@@ -1,5 +1,7 @@
 #pragma once
 #include <cstdint>
+#include <deque>
+#include <unordered_set>
 #include <vector>
 
 class Picture {
@@ -23,6 +25,15 @@ public:
 
     int height() const { return height_; }
     int width() const { return width_; }
+
+    std::vector<std::int8_t> pixels;
+    std::vector<std::uint8_t> row_dirty;
+    std::vector<std::uint8_t> col_dirty;
+    std::deque<int> row_queue;
+    std::deque<int> col_queue;
+    std::unordered_set<int> solved_rows;
+    std::unordered_set<int> solved_cols;
+    int unknown_count;
 
 private:
     int height_;
