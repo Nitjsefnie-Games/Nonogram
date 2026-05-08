@@ -25,14 +25,13 @@ def solve_line_batch(line, states):
     n = len(line)
     len_states = len(states)
 
-    forward = np.zeros((n + 1, len_states), dtype=np.int64)
-    forward[0, 0] = 1
+    forward = np.zeros((n + 1, len_states), dtype=np.bool_)
+    forward[0, 0] = True
 
     for pos in range(n):
         val = line[pos]
         for state in range(len_states):
-            count = forward[pos, state]
-            if count == 0:
+            if not forward[pos, state]:
                 continue
 
             cur_state_val = states[state]
@@ -41,32 +40,32 @@ def solve_line_batch(line, states):
 
             if val == UNKNOWN:
                 if cur_state_val == EMPTY:
-                    forward[pos + 1, state] += count
+                    forward[pos + 1, state] = True
                 if next_state_val != -1:
-                    forward[pos + 1, next_state] += count
+                    forward[pos + 1, next_state] = True
             elif val == EMPTY:
                 if cur_state_val == EMPTY:
-                    forward[pos + 1, state] += count
+                    forward[pos + 1, state] = True
                 if next_state_val == EMPTY:
-                    forward[pos + 1, next_state] += count
+                    forward[pos + 1, next_state] = True
             else:
                 if next_state_val == FULL:
-                    forward[pos + 1, next_state] += count
+                    forward[pos + 1, next_state] = True
 
-    total = np.int64(0)
-    if len_states >= 1:
-        total += forward[n, len_states - 1]
-    if len_states >= 2:
-        total += forward[n, len_states - 2]
+    reachable = False
+    if len_states >= 1 and forward[n, len_states - 1]:
+        reachable = True
+    if len_states >= 2 and forward[n, len_states - 2]:
+        reachable = True
 
-    if total == 0:
+    if not reachable:
         return np.full(n, UNKNOWN, dtype=np.int32), np.int64(0)
 
-    backward = np.zeros((n + 1, len_states), dtype=np.int64)
+    backward = np.zeros((n + 1, len_states), dtype=np.bool_)
     if len_states >= 1:
-        backward[n, len_states - 1] = 1
+        backward[n, len_states - 1] = True
     if len_states >= 2:
-        backward[n, len_states - 2] = 1
+        backward[n, len_states - 2] = True
 
     for pos in range(n - 1, -1, -1):
         val = line[pos]
@@ -77,17 +76,17 @@ def solve_line_batch(line, states):
 
             if val == UNKNOWN:
                 if cur_state_val == EMPTY:
-                    backward[pos, state] += backward[pos + 1, state]
+                    backward[pos, state] |= backward[pos + 1, state]
                 if next_state_val != -1:
-                    backward[pos, state] += backward[pos + 1, next_state]
+                    backward[pos, state] |= backward[pos + 1, next_state]
             elif val == EMPTY:
                 if cur_state_val == EMPTY:
-                    backward[pos, state] += backward[pos + 1, state]
+                    backward[pos, state] |= backward[pos + 1, state]
                 if next_state_val == EMPTY:
-                    backward[pos, state] += backward[pos + 1, next_state]
+                    backward[pos, state] |= backward[pos + 1, next_state]
             else:
                 if next_state_val == FULL:
-                    backward[pos, state] += backward[pos + 1, next_state]
+                    backward[pos, state] |= backward[pos + 1, next_state]
 
     result = np.full(n, UNKNOWN, dtype=np.int32)
 
@@ -96,32 +95,33 @@ def solve_line_batch(line, states):
             result[pos] = line[pos]
             continue
 
-        can_empty = np.int64(0)
-        can_full = np.int64(0)
+        can_empty = False
+        can_full = False
 
         for state in range(len_states):
-            fwd = forward[pos, state]
-            if fwd == 0:
+            if not forward[pos, state]:
                 continue
 
             cur_state_val = states[state]
             next_state = state + 1
             next_state_val = states[next_state] if next_state < len_states else -1
 
-            if cur_state_val == EMPTY:
-                can_empty += fwd * backward[pos + 1, state]
-            if next_state_val == EMPTY:
-                can_empty += fwd * backward[pos + 1, next_state]
+            if cur_state_val == EMPTY and backward[pos + 1, state]:
+                can_empty = True
+            if next_state_val == EMPTY and backward[pos + 1, next_state]:
+                can_empty = True
+            if next_state_val == FULL and backward[pos + 1, next_state]:
+                can_full = True
 
-            if next_state_val == FULL:
-                can_full += fwd * backward[pos + 1, next_state]
+            if can_empty and can_full:
+                break
 
-        if can_empty > 0 and can_full == 0:
+        if can_empty and not can_full:
             result[pos] = EMPTY
-        elif can_full > 0 and can_empty == 0:
+        elif can_full and not can_empty:
             result[pos] = FULL
 
-    return result, total
+    return result, np.int64(1)
 
 
 @njit(cache=True)
@@ -129,14 +129,13 @@ def check_line_valid(line, states):
     n = len(line)
     len_states = len(states)
 
-    forward = np.zeros((n + 1, len_states), dtype=np.int64)
-    forward[0, 0] = 1
+    forward = np.zeros((n + 1, len_states), dtype=np.bool_)
+    forward[0, 0] = True
 
     for pos in range(n):
         val = line[pos]
         for state in range(len_states):
-            count = forward[pos, state]
-            if count == 0:
+            if not forward[pos, state]:
                 continue
 
             cur_state_val = states[state]
@@ -145,22 +144,20 @@ def check_line_valid(line, states):
 
             if val == UNKNOWN:
                 if cur_state_val == EMPTY:
-                    forward[pos + 1, state] += count
+                    forward[pos + 1, state] = True
                 if next_state_val != -1:
-                    forward[pos + 1, next_state] += count
+                    forward[pos + 1, next_state] = True
             elif val == EMPTY:
                 if cur_state_val == EMPTY:
-                    forward[pos + 1, state] += count
+                    forward[pos + 1, state] = True
                 if next_state_val == EMPTY:
-                    forward[pos + 1, next_state] += count
+                    forward[pos + 1, next_state] = True
             else:
                 if next_state_val == FULL:
-                    forward[pos + 1, next_state] += count
+                    forward[pos + 1, next_state] = True
 
-    total = np.int64(0)
-    if len_states >= 1:
-        total += forward[n, len_states - 1]
-    if len_states >= 2:
-        total += forward[n, len_states - 2]
-
-    return total > 0
+    if len_states >= 1 and forward[n, len_states - 1]:
+        return True
+    if len_states >= 2 and forward[n, len_states - 2]:
+        return True
+    return False

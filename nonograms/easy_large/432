@@ -1,8 +1,8 @@
-# solver=1.1.0
+# solver=1.2.0
 # cpu=AMD EPYC 7H12 64-Core Processor
 # isolated_core=5
 # strategy=basic
-# solve_time=0.01062
+# solve_time=0.01024
 5
 2 5
 9
