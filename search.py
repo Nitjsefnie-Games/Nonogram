@@ -5,7 +5,7 @@ import numpy as np
 from lines import EMPTY, FULL, UNKNOWN, solve_line_batch, check_line_valid, states_pregen
 from picture import Picture, SolveState
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 setrecursionlimit(100000)
 
@@ -33,38 +33,21 @@ def solve_one_batch(clue, index, is_col, pic):
     else:
         line = pic.get_row_view(index)
 
-    result_line, total = solve_line_batch(line, clue)
+    positions, values, total, fully_solved = solve_line_batch(line, clue)
 
     if total == 0:
         return False, None, None, None
 
-    has_unknown = False
-    for i in range(len(line)):
-        if line[i] == UNKNOWN:
-            has_unknown = True
-            break
-
-    if not has_unknown:
+    if fully_solved:
         if is_col:
             pic.solved_cols.add(index)
         else:
             pic.solved_rows.add(index)
+
+    if positions.size == 0:
         return True, None, None, None
 
-    n = len(line)
-    determined_positions = []
-    determined_values = []
-
-    for i in range(n):
-        if line[i] == UNKNOWN and result_line[i] != UNKNOWN:
-            determined_positions.append(i)
-            determined_values.append(result_line[i])
-
-    if not determined_positions:
-        return True, None, None, None
-
-    return True, np.array(determined_positions, dtype=np.int32), \
-        np.array(determined_values, dtype=np.int32), index
+    return True, positions, values, index
 
 
 def write_intersection_vectorized(positions, values, line_index, pic, is_row):
