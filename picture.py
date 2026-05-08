@@ -12,16 +12,35 @@ class Picture:
         self.height = height
         self.width = width
         self.pixels = np.full((height, width), UNKNOWN, dtype=np.int32)
-        self.rows_to_solve = np.ones(height, dtype=np.bool_)
-        self.cols_to_solve = np.ones(width, dtype=np.bool_)
+        self.row_dirty = np.ones(height, dtype=np.bool_)
+        self.col_dirty = np.ones(width, dtype=np.bool_)
+        self.row_queue = deque(range(height))
+        self.col_queue = deque(range(width))
         self.solved_rows = set()
         self.solved_cols = set()
+        self.unknown_count = height * width
+
+    def mark_row_dirty(self, idx):
+        if not self.row_dirty[idx]:
+            self.row_dirty[idx] = True
+            self.row_queue.append(idx)
+
+    def mark_col_dirty(self, idx):
+        if not self.col_dirty[idx]:
+            self.col_dirty[idx] = True
+            self.col_queue.append(idx)
+
+    def has_dirty(self):
+        return bool(self.row_queue) or bool(self.col_queue)
 
     def get_pixel(self, row, col):
         return self.pixels[row, col]
 
     def set_pixel(self, row, col, val):
+        old = self.pixels[row, col]
         self.pixels[row, col] = val
+        if old == UNKNOWN and val != UNKNOWN:
+            self.unknown_count -= 1
 
     def get_row_view(self, row):
         return self.pixels[row]
@@ -36,17 +55,20 @@ class Picture:
         return self.pixels[:, col].copy()
 
     def is_solved(self):
-        return not np.any(self.pixels == UNKNOWN)
+        return self.unknown_count == 0
 
     def copy(self):
         new_pic = Picture.__new__(Picture)
         new_pic.height = self.height
         new_pic.width = self.width
         new_pic.pixels = self.pixels.copy()
-        new_pic.rows_to_solve = self.rows_to_solve.copy()
-        new_pic.cols_to_solve = self.cols_to_solve.copy()
+        new_pic.row_dirty = self.row_dirty.copy()
+        new_pic.col_dirty = self.col_dirty.copy()
+        new_pic.row_queue = deque(self.row_queue)
+        new_pic.col_queue = deque(self.col_queue)
         new_pic.solved_rows = self.solved_rows.copy()
         new_pic.solved_cols = self.solved_cols.copy()
+        new_pic.unknown_count = self.unknown_count
         return new_pic
 
     def __str__(self):
