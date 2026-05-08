@@ -3,7 +3,8 @@ import sys
 from os import listdir
 from os.path import isfile, join
 
-from categorize import load_clues, clues_valid, solve
+from puzzle_io import load_clues, clues_valid
+from search import solve
 
 
 def solve_folder(loc):
@@ -51,7 +52,7 @@ def benchmark(rows, cols, runs=5):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python solver.py <puzzle_file> [--benchmark] [--runs N] [--print]")
+        print("Usage: python solver.py <puzzle_file> [--benchmark] [--runs N] [--print] [--max N]")
         print("\nPuzzle file format:")
         print("  Row clues (one per line, space-separated numbers)")
         print("  ---")
@@ -60,6 +61,7 @@ def main():
         print("  --benchmark  Run multiple times and report statistics")
         print("  --runs N     Number of benchmark runs (default 5)")
         print("  --print      Print progress and grid during solving")
+        print("  --max N      Stop after finding N solutions")
         sys.exit(1)
 
     filename = sys.argv[1]
@@ -71,6 +73,12 @@ def main():
         idx = sys.argv.index('--runs')
         if idx + 1 < len(sys.argv):
             runs = int(sys.argv[idx + 1])
+
+    max_solutions = None
+    if '--max' in sys.argv:
+        idx = sys.argv.index('--max')
+        if idx + 1 < len(sys.argv):
+            max_solutions = int(sys.argv[idx + 1])
 
     rows, cols = load_clues(filename)
 
@@ -100,6 +108,8 @@ def main():
                 if print_count == 10:
                     print()
                     print_count = 0
+            if max_solutions is not None and solution_count >= max_solutions:
+                break
         print()
         elapsed = time.perf_counter() - start
 

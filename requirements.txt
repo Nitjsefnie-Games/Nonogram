@@ -1,0 +1,4 @@
+numpy>=2.0
+numba>=0.60
+requests>=2.31
+py-cpuinfo>=9.0
