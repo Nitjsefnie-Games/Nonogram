@@ -6,11 +6,15 @@ correctness gate when changing the line DP kernel.
 Usage:
   python3 scripts/baseline.py --save nonograms baseline.jsonl --exclude partially_solved
   python3 scripts/baseline.py        nonograms baseline.jsonl --exclude partially_solved
+  python3 scripts/baseline.py        nonograms baseline.jsonl --exclude partially_solved \
+      --solver-cmd cpp/solver
 """
 import argparse
 import hashlib
 import json
 import os
+import struct
+import subprocess
 import sys
 from pathlib import Path
 
@@ -20,8 +24,77 @@ from puzzle_io import load_clues, clues_valid
 from search import solve
 
 
+CELL_MAP = {".": 0, "#": 1, "?": 2}
+
+
 def hash_pic(pic):
     return hashlib.sha256(pic.pixels.tobytes()).hexdigest()[:16]
+
+
+def hash_grid_lines(grid_lines):
+    """Hash a list of grid rows (strings of '.', '#', '?') the same way
+    Python's hash_pic() does: int32 little-endian bytes, sha256[:16]."""
+    flat = []
+    for line in grid_lines:
+        for ch in line:
+            flat.append(CELL_MAP[ch])
+    buf = struct.pack("<%di" % len(flat), *flat)
+    return hashlib.sha256(buf).hexdigest()[:16]
+
+
+def parse_solver_output(stdout):
+    """Parse `cpp/solver <path> --print` stdout and return a list of grids
+    (each grid is a list of row strings).
+
+    Format: between a line starting with '=== Solution ' and the next
+    blank line / next '=== ' / a 'Time:' line, the contents are the grid.
+    """
+    grids = []
+    current = None
+    for raw in stdout.splitlines():
+        line = raw.rstrip("\r")
+        if line.startswith("=== Solution "):
+            if current is not None:
+                grids.append(current)
+            current = []
+            continue
+        if current is None:
+            continue
+        # End-of-grid signals.
+        if line == "" or line.startswith("=== ") or line.startswith("Time:") \
+                or line.startswith("Found "):
+            grids.append(current)
+            current = None
+            continue
+        current.append(line)
+    if current is not None:
+        grids.append(current)
+    # Drop trailing empty grids defensively.
+    return [g for g in grids if g]
+
+
+def solve_puzzle_external(path, cmd):
+    """Run the external solver and return {n, hash} matching Python's scheme."""
+    try:
+        proc = subprocess.run(
+            [cmd, path, "--print"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as e:
+        print(f"  ERROR running {cmd} on {path}: {e}", flush=True)
+        return None
+    if proc.returncode != 0:
+        print(f"  ERROR {cmd} exit={proc.returncode} on {path}", flush=True)
+        sys.stderr.write(proc.stderr.decode("utf-8", errors="replace"))
+        return None
+    stdout = proc.stdout.decode("utf-8", errors="replace")
+    grids = parse_solver_output(stdout)
+    solutions = [hash_grid_lines(g) for g in grids]
+    solutions.sort()
+    composite = hashlib.sha256("|".join(solutions).encode()).hexdigest()[:16]
+    return {"n": len(solutions), "hash": composite}
 
 
 def solve_puzzle(path):
@@ -56,15 +129,23 @@ def main():
                     help="Solve every puzzle and write the baseline (default mode is check)")
     ap.add_argument("--exclude", action="append", default=[], metavar="FOLDER",
                     help="Folder name to skip (exact match, any depth). Repeatable.")
+    ap.add_argument("--solver-cmd", default=None, metavar="PATH",
+                    help="Use external solver: run `PATH <puzzle> --print` and "
+                         "parse stdout instead of calling Python solve().")
     args = ap.parse_args()
     excludes = set(args.exclude)
+
+    def run_one(path):
+        if args.solver_cmd:
+            return solve_puzzle_external(path, args.solver_cmd)
+        return solve_puzzle(path)
 
     if args.save:
         n_written = 0
         with open(args.baseline_file, "w") as f:
             for path in walk_puzzles(args.dir, excludes):
                 rel = os.path.relpath(path, args.dir)
-                result = solve_puzzle(path)
+                result = run_one(path)
                 if result is None:
                     print(f"  SKIP {rel}: invalid clues", flush=True)
                     continue
@@ -87,7 +168,7 @@ def main():
         rel = os.path.relpath(path, args.dir)
         if rel not in baseline:
             continue
-        current = solve_puzzle(path)
+        current = run_one(path)
         if current is None:
             print(f"  SKIP {rel}: invalid clues now", flush=True)
             continue
