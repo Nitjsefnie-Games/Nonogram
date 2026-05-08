@@ -59,7 +59,10 @@ def solve_line_batch(line, states):
         reachable = True
 
     if not reachable:
-        return np.full(n, UNKNOWN, dtype=np.int32), np.int64(0)
+        return (np.empty(0, dtype=np.int32),
+                np.empty(0, dtype=np.int32),
+                np.int64(0),
+                False)
 
     backward = np.zeros((n + 1, len_states), dtype=np.bool_)
     if len_states >= 1:
@@ -88,12 +91,15 @@ def solve_line_batch(line, states):
                 if next_state_val == FULL:
                     backward[pos, state] |= backward[pos + 1, next_state]
 
-    result = np.full(n, UNKNOWN, dtype=np.int32)
+    positions = np.empty(n, dtype=np.int32)
+    values = np.empty(n, dtype=np.int32)
+    n_changed = 0
+    n_unknown_total = 0
 
     for pos in range(n):
         if line[pos] != UNKNOWN:
-            result[pos] = line[pos]
             continue
+        n_unknown_total += 1
 
         can_empty = False
         can_full = False
@@ -117,11 +123,16 @@ def solve_line_batch(line, states):
                 break
 
         if can_empty and not can_full:
-            result[pos] = EMPTY
+            positions[n_changed] = pos
+            values[n_changed] = EMPTY
+            n_changed += 1
         elif can_full and not can_empty:
-            result[pos] = FULL
+            positions[n_changed] = pos
+            values[n_changed] = FULL
+            n_changed += 1
 
-    return result, np.int64(1)
+    fully_solved = (n_unknown_total == n_changed)
+    return positions[:n_changed], values[:n_changed], np.int64(1), fully_solved
 
 
 @njit(cache=True)
