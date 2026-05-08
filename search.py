@@ -5,23 +5,23 @@ import numpy as np
 from lines import EMPTY, FULL, UNKNOWN, solve_line_batch, check_line_valid, states_pregen
 from picture import Picture, SolveState
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 setrecursionlimit(100000)
 
 
 def solve(rows, cols, print_progress=False):
     pic = Picture(len(rows), len(cols))
-    mapped_rows = [(i, states_pregen(clue)) for i, clue in enumerate(rows)]
-    mapped_cols = [(i, states_pregen(clue)) for i, clue in enumerate(cols)]
+    mapped_rows = [states_pregen(clue) for clue in rows]
+    mapped_cols = [states_pregen(clue) for clue in cols]
     state = SolveState(print_progress)
     yield from solve_real(mapped_rows, mapped_cols, pic, state)
 
 
 def solve_with_strategy(rows, cols, print_progress=False):
     pic = Picture(len(rows), len(cols))
-    mapped_rows = [(i, states_pregen(clue)) for i, clue in enumerate(rows)]
-    mapped_cols = [(i, states_pregen(clue)) for i, clue in enumerate(cols)]
+    mapped_rows = [states_pregen(clue) for clue in rows]
+    mapped_cols = [states_pregen(clue) for clue in cols]
     state = SolveState(print_progress)
     solution_count = sum(1 for _ in solve_real(mapped_rows, mapped_cols, pic, state))
     return solution_count, state.get_strategy()
@@ -60,14 +60,16 @@ def write_intersection_vectorized(positions, values, line_index, pic, is_row):
             col = positions[i]
             if pic.pixels[row, col] == UNKNOWN:
                 pic.pixels[row, col] = values[i]
-                pic.cols_to_solve[col] = True
+                pic.unknown_count -= 1
+                pic.mark_col_dirty(col)
     else:
         col = line_index
         for i in range(len(positions)):
             row = positions[i]
             if pic.pixels[row, col] == UNKNOWN:
                 pic.pixels[row, col] = values[i]
-                pic.rows_to_solve[row] = True
+                pic.unknown_count -= 1
+                pic.mark_row_dirty(row)
 
 
 def solve_real(mapped_rows, mapped_cols, pic, state):
@@ -79,7 +81,7 @@ def solve_real(mapped_rows, mapped_cols, pic, state):
         yield pic
         return
 
-    while np.any(pic.rows_to_solve) or np.any(pic.cols_to_solve):
+    while pic.has_dirty():
         if not solve_lines(mapped_rows, pic, is_row=True):
             return
         if not solve_lines(mapped_cols, pic, is_row=False):
@@ -96,16 +98,12 @@ def solve_real(mapped_rows, mapped_cols, pic, state):
 
 
 def solve_lines(mapped, pic, is_row):
-    for index, clue in mapped:
-        should_solve = pic.rows_to_solve[index] if is_row else pic.cols_to_solve[index]
-        if not should_solve:
-            continue
-        if is_row:
-            pic.rows_to_solve[index] = False
-        else:
-            pic.cols_to_solve[index] = False
-
-        success, positions, values, line_idx = solve_one_batch(clue, index, not is_row, pic)
+    queue = pic.row_queue if is_row else pic.col_queue
+    dirty = pic.row_dirty if is_row else pic.col_dirty
+    while queue:
+        index = queue.popleft()
+        dirty[index] = False
+        success, positions, values, _ = solve_one_batch(mapped[index], index, not is_row, pic)
         if not success:
             return False
         write_intersection_vectorized(positions, values, index, pic, is_row)
@@ -131,13 +129,13 @@ def count_solved_pixels(pic):
 def probe_cell(row, col, val, mapped_rows, mapped_cols, pic):
     pic2 = pic.copy()
     pic2.set_pixel(row, col, val)
-    pic2.rows_to_solve[row] = True
-    pic2.cols_to_solve[col] = True
+    pic2.mark_row_dirty(row)
+    pic2.mark_col_dirty(col)
 
     if not solve_check(pic2, mapped_rows, mapped_cols):
         return False, 0
 
-    while np.any(pic2.rows_to_solve) or np.any(pic2.cols_to_solve):
+    while pic2.has_dirty():
         if not solve_lines(mapped_rows, pic2, is_row=True):
             return False, 0
         if not solve_lines(mapped_cols, pic2, is_row=False):
@@ -182,16 +180,16 @@ def solve_backtrack(mapped_rows, mapped_cols, pic, state):
             if full_ok and not empty_ok:
                 state.mark_contradiction()
                 pic.set_pixel(row, col, FULL)
-                pic.rows_to_solve[row] = True
-                pic.cols_to_solve[col] = True
+                pic.mark_row_dirty(row)
+                pic.mark_col_dirty(col)
                 yield from solve_real(mapped_rows, mapped_cols, pic, state)
                 return
 
             if empty_ok and not full_ok:
                 state.mark_contradiction()
                 pic.set_pixel(row, col, EMPTY)
-                pic.rows_to_solve[row] = True
-                pic.cols_to_solve[col] = True
+                pic.mark_row_dirty(row)
+                pic.mark_col_dirty(col)
                 yield from solve_real(mapped_rows, mapped_cols, pic, state)
                 return
 
@@ -214,8 +212,8 @@ def solve_backtrack(mapped_rows, mapped_cols, pic, state):
 
     pic2 = pic.copy()
     pic2.set_pixel(row, col, first_val)
-    pic2.rows_to_solve[row] = True
-    pic2.cols_to_solve[col] = True
+    pic2.mark_row_dirty(row)
+    pic2.mark_col_dirty(col)
 
     found_solution = False
     for solution in solve_real(mapped_rows, mapped_cols, pic2, state):
@@ -227,28 +225,28 @@ def solve_backtrack(mapped_rows, mapped_cols, pic, state):
 
     pic2 = pic.copy()
     pic2.set_pixel(row, col, second_val)
-    pic2.rows_to_solve[row] = True
-    pic2.cols_to_solve[col] = True
+    pic2.mark_row_dirty(row)
+    pic2.mark_col_dirty(col)
     yield from solve_real(mapped_rows, mapped_cols, pic2, state)
 
     state.exit_backtrack()
 
 
 def solve_check(pic, mapped_rows, mapped_cols):
-    for i, clue in mapped_rows:
+    for i in range(len(mapped_rows)):
         if i in pic.solved_rows:
             continue
         line = pic.get_row_view(i)
-        if not check_line_valid(line, clue):
+        if not check_line_valid(line, mapped_rows[i]):
             return False
         if UNKNOWN not in line:
             pic.solved_rows.add(i)
 
-    for i, clue in mapped_cols:
+    for i in range(len(mapped_cols)):
         if i in pic.solved_cols:
             continue
         line = pic.get_col(i)
-        if not check_line_valid(line, clue):
+        if not check_line_valid(line, mapped_cols[i]):
             return False
         if UNKNOWN not in line:
             pic.solved_cols.add(i)
