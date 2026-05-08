@@ -5,7 +5,7 @@ import numpy as np
 from lines import EMPTY, FULL, UNKNOWN, solve_line_batch, check_line_valid, states_pregen
 from picture import Picture, SolveState
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 setrecursionlimit(100000)
 
