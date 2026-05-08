@@ -5,12 +5,19 @@ import numpy as np
 from lines import EMPTY, FULL, UNKNOWN, solve_line_batch, check_line_valid, states_pregen
 from picture import Picture, SolveState
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 setrecursionlimit(100000)
 
+_line_cache = {}
+
+
+def _reset_line_cache():
+    _line_cache.clear()
+
 
 def solve(rows, cols, print_progress=False):
+    _reset_line_cache()
     pic = Picture(len(rows), len(cols))
     mapped_rows = [states_pregen(clue) for clue in rows]
     mapped_cols = [states_pregen(clue) for clue in cols]
@@ -19,6 +26,7 @@ def solve(rows, cols, print_progress=False):
 
 
 def solve_with_strategy(rows, cols, print_progress=False):
+    _reset_line_cache()
     pic = Picture(len(rows), len(cols))
     mapped_rows = [states_pregen(clue) for clue in rows]
     mapped_cols = [states_pregen(clue) for clue in cols]
@@ -33,7 +41,13 @@ def solve_one_batch(clue, index, is_col, pic):
     else:
         line = pic.get_row_view(index)
 
-    positions, values, total, fully_solved = solve_line_batch(line, clue)
+    key = (line.tobytes(), id(clue))
+    cached = _line_cache.get(key)
+    if cached is None:
+        positions, values, total, fully_solved = solve_line_batch(line, clue)
+        _line_cache[key] = (positions.copy(), values.copy(), total, fully_solved)
+    else:
+        positions, values, total, fully_solved = cached
 
     if total == 0:
         return False, None, None, None
