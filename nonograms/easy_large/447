@@ -3,7 +3,7 @@
 # isolated_core=5
 # strategy=backtrack
 # n_solutions=4
-# solve_time=0.00130
+# solve_time=0.00120
 1 1
 2 2
 2 3
