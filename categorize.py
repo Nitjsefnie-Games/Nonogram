@@ -192,7 +192,12 @@ _STRATEGY_NAME_TO_ENUM = {
 }
 
 
-def _solve_via_external(cmd, puzzle_path):
+class ExternalSolverTimeout(Exception):
+    """Raised when the external solver exceeds the configured timeout."""
+    pass
+
+
+def _solve_via_external(cmd, puzzle_path, timeout_s=None):
     """Run an external solver binary on `puzzle_path` and parse its stdout.
 
     Expects (case-sensitive) the lines emitted by cpp/main.cpp:
@@ -201,15 +206,22 @@ def _solve_via_external(cmd, puzzle_path):
         Strategy: basic|contra|backtrack
 
     Returns (n_solutions, strategy_enum, elapsed). Raises RuntimeError on
-    non-zero exit or unparseable output.
+    non-zero exit or unparseable output. Raises ExternalSolverTimeout if
+    the subprocess exceeds `timeout_s` seconds (when not None).
     """
-    proc = subprocess.run(
-        [cmd, puzzle_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            [cmd, puzzle_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        raise ExternalSolverTimeout(
+            f"external solver {cmd!r} exceeded {timeout_s}s on {puzzle_path!r}"
+        )
     if proc.returncode != 0:
         raise RuntimeError(
             f"external solver {cmd!r} failed on {puzzle_path!r} "
@@ -237,6 +249,44 @@ def _solve_via_external(cmd, puzzle_path):
         )
     strategy = _STRATEGY_NAME_TO_ENUM[strat_name]
     return n_solutions, strategy, elapsed
+
+
+def solve_puzzle_text_external(clue_text, puzzle_id, solver_cmd, timeout_s=None):
+    """Same shape as `solve_puzzle_text`, but runs the external solver on the
+    in-progress file at `nonograms/in_progress/<puzzle_id>`.
+
+    Returns (solution_count, strategy, elapsed, rows, cols), or
+    (None, None, None, None, None) if the parsed clues are invalid.
+
+    Assumes `save_in_progress(puzzle_id, clue_text)` has already been called
+    by the caller — we read the rows/cols from clue_text but invoke the
+    external solver on the saved file path.
+
+    Propagates `ExternalSolverTimeout` from `_solve_via_external` so the
+    caller can distinguish timeout from other failures.
+    """
+    lines = clue_text.strip().split('\n')
+
+    cols = []
+    rows = []
+    for line in lines:
+        if not line:
+            cols.append([])
+        elif line[0] == '#':
+            continue
+        elif line == '---':
+            rows, cols = cols, rows
+        else:
+            cols.append([int(x) for x in line.split()])
+
+    if not clues_valid(rows, cols):
+        return None, None, None, None, None
+
+    puzzle_path = f"{IN_PROGRESS_DIR}/{puzzle_id}"
+    n_solutions, strategy, elapsed = _solve_via_external(
+        solver_cmd, puzzle_path, timeout_s=timeout_s
+    )
+    return n_solutions, strategy, elapsed, rows, cols
 
 
 def rebench_file(path, solver_cmd=None):
@@ -330,11 +380,13 @@ def main():
     parser.add_argument('--exclude', action='append', default=[], metavar='FOLDER',
                         help='Folder name (exact match, any depth) to skip during --rebench. Repeatable.')
     parser.add_argument('--solver-cmd', metavar='PATH', default=None,
-                        help='External solver binary to use during --rebench. Each '
+                        help='External solver binary to use for solving. Each '
                              'puzzle file path is passed as the sole argument; the '
                              'solver must print "Found N solution(s)", "Time: Xs", '
                              'and "Strategy: <name>" lines on stdout. '
-                             'Ignored outside --rebench mode.')
+                             'Works in both --rebench mode and harvest (default) mode. '
+                             'In harvest mode, the saved in_progress file is used as '
+                             'the puzzle path passed to the solver.')
     args = parser.parse_args()
 
     joined = join_solver_cgroup()
@@ -381,7 +433,22 @@ def main():
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-1]
         print(f"found [{timestamp}], solving... ", end='', flush=True)
 
-        solution_count, strategy, solve_time, rows, cols = solve_puzzle_text(clue_text)
+        if args.solver_cmd:
+            try:
+                solution_count, strategy, solve_time, rows, cols = (
+                    solve_puzzle_text_external(
+                        clue_text, current_id, args.solver_cmd, timeout_s=args.timeout
+                    )
+                )
+            except ExternalSolverTimeout:
+                print(f"timeout (>{args.timeout}s)")
+                # Leave the in_progress file in place — represents an unfinishable puzzle.
+                current_id += 1
+                save_progress(current_id - 1)
+                puzzles_processed += 1
+                continue
+        else:
+            solution_count, strategy, solve_time, rows, cols = solve_puzzle_text(clue_text)
 
         if solution_count is None:
             print("invalid clues")
