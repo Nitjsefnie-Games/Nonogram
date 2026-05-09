@@ -14,15 +14,17 @@
 namespace {
 
 void print_usage(std::FILE* stream) {
-    std::fprintf(stream, "Usage: solver <puzzle_file> [--print] [--max N]\n");
+    std::fprintf(stream, "Usage: solver <puzzle_file> [--print] [--max N] [--print-every N]\n");
     std::fprintf(stream, "\n");
     std::fprintf(stream, "Puzzle file format:\n");
     std::fprintf(stream, "  Row clues (one per line, space-separated numbers)\n");
     std::fprintf(stream, "  ---\n");
     std::fprintf(stream, "  Column clues (one per line, space-separated numbers)\n");
     std::fprintf(stream, "\nOptions:\n");
-    std::fprintf(stream, "  --print      Print each solution as a grid\n");
-    std::fprintf(stream, "  --max N      Stop after finding N solutions\n");
+    std::fprintf(stream, "  --print          Print each solution as a grid\n");
+    std::fprintf(stream, "  --max N          Stop after finding N solutions\n");
+    std::fprintf(stream, "  --print-every N  Log count + rate + elapsed every N solutions\n");
+    std::fprintf(stream, "                   (default: progressive batches starting at 10, x1.1)\n");
 }
 
 // Format an integer with comma thousands separators (e.g. 30000 -> "30,000").
@@ -41,11 +43,11 @@ std::string fmt_int_commas(long long n) {
     }
     std::string out;
     int count = 0;
-    for (auto it = digits.rbegin(); it != digits.rend(); ++it) {
+    for (char c : digits) {
         if (count > 0 && count % 3 == 0) {
             out.push_back(',');
         }
-        out.push_back(*it);
+        out.push_back(c);
         ++count;
     }
     std::string result;
@@ -101,6 +103,7 @@ int main(int argc, char** argv) {
     bool print_progress = false;
     long long max_solutions = -1;  // -1 = no cap
     bool have_max = false;
+    long long print_every = 0;     // 0 = use progressive default
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -116,6 +119,21 @@ int main(int argc, char** argv) {
                 have_max = true;
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "--max: invalid integer: %s\n", e.what());
+                return 1;
+            }
+        } else if (std::strcmp(a, "--print-every") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "--print-every requires a value\n");
+                return 1;
+            }
+            try {
+                print_every = std::stoll(argv[++i]);
+                if (print_every <= 0) {
+                    std::fprintf(stderr, "--print-every: value must be > 0\n");
+                    return 1;
+                }
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "--print-every: invalid integer: %s\n", e.what());
                 return 1;
             }
         } else if (a[0] == '-' && a[1] != '\0') {
@@ -171,6 +189,19 @@ int main(int argc, char** argv) {
                         elapsed);
             print_grid(pic);
             std::fflush(stdout);
+        } else if (print_every > 0) {
+            if (solution_count % print_every == 0) {
+                std::printf("%s (%s/s, %.1fs) ",
+                            fmt_int_commas(solution_count).c_str(),
+                            fmt_rate(rate).c_str(),
+                            elapsed);
+                std::fflush(stdout);
+                ++print_count;
+                if (print_count == 10) {
+                    std::putchar('\n');
+                    print_count = 0;
+                }
+            }
         } else if (solution_count % print_count_threshold == 0) {
             std::printf("%s (%s/s, %.1fs) ",
                         fmt_int_commas(solution_count).c_str(),
