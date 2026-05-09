@@ -4,6 +4,11 @@
 #include "picture.hpp"
 #include "types.hpp"
 
+// Vendored third-party hash map: ankerl::unordered_dense (MIT, v4.8.1).
+// See cpp/external/ankerl/unordered_dense.h for license/copyright header.
+// Used for the line-batch memoization cache in this file.
+#include "external/ankerl/unordered_dense.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -12,7 +17,6 @@
 #include <deque>
 #include <functional>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -44,7 +48,7 @@ struct LineKeyHash {
     }
 };
 
-using LineCache = std::unordered_map<LineKey, LineSolveResult, LineKeyHash>;
+using LineCache = ankerl::unordered_dense::map<LineKey, LineSolveResult, LineKeyHash>;
 
 LineCache& line_cache() {
     static LineCache cache;
