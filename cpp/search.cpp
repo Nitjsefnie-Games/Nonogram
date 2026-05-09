@@ -605,36 +605,38 @@ bool solve_backtrack(const std::vector<std::vector<std::int8_t>>& mapped_rows,
 
     state.enter_backtrack();
 
-    // Branch 1
-    {
+    // Iterative two-branch loop. branch==0 runs first_val under a wrapped
+    // callback that records whether any solution was emitted (so we can call
+    // first_branch_failed if the branch yields nothing). branch==1 runs
+    // second_val with the raw callback. On stop signal (solve_real returns
+    // false), we propagate immediately WITHOUT calling exit_backtrack — the
+    // caller is aborting; matches the original recursive form.
+    //
+    // exit_backtrack is invoked exactly once, after both branches complete
+    // normally. That matches the original semantics.
+    bool found_solution_in_first = false;
+    for (int branch = 0; branch < 2; ++branch) {
+        const std::int8_t val = (branch == 0) ? first_val : second_val;
         Picture pic2 = pic.copy();
-        pic2.set_pixel(row, col, first_val);
+        pic2.set_pixel(row, col, val);
         pic2.mark_row_dirty(row);
         pic2.mark_col_dirty(col);
 
-        bool found_solution = false;
-        OnSolution wrapped = [&](const Picture& p) {
-            found_solution = true;
-            return on_solution(p);
-        };
-        if (!solve_real(mapped_rows, mapped_cols, pic2, state, wrapped)) {
-            // Stop signal — propagate. (We deliberately do NOT call exit_backtrack
-            // because the caller is aborting.)
-            return false;
-        }
-        if (!found_solution) {
-            state.first_branch_failed();
-        }
-    }
-
-    // Branch 2
-    {
-        Picture pic2 = pic.copy();
-        pic2.set_pixel(row, col, second_val);
-        pic2.mark_row_dirty(row);
-        pic2.mark_col_dirty(col);
-        if (!solve_real(mapped_rows, mapped_cols, pic2, state, on_solution)) {
-            return false;
+        if (branch == 0) {
+            OnSolution wrapped = [&](const Picture& p) {
+                found_solution_in_first = true;
+                return on_solution(p);
+            };
+            if (!solve_real(mapped_rows, mapped_cols, pic2, state, wrapped)) {
+                return false;
+            }
+            if (!found_solution_in_first) {
+                state.first_branch_failed();
+            }
+        } else {
+            if (!solve_real(mapped_rows, mapped_cols, pic2, state, on_solution)) {
+                return false;
+            }
         }
     }
 
