@@ -5,6 +5,7 @@
 #include "types.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -59,6 +60,15 @@ void reset_line_cache() {
 std::string line_to_bytes(const std::vector<std::int8_t>& line) {
     return std::string(reinterpret_cast<const char*>(line.data()), line.size());
 }
+
+// ---------------------------------------------------------------------------
+// Trail — records cell-index mutations during a probe so probe_cell can
+// undo them in place (avoiding pic.copy()). Only used when probing.
+// ---------------------------------------------------------------------------
+
+struct Trail {
+    std::vector<int> changed_cell_indices;
+};
 
 // ---------------------------------------------------------------------------
 // SolveState — mirrors picture.py SolveState (without print_state).
@@ -262,13 +272,19 @@ BatchResult solve_one_batch(const std::vector<std::int8_t>& states,
 // ---------------------------------------------------------------------------
 // write_intersection: apply the deduced positions/values to pic, marking
 // the cross-direction dirty for any cells that go from UNKNOWN to a value.
+//
+// Templated on with_trail: when true, every pixel transition UNKNOWN -> value
+// is recorded into *trail (linear cell index r*W + c). The compiler dead-code-
+// eliminates the recording branch when with_trail = false.
 // ---------------------------------------------------------------------------
 
+template <bool with_trail>
 void write_intersection(const std::vector<int>& positions,
                         const std::vector<std::int8_t>& values,
                         int line_index,
                         Picture& pic,
-                        bool is_row) {
+                        bool is_row,
+                        Trail* trail) {
     if (is_row) {
         const int row = line_index;
         const int W = pic.width();
@@ -279,6 +295,9 @@ void write_intersection(const std::vector<int>& positions,
                 px[col] = values[i];
                 pic.unknown_count -= 1;
                 pic.mark_col_dirty(col);
+                if (with_trail) {
+                    trail->changed_cell_indices.push_back(row * W + col);
+                }
             }
         }
     } else {
@@ -291,6 +310,9 @@ void write_intersection(const std::vector<int>& positions,
                 cell = values[i];
                 pic.unknown_count -= 1;
                 pic.mark_row_dirty(row);
+                if (with_trail) {
+                    trail->changed_cell_indices.push_back(row * W + col);
+                }
             }
         }
     }
@@ -301,9 +323,11 @@ void write_intersection(const std::vector<int>& positions,
 // false, on success returns true.
 // ---------------------------------------------------------------------------
 
+template <bool with_trail>
 bool solve_lines(const std::vector<std::vector<std::int8_t>>& mapped,
                  Picture& pic,
-                 bool is_row) {
+                 bool is_row,
+                 Trail* trail) {
     auto& queue = is_row ? pic.row_queue : pic.col_queue;
     auto& dirty = is_row ? pic.row_dirty : pic.col_dirty;
     while (!queue.empty()) {
@@ -315,7 +339,7 @@ bool solve_lines(const std::vector<std::vector<std::int8_t>>& mapped,
             return false;
         }
         if (r.positions != nullptr) {
-            write_intersection(*r.positions, *r.values, index, pic, is_row);
+            write_intersection<with_trail>(*r.positions, *r.values, index, pic, is_row, trail);
         }
     }
     return true;
@@ -357,8 +381,16 @@ int count_solved_pixels(const Picture& pic) {
 }
 
 // ---------------------------------------------------------------------------
-// probe_cell: try setting (row, col) to val on a copy of pic, drain queues.
-// Returns (ok, pixels_filled). ok=false on contradiction, pixels_filled=0.
+// probe_cell: try setting (row, col) to val, drain queues. Returns
+// (ok, pixels_filled). ok=false on contradiction, pixels_filled=0.
+//
+// Mutates pic in place under a trail and reverts every change before
+// returning, regardless of which path is taken (RAII guard). Avoids the
+// per-probe pic.copy() that dominated the hot path.
+//
+// Precondition: at entry, both queues are empty and all dirty bits are 0.
+// (Holds because solve_real drains both queues before calling solve_backtrack,
+// which calls probe_cell without touching the picture.)
 // ---------------------------------------------------------------------------
 
 struct ProbeResult {
@@ -366,31 +398,91 @@ struct ProbeResult {
     int pixels_filled;
 };
 
+// RAII guard that snapshots a small amount of Picture state at construction
+// and restores pic to its entry state on destruction by walking the trail.
+struct ProbeGuard {
+    Picture& pic;
+    Trail& trail;
+    int saved_unknown_count;
+    std::unordered_set<int> saved_solved_rows;
+    std::unordered_set<int> saved_solved_cols;
+
+    ProbeGuard(Picture& p, Trail& t)
+        : pic(p),
+          trail(t),
+          saved_unknown_count(p.unknown_count),
+          saved_solved_rows(p.solved_rows),
+          saved_solved_cols(p.solved_cols) {
+        // Precondition: queues empty, dirty all zero.
+        assert(p.row_queue.empty() && p.col_queue.empty());
+    }
+
+    ~ProbeGuard() {
+        // Walk trail in reverse and restore each cell to UNKNOWN. We bypass
+        // Picture::set_pixel because it only adjusts unknown_count for the
+        // UNKNOWN -> value direction.
+        std::int8_t* px = pic.pixels.data();
+        for (auto it = trail.changed_cell_indices.rbegin();
+             it != trail.changed_cell_indices.rend(); ++it) {
+            px[*it] = UNKNOWN;
+        }
+        pic.unknown_count = saved_unknown_count;
+        pic.solved_rows = std::move(saved_solved_rows);
+        pic.solved_cols = std::move(saved_solved_cols);
+
+        // Drain any pending queue entries and clear their dirty flags.
+        // (Anything in the queue has dirty[i] = 1 by construction; clearing
+        // dirty for popped indices fully restores the empty/zero invariant.)
+        while (!pic.row_queue.empty()) {
+            int i = pic.row_queue.front();
+            pic.row_queue.pop_front();
+            pic.row_dirty[i] = 0;
+        }
+        while (!pic.col_queue.empty()) {
+            int j = pic.col_queue.front();
+            pic.col_queue.pop_front();
+            pic.col_dirty[j] = 0;
+        }
+    }
+};
+
 ProbeResult probe_cell(int row,
                        int col,
                        std::int8_t val,
                        const std::vector<std::vector<std::int8_t>>& mapped_rows,
                        const std::vector<std::vector<std::int8_t>>& mapped_cols,
-                       const Picture& pic) {
-    Picture pic2 = pic.copy();
-    pic2.set_pixel(row, col, val);
-    pic2.mark_row_dirty(row);
-    pic2.mark_col_dirty(col);
+                       Picture& pic) {
+    Trail trail;
+    // Reserve enough headroom that most probes don't reallocate. Linear in
+    // the number of unknowns.
+    trail.changed_cell_indices.reserve(static_cast<std::size_t>(pic.unknown_count));
 
-    if (!solve_check(pic2, mapped_rows, mapped_cols)) {
+    ProbeGuard guard(pic, trail);
+
+    // Apply the probe pixel directly (bypass set_pixel; record on trail).
+    const int W = pic.width();
+    const int idx = row * W + col;
+    pic.pixels[idx] = val;
+    pic.unknown_count -= 1;
+    trail.changed_cell_indices.push_back(idx);
+
+    pic.mark_row_dirty(row);
+    pic.mark_col_dirty(col);
+
+    if (!solve_check(pic, mapped_rows, mapped_cols)) {
         return ProbeResult{false, 0};
     }
 
-    while (pic2.has_dirty()) {
-        if (!solve_lines(mapped_rows, pic2, true)) {
+    while (pic.has_dirty()) {
+        if (!solve_lines<true>(mapped_rows, pic, true, &trail)) {
             return ProbeResult{false, 0};
         }
-        if (!solve_lines(mapped_cols, pic2, false)) {
+        if (!solve_lines<true>(mapped_cols, pic, false, &trail)) {
             return ProbeResult{false, 0};
         }
     }
 
-    return ProbeResult{true, count_solved_pixels(pic2)};
+    return ProbeResult{true, count_solved_pixels(pic)};
 }
 
 // ---------------------------------------------------------------------------
@@ -565,10 +657,10 @@ bool solve_real(const std::vector<std::vector<std::int8_t>>& mapped_rows,
     }
 
     while (pic.has_dirty()) {
-        if (!solve_lines(mapped_rows, pic, true)) {
+        if (!solve_lines<false>(mapped_rows, pic, true, nullptr)) {
             return true;
         }
-        if (!solve_lines(mapped_cols, pic, false)) {
+        if (!solve_lines<false>(mapped_cols, pic, false, nullptr)) {
             return true;
         }
     }

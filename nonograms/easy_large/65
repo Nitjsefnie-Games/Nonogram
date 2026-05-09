@@ -2,7 +2,8 @@
 # cpu=AMD EPYC 7H12 64-Core Processor
 # isolated_core=5
 # strategy=contra
-# solve_time=0.01258
+# n_solutions=1
+# solve_time=0.00220
 12
 5 2 5
 5 2 2 5
