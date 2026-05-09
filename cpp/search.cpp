@@ -537,6 +537,11 @@ bool solve_backtrack(const std::vector<std::vector<std::int8_t>>& mapped_rows,
     const int W = pic.width();
     std::vector<int> scores = get_neighbor_scores(pic);
 
+    // Per-row / per-col UNKNOWN counts, used as the "most constrained line"
+    // signal in the composite sort key (lower => more constrained line).
+    std::vector<int> unknowns_in_row(static_cast<std::size_t>(H), 0);
+    std::vector<int> unknowns_in_col(static_cast<std::size_t>(W), 0);
+
     // Collect unknown coords in row-major order (matches np.argwhere order).
     std::vector<std::pair<int, int>> unknown_coords;
     unknown_coords.reserve(static_cast<std::size_t>(pic.unknown_count));
@@ -544,6 +549,8 @@ bool solve_backtrack(const std::vector<std::vector<std::int8_t>>& mapped_rows,
         for (int c = 0; c < W; ++c) {
             if (pic.pixels[r * W + c] == UNKNOWN) {
                 unknown_coords.emplace_back(r, c);
+                unknowns_in_row[r] += 1;
+                unknowns_in_col[c] += 1;
             }
         }
     }
@@ -556,16 +563,27 @@ bool solve_backtrack(const std::vector<std::vector<std::int8_t>>& mapped_rows,
     int best_col = -1;
     std::int8_t best_first_val = FULL;
 
+    // Composite key: ascending line_constraint, then descending neighbor.
+    // Returned via a pair so std::less ordering matches the desired ordering
+    // (we negate neighbor so larger neighbor compares smaller, i.e. wins ties).
+    auto composite_key = [&](int r, int c) {
+        int line_constraint = unknowns_in_row[r] + unknowns_in_col[c];
+        int neighbor = scores[r * W + c];
+        return std::pair<int, int>(line_constraint, -neighbor);
+    };
+
     if (state.skip_probing) {
-        // Pick the cell with highest neighbor score.
+        // Pick the cell with the smallest composite key (most-constrained
+        // line; tie-broken by highest neighbor score). Equivalent to
+        // sorted_coords[0] under the same key.
         int best_idx = 0;
-        int best_score = -1;
-        for (std::size_t i = 0; i < unknown_coords.size(); ++i) {
-            int r = unknown_coords[i].first;
-            int c = unknown_coords[i].second;
-            int s = scores[r * W + c];
-            if (s > best_score) {
-                best_score = s;
+        std::pair<int, int> best_key = composite_key(unknown_coords[0].first,
+                                                     unknown_coords[0].second);
+        for (std::size_t i = 1; i < unknown_coords.size(); ++i) {
+            std::pair<int, int> k = composite_key(unknown_coords[i].first,
+                                                  unknown_coords[i].second);
+            if (k < best_key) {
+                best_key = k;
                 best_idx = static_cast<int>(i);
             }
         }
@@ -573,15 +591,16 @@ bool solve_backtrack(const std::vector<std::vector<std::int8_t>>& mapped_rows,
         best_col = unknown_coords[best_idx].second;
         best_first_val = FULL;
     } else {
-        // Sort by descending neighbor score (stable to mirror np.argsort which
-        // is stable for equal keys).
+        // Sort by composite key ascending: ascending line_constraint, then
+        // descending neighbor (stable to keep deterministic order on full ties,
+        // mirroring np.argsort which is stable).
         std::vector<int> order(unknown_coords.size());
         for (std::size_t i = 0; i < order.size(); ++i) order[i] = static_cast<int>(i);
         std::stable_sort(order.begin(), order.end(),
             [&](int a, int b) {
                 int ra = unknown_coords[a].first, ca = unknown_coords[a].second;
                 int rb = unknown_coords[b].first, cb = unknown_coords[b].second;
-                return scores[ra * W + ca] > scores[rb * W + cb];
+                return composite_key(ra, ca) < composite_key(rb, cb);
             });
 
         int best_pixels = -1;
