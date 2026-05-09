@@ -1,5 +1,5 @@
 CXX = g++
-CXXFLAGS = -O3 -march=native -std=c++17 -Wall -Wextra -pedantic
+CXXFLAGS = -O3 -march=native -flto -std=c++17 -Wall -Wextra -pedantic
 
 SRCS = main.cpp lines.cpp picture.cpp puzzle_io.cpp search.cpp
 OBJS = $(SRCS:.cpp=.o)
