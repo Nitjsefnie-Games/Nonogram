@@ -3,7 +3,7 @@
 # isolated_core=5
 # strategy=contra
 # n_solutions=1
-# solve_time=0.11160
+# solve_time=0.11260
 60
 15 3 2 2 3 3
 14 11 6 7 3 1 4
