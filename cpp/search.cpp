@@ -66,8 +66,14 @@ std::string line_to_bytes(const std::vector<std::int8_t>& line) {
 }
 
 // ---------------------------------------------------------------------------
-// Trail — records cell-index mutations during a probe so probe_cell can
-// undo them in place (avoiding pic.copy()). Only used when probing.
+// Trail — records cell-index mutations so probe_cell and solve_backtrack can
+// undo them in place (avoiding pic.copy()). Threaded through all propagation
+// paths. A single Trail is owned by solve(); each backtrack branch uses
+// trail.size() as a mark, applies its branch pixel + propagation, then
+// truncates the trail (reverting cells to UNKNOWN) before the next branch.
+// probe_cell uses a private local Trail because its mutations are reverted
+// before returning to its caller (solve_backtrack), so they don't need to
+// commingle with the outer trail.
 // ---------------------------------------------------------------------------
 
 struct Trail {
@@ -172,13 +178,15 @@ bool solve_real(const std::vector<std::vector<std::int8_t>>& mapped_rows,
                 const std::vector<std::vector<std::int8_t>>& mapped_cols,
                 Picture& pic,
                 SolveState& state,
-                const OnSolution& on_solution);
+                const OnSolution& on_solution,
+                Trail& trail);
 
 bool solve_backtrack(const std::vector<std::vector<std::int8_t>>& mapped_rows,
                      const std::vector<std::vector<std::int8_t>>& mapped_cols,
                      Picture& pic,
                      SolveState& state,
-                     const OnSolution& on_solution);
+                     const OnSolution& on_solution,
+                     Trail& trail);
 
 // ---------------------------------------------------------------------------
 // solve_check: validate every not-yet-solved row/col; mark fully-known lines
@@ -277,18 +285,17 @@ BatchResult solve_one_batch(const std::vector<std::int8_t>& states,
 // write_intersection: apply the deduced positions/values to pic, marking
 // the cross-direction dirty for any cells that go from UNKNOWN to a value.
 //
-// Templated on with_trail: when true, every pixel transition UNKNOWN -> value
-// is recorded into *trail (linear cell index r*W + c). The compiler dead-code-
-// eliminates the recording branch when with_trail = false.
+// Every pixel transition UNKNOWN -> value is recorded into trail (linear cell
+// index r*W + c). On revert, the caller truncates the trail and walks each
+// recorded index back to UNKNOWN.
 // ---------------------------------------------------------------------------
 
-template <bool with_trail>
 void write_intersection(const std::vector<int>& positions,
                         const std::vector<std::int8_t>& values,
                         int line_index,
                         Picture& pic,
                         bool is_row,
-                        Trail* trail) {
+                        Trail& trail) {
     if (is_row) {
         const int row = line_index;
         const int W = pic.width();
@@ -299,9 +306,7 @@ void write_intersection(const std::vector<int>& positions,
                 px[col] = values[i];
                 pic.unknown_count -= 1;
                 pic.mark_col_dirty(col);
-                if (with_trail) {
-                    trail->changed_cell_indices.push_back(row * W + col);
-                }
+                trail.changed_cell_indices.push_back(row * W + col);
             }
         }
     } else {
@@ -314,9 +319,7 @@ void write_intersection(const std::vector<int>& positions,
                 cell = values[i];
                 pic.unknown_count -= 1;
                 pic.mark_row_dirty(row);
-                if (with_trail) {
-                    trail->changed_cell_indices.push_back(row * W + col);
-                }
+                trail.changed_cell_indices.push_back(row * W + col);
             }
         }
     }
@@ -327,11 +330,10 @@ void write_intersection(const std::vector<int>& positions,
 // false, on success returns true.
 // ---------------------------------------------------------------------------
 
-template <bool with_trail>
 bool solve_lines(const std::vector<std::vector<std::int8_t>>& mapped,
                  Picture& pic,
                  bool is_row,
-                 Trail* trail) {
+                 Trail& trail) {
     auto& queue = is_row ? pic.row_queue : pic.col_queue;
     auto& dirty = is_row ? pic.row_dirty : pic.col_dirty;
     while (!queue.empty()) {
@@ -343,7 +345,7 @@ bool solve_lines(const std::vector<std::vector<std::int8_t>>& mapped,
             return false;
         }
         if (r.positions != nullptr) {
-            write_intersection<with_trail>(*r.positions, *r.values, index, pic, is_row, trail);
+            write_intersection(*r.positions, *r.values, index, pic, is_row, trail);
         }
     }
     return true;
@@ -478,10 +480,10 @@ ProbeResult probe_cell(int row,
     }
 
     while (pic.has_dirty()) {
-        if (!solve_lines<true>(mapped_rows, pic, true, &trail)) {
+        if (!solve_lines(mapped_rows, pic, true, trail)) {
             return ProbeResult{false, 0};
         }
-        if (!solve_lines<true>(mapped_cols, pic, false, &trail)) {
+        if (!solve_lines(mapped_cols, pic, false, trail)) {
             return ProbeResult{false, 0};
         }
     }
@@ -493,11 +495,44 @@ ProbeResult probe_cell(int row,
 // solve_backtrack
 // ---------------------------------------------------------------------------
 
+// Helper: revert pic to the state captured at branch entry. Walks the trail
+// from its current size back to `mark`, restoring each cell to UNKNOWN.
+// Restores unknown_count and the solved-row/col sets from snapshots. Drains
+// any leftover queue entries (clearing their dirty bits) so the picture
+// is in a clean queues-empty / dirty-zero state, matching branch entry.
+void revert_branch(Picture& pic,
+                   Trail& trail,
+                   std::size_t mark,
+                   int saved_unknown_count,
+                   std::unordered_set<int>& saved_solved_rows,
+                   std::unordered_set<int>& saved_solved_cols) {
+    std::int8_t* px = pic.pixels.data();
+    while (trail.changed_cell_indices.size() > mark) {
+        int idx = trail.changed_cell_indices.back();
+        trail.changed_cell_indices.pop_back();
+        px[idx] = UNKNOWN;
+    }
+    pic.unknown_count = saved_unknown_count;
+    pic.solved_rows = std::move(saved_solved_rows);
+    pic.solved_cols = std::move(saved_solved_cols);
+    while (!pic.row_queue.empty()) {
+        int i = pic.row_queue.front();
+        pic.row_queue.pop_front();
+        pic.row_dirty[i] = 0;
+    }
+    while (!pic.col_queue.empty()) {
+        int j = pic.col_queue.front();
+        pic.col_queue.pop_front();
+        pic.col_dirty[j] = 0;
+    }
+}
+
 bool solve_backtrack(const std::vector<std::vector<std::int8_t>>& mapped_rows,
                      const std::vector<std::vector<std::int8_t>>& mapped_cols,
                      Picture& pic,
                      SolveState& state,
-                     const OnSolution& on_solution) {
+                     const OnSolution& on_solution,
+                     Trail& trail) {
     const int H = pic.height();
     const int W = pic.width();
     std::vector<int> scores = get_neighbor_scores(pic);
@@ -567,18 +602,26 @@ bool solve_backtrack(const std::vector<std::vector<std::int8_t>>& mapped_rows,
 
             if (full_res.ok && !empty_res.ok) {
                 state.mark_contradiction();
-                pic.set_pixel(row, col, FULL);
+                // Forced commit: record the pixel on the trail so a parent
+                // backtrack frame can revert it if its own branch fails.
+                const int idx_f = row * W + col;
+                pic.pixels[idx_f] = FULL;
+                pic.unknown_count -= 1;
+                trail.changed_cell_indices.push_back(idx_f);
                 pic.mark_row_dirty(row);
                 pic.mark_col_dirty(col);
-                return solve_real(mapped_rows, mapped_cols, pic, state, on_solution);
+                return solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
             }
 
             if (empty_res.ok && !full_res.ok) {
                 state.mark_contradiction();
-                pic.set_pixel(row, col, EMPTY);
+                const int idx_e = row * W + col;
+                pic.pixels[idx_e] = EMPTY;
+                pic.unknown_count -= 1;
+                trail.changed_cell_indices.push_back(idx_e);
                 pic.mark_row_dirty(row);
                 pic.mark_col_dirty(col);
-                return solve_real(mapped_rows, mapped_cols, pic, state, on_solution);
+                return solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
             }
 
             int max_pixels = std::max(full_res.pixels_filled, empty_res.pixels_filled);
@@ -605,38 +648,51 @@ bool solve_backtrack(const std::vector<std::vector<std::int8_t>>& mapped_rows,
 
     state.enter_backtrack();
 
-    // Iterative two-branch loop. branch==0 runs first_val under a wrapped
-    // callback that records whether any solution was emitted (so we can call
-    // first_branch_failed if the branch yields nothing). branch==1 runs
-    // second_val with the raw callback. On stop signal (solve_real returns
-    // false), we propagate immediately WITHOUT calling exit_backtrack — the
-    // caller is aborting; matches the original recursive form.
+    // Iterative two-branch loop, no pic.copy(). Each branch records a trail
+    // mark + small snapshot, applies the branch pixel, recurses, then on
+    // normal return reverts pic to the entry state for the next branch.
     //
-    // exit_backtrack is invoked exactly once, after both branches complete
-    // normally. That matches the original semantics.
+    // On stop signal (solve_real returns false) we propagate immediately
+    // WITHOUT reverting or calling exit_backtrack — the caller is aborting,
+    // pic state is no longer observed.
+    //
+    // exit_backtrack is invoked exactly once, after both branches complete.
     bool found_solution_in_first = false;
     for (int branch = 0; branch < 2; ++branch) {
         const std::int8_t val = (branch == 0) ? first_val : second_val;
-        Picture pic2 = pic.copy();
-        pic2.set_pixel(row, col, val);
-        pic2.mark_row_dirty(row);
-        pic2.mark_col_dirty(col);
+
+        const std::size_t mark = trail.changed_cell_indices.size();
+        const int saved_unknown_count = pic.unknown_count;
+        std::unordered_set<int> saved_solved_rows = pic.solved_rows;
+        std::unordered_set<int> saved_solved_cols = pic.solved_cols;
+
+        // Apply the branch pixel directly (bypass set_pixel; record on trail).
+        const int br_idx = row * W + col;
+        pic.pixels[br_idx] = val;
+        pic.unknown_count -= 1;
+        trail.changed_cell_indices.push_back(br_idx);
+        pic.mark_row_dirty(row);
+        pic.mark_col_dirty(col);
 
         if (branch == 0) {
             OnSolution wrapped = [&](const Picture& p) {
                 found_solution_in_first = true;
                 return on_solution(p);
             };
-            if (!solve_real(mapped_rows, mapped_cols, pic2, state, wrapped)) {
+            if (!solve_real(mapped_rows, mapped_cols, pic, state, wrapped, trail)) {
                 return false;
             }
+            revert_branch(pic, trail, mark, saved_unknown_count,
+                          saved_solved_rows, saved_solved_cols);
             if (!found_solution_in_first) {
                 state.first_branch_failed();
             }
         } else {
-            if (!solve_real(mapped_rows, mapped_cols, pic2, state, on_solution)) {
+            if (!solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail)) {
                 return false;
             }
+            revert_branch(pic, trail, mark, saved_unknown_count,
+                          saved_solved_rows, saved_solved_cols);
         }
     }
 
@@ -652,7 +708,8 @@ bool solve_real(const std::vector<std::vector<std::int8_t>>& mapped_rows,
                 const std::vector<std::vector<std::int8_t>>& mapped_cols,
                 Picture& pic,
                 SolveState& state,
-                const OnSolution& on_solution) {
+                const OnSolution& on_solution,
+                Trail& trail) {
     if (!solve_check(pic, mapped_rows, mapped_cols)) {
         return true;
     }
@@ -663,10 +720,10 @@ bool solve_real(const std::vector<std::vector<std::int8_t>>& mapped_rows,
     }
 
     while (pic.has_dirty()) {
-        if (!solve_lines<false>(mapped_rows, pic, true, nullptr)) {
+        if (!solve_lines(mapped_rows, pic, true, trail)) {
             return true;
         }
-        if (!solve_lines<false>(mapped_cols, pic, false, nullptr)) {
+        if (!solve_lines(mapped_cols, pic, false, trail)) {
             return true;
         }
     }
@@ -676,7 +733,7 @@ bool solve_real(const std::vector<std::vector<std::int8_t>>& mapped_rows,
         return on_solution(pic);
     }
 
-    return solve_backtrack(mapped_rows, mapped_cols, pic, state, on_solution);
+    return solve_backtrack(mapped_rows, mapped_cols, pic, state, on_solution, trail);
 }
 
 } // anonymous namespace
@@ -709,7 +766,10 @@ void solve(const std::vector<std::vector<int>>& rows,
     }
 
     SolveState state;
-    (void)solve_real(mapped_rows, mapped_cols, pic, state, on_solution);
+    Trail trail;
+    // Reserve enough headroom that the trail rarely reallocates.
+    trail.changed_cell_indices.reserve(static_cast<std::size_t>(H) * static_cast<std::size_t>(W));
+    (void)solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
 
     if (out_strategy != nullptr) {
         // Priority: BACKTRACK > CONTRA > BASIC. Mirrors SolveState.get_strategy()
