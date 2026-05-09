@@ -1,3 +1,5 @@
+import re
+import subprocess
 import time
 import os
 from datetime import datetime
@@ -6,6 +8,7 @@ from pathlib import Path
 
 from cpuinfo import get_cpu_info
 
+from picture import SolveStrategy
 from puzzle_io import clues_valid, load_clues
 from search import solve_with_strategy, __version__ as SOLVER_VERSION
 from webpbn import fetch_webpbn
@@ -86,7 +89,7 @@ def get_time_category(solve_time, rows, cols):
     return "easy_large"
 
 
-def make_header_block(strategy, solve_time):
+def make_header_block(strategy, n_solutions, solve_time):
     lines = [
         f"# solver={SOLVER_VERSION}",
         f"# cpu={CPU_MODEL}",
@@ -94,6 +97,7 @@ def make_header_block(strategy, solve_time):
     if ISOLATED_CORE:
         lines.append(f"# isolated_core={ISOLATED_CORE}")
     lines.append(f"# strategy={strategy}")
+    lines.append(f"# n_solutions={n_solutions}")
     lines.append(f"# solve_time={solve_time:.5f}")
     return "\n".join(lines) + "\n"
 
@@ -150,7 +154,7 @@ def categorize_and_save(puzzle_id, clue_text, rows, cols, solution_count, strate
 
     filepath = f"{folder}/{puzzle_id}"
     with open(filepath, "w") as f:
-        f.write(make_header_block(strat_cat, solve_time))
+        f.write(make_header_block(strat_cat, solution_count, solve_time))
         f.write(clue_text)
 
     return f"{time_cat}/{strat_cat}"
@@ -181,7 +185,61 @@ def solve_puzzle_text(clue_text):
     return solution_count, strategy, elapsed, rows, cols
 
 
-def rebench_file(path):
+_STRATEGY_NAME_TO_ENUM = {
+    "basic": SolveStrategy.BASIC,
+    "contra": SolveStrategy.CONTRA,
+    "backtrack": SolveStrategy.BACKTRACK,
+}
+
+
+def _solve_via_external(cmd, puzzle_path):
+    """Run an external solver binary on `puzzle_path` and parse its stdout.
+
+    Expects (case-sensitive) the lines emitted by cpp/main.cpp:
+        Time: <X.XXXXX>s
+        Found <N[,with,commas]> solution(s) (...)
+        Strategy: basic|contra|backtrack
+
+    Returns (n_solutions, strategy_enum, elapsed). Raises RuntimeError on
+    non-zero exit or unparseable output.
+    """
+    proc = subprocess.run(
+        [cmd, puzzle_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"external solver {cmd!r} failed on {puzzle_path!r} "
+            f"(exit {proc.returncode}): {proc.stderr.strip()}"
+        )
+
+    out = proc.stdout
+
+    m_found = re.search(r"^Found\s+([\d,]+)\s+solution\(s\)", out, re.MULTILINE)
+    m_time = re.search(r"^Time:\s+([0-9]*\.?[0-9]+)s", out, re.MULTILINE)
+    m_strat = re.search(r"^Strategy:\s+(\S+)", out, re.MULTILINE)
+
+    if not (m_found and m_time and m_strat):
+        raise RuntimeError(
+            f"external solver {cmd!r}: could not parse output for {puzzle_path!r}.\n"
+            f"stdout: {out!r}"
+        )
+
+    n_solutions = int(m_found.group(1).replace(",", ""))
+    elapsed = float(m_time.group(1))
+    strat_name = m_strat.group(1).strip()
+    if strat_name not in _STRATEGY_NAME_TO_ENUM:
+        raise RuntimeError(
+            f"external solver {cmd!r}: unknown strategy {strat_name!r}"
+        )
+    strategy = _STRATEGY_NAME_TO_ENUM[strat_name]
+    return n_solutions, strategy, elapsed
+
+
+def rebench_file(path, solver_cmd=None):
     try:
         rows, cols = load_clues(path)
     except Exception as exc:
@@ -191,15 +249,18 @@ def rebench_file(path):
         print(f"  {path}: invalid clues")
         return False, path, None
 
-    start = time.perf_counter()
-    _, strategy = solve_with_strategy(rows, cols)
-    elapsed = time.perf_counter() - start
+    if solver_cmd is None:
+        start = time.perf_counter()
+        n_solutions, strategy = solve_with_strategy(rows, cols)
+        elapsed = time.perf_counter() - start
+    else:
+        n_solutions, strategy, elapsed = _solve_via_external(solver_cmd, path)
     strat_cat = strategy.value
 
     with open(path) as f:
         full = f.read()
     blocks, body = parse_header_blocks(full)
-    new_block = make_header_block(strat_cat, elapsed)
+    new_block = make_header_block(strat_cat, n_solutions, elapsed)
     if blocks and header_matches_current(blocks[0]):
         blocks[0] = new_block
     else:
@@ -220,7 +281,7 @@ def rebench_file(path):
     return True, new_path, elapsed
 
 
-def rebench_folder(root, excludes):
+def rebench_folder(root, excludes, solver_cmd=None):
     print(f"Rebenching {root}")
     if excludes:
         print(f"Excluded folders (exact-name match): {sorted(excludes)}")
@@ -238,7 +299,7 @@ def rebench_folder(root, excludes):
 
     rebenched = moved = 0
     for path in files:
-        ok, new_path, elapsed = rebench_file(path)
+        ok, new_path, elapsed = rebench_file(path, solver_cmd=solver_cmd)
         if not ok:
             continue
         rebenched += 1
@@ -268,6 +329,12 @@ def main():
                         help='Re-solve every puzzle file under DIR with the current solver instead of fetching from webpbn')
     parser.add_argument('--exclude', action='append', default=[], metavar='FOLDER',
                         help='Folder name (exact match, any depth) to skip during --rebench. Repeatable.')
+    parser.add_argument('--solver-cmd', metavar='PATH', default=None,
+                        help='External solver binary to use during --rebench. Each '
+                             'puzzle file path is passed as the sole argument; the '
+                             'solver must print "Found N solution(s)", "Time: Xs", '
+                             'and "Strategy: <name>" lines on stdout. '
+                             'Ignored outside --rebench mode.')
     args = parser.parse_args()
 
     joined = join_solver_cgroup()
@@ -277,7 +344,7 @@ def main():
         print(f"(no exclusive cpuset; run scripts/cpuset_setup.sh as root for stable timings)")
 
     if args.rebench:
-        rebench_folder(args.rebench, set(args.exclude))
+        rebench_folder(args.rebench, set(args.exclude), solver_cmd=args.solver_cmd)
         return
 
     if args.start is not None:
