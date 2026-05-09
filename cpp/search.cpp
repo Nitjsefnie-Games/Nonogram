@@ -589,7 +589,8 @@ bool solve_real(const std::vector<std::vector<std::int8_t>>& mapped_rows,
 
 void solve(const std::vector<std::vector<int>>& rows,
            const std::vector<std::vector<int>>& cols,
-           std::function<bool(const Picture&)> on_solution) {
+           std::function<bool(const Picture&)> on_solution,
+           Strategy* out_strategy) {
     reset_line_cache();
 
     const int H = static_cast<int>(rows.size());
@@ -611,4 +612,16 @@ void solve(const std::vector<std::vector<int>>& rows,
 
     SolveState state;
     (void)solve_real(mapped_rows, mapped_cols, pic, state, on_solution);
+
+    if (out_strategy != nullptr) {
+        // Priority: BACKTRACK > CONTRA > BASIC. Mirrors SolveState.get_strategy()
+        // in picture.py.
+        if (state.used_backtrack) {
+            *out_strategy = Strategy::BACKTRACK;
+        } else if (state.used_contradiction) {
+            *out_strategy = Strategy::CONTRA;
+        } else {
+            *out_strategy = Strategy::BASIC;
+        }
+    }
 }

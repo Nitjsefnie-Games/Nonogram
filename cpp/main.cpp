@@ -64,6 +64,15 @@ std::string fmt_rate(double r) {
     return fmt_int_commas(rounded);
 }
 
+const char* strategy_name(Strategy s) {
+    switch (s) {
+        case Strategy::BASIC:     return "basic";
+        case Strategy::CONTRA:    return "contra";
+        case Strategy::BACKTRACK: return "backtrack";
+    }
+    return "basic";
+}
+
 void print_grid(const Picture& pic) {
     const int H = pic.height();
     const int W = pic.width();
@@ -183,7 +192,8 @@ int main(int argc, char** argv) {
         return true;
     };
 
-    solve(clues.rows, clues.cols, callback);
+    Strategy strategy = Strategy::BASIC;
+    solve(clues.rows, clues.cols, callback, &strategy);
 
     auto end = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(end - start).count();
@@ -194,6 +204,7 @@ int main(int argc, char** argv) {
     std::printf("Found %s solution(s) (%s/s)\n",
                 fmt_int_commas(solution_count).c_str(),
                 fmt_rate(rate).c_str());
+    std::printf("Strategy: %s\n", strategy_name(strategy));
 
     return 0;
 }
