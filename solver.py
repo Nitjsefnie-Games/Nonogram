@@ -30,23 +30,33 @@ def solve_file(location, number=-1):
     return i
 
 
-def benchmark(rows, cols, runs=5):
+def benchmark(rows, cols, runs=5, max_solutions=None):
     print(f"Benchmarking {runs} runs...")
     times = []
+    counts = []
     pic = None
     for i in range(runs):
         start = time.perf_counter()
+        count = 0
         for pic in solve(rows, cols):
-            break
+            count += 1
+            if max_solutions is not None and count >= max_solutions:
+                break
         elapsed = time.perf_counter() - start
         times.append(elapsed)
-        print(f"  Run {i + 1}: {elapsed:.4f}s")
+        counts.append(count)
+        rate = count / elapsed if elapsed > 0 else 0
+        print(f"  Run {i + 1}: {elapsed:.4f}s ({count:,} solutions, {rate:,.0f}/s)")
 
     avg = sum(times) / len(times)
     min_t = min(times)
     max_t = max(times)
     print(f"\nAverage: {avg:.4f}s")
     print(f"Min: {min_t:.4f}s, Max: {max_t:.4f}s")
+    if counts and all(c == counts[0] for c in counts):
+        print(f"Solutions: {counts[0]:,}")
+    else:
+        print(f"Solutions per run: {counts}")
     return pic
 
 
@@ -58,7 +68,8 @@ def main():
         print("  ---")
         print("  Column clues (one per line, space-separated numbers)")
         print("\nOptions:")
-        print("  --benchmark  Run multiple times and report statistics")
+        print("  --benchmark  Run multiple times; reports time, solution count, rate")
+        print("               (combine with --max N to cap each run)")
         print("  --runs N     Number of benchmark runs (default 5)")
         print("  --print      Print progress and grid during solving")
         print("  --max N      Stop after finding N solutions")
@@ -87,7 +98,7 @@ def main():
         sys.exit(1)
 
     if do_benchmark:
-        pic = benchmark(rows, cols, runs)
+        pic = benchmark(rows, cols, runs, max_solutions=max_solutions)
     else:
         print(f"Puzzle size: {len(rows)} rows x {len(cols)} cols")
         print("Solving...")
@@ -99,10 +110,14 @@ def main():
         for pic in solve(rows, cols, print_progress=print_progress):
             solution_count += 1
             if print_progress:
-                print(f"\n=== Solution {solution_count} found ===")
+                elapsed = time.perf_counter() - start
+                rate = solution_count / elapsed if elapsed > 0 else 0
+                print(f"\n=== Solution {solution_count} found ({rate:,.0f}/s, elapsed {elapsed:.1f}s) ===")
                 print(pic)
             elif solution_count % print_count_threshold == 0:
-                print(f"{solution_count} ", end='', flush=True)
+                elapsed = time.perf_counter() - start
+                rate = solution_count / elapsed if elapsed > 0 else 0
+                print(f"{solution_count:,} ({rate:,.0f}/s, {elapsed:.1f}s) ", end='', flush=True)
                 print_count_threshold = int(print_count_threshold * 1.1)
                 print_count += 1
                 if print_count == 10:
@@ -114,7 +129,8 @@ def main():
         elapsed = time.perf_counter() - start
 
         print(f"\nTime: {elapsed:.4f}s")
-        print(f"Found {solution_count} solution(s)")
+        rate = solution_count / elapsed if elapsed > 0 else 0
+        print(f"Found {solution_count:,} solution(s) ({rate:,.0f}/s)")
 
 
 if __name__ == "__main__":
