@@ -11,11 +11,13 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <list>
 #include <string>
 #include <utility>
 #include <vector>
@@ -48,15 +50,57 @@ struct LineKeyHash {
     }
 };
 
-using LineCache = ankerl::unordered_dense::map<LineKey, LineSolveResult, LineKeyHash>;
+struct LineCacheEntry {
+    LineKey key;
+    LineSolveResult value;
+};
 
-LineCache& line_cache() {
-    static LineCache cache;
+class LRULineCache {
+public:
+    std::size_t max_entries_ = 1'000'000;  // default; set by reset_line_cache
+
+    void set_max_entries(std::size_t n) { max_entries_ = std::max<std::size_t>(1, n); }
+
+    void clear() {
+        entries_.clear();
+        index_.clear();
+    }
+
+    LineSolveResult* find_and_promote(const LineKey& key) {
+        auto it = index_.find(key);
+        if (it == index_.end()) return nullptr;
+        // Move to front (most recently used).
+        entries_.splice(entries_.begin(), entries_, it->second);
+        return &it->second->value;
+    }
+
+    LineSolveResult* insert(LineKey key, LineSolveResult value) {
+        if (index_.size() >= max_entries_) {
+            // Evict LRU (back of list).
+            index_.erase(entries_.back().key);
+            entries_.pop_back();
+        }
+        entries_.push_front(LineCacheEntry{key, std::move(value)});
+        auto list_it = entries_.begin();
+        index_.emplace(std::move(key), list_it);
+        return &list_it->value;
+    }
+
+private:
+    std::list<LineCacheEntry> entries_;
+    ankerl::unordered_dense::map<LineKey, std::list<LineCacheEntry>::iterator, LineKeyHash> index_;
+};
+
+LRULineCache& line_cache() {
+    static LRULineCache cache;
     return cache;
 }
 
-void reset_line_cache() {
-    line_cache().clear();
+void reset_line_cache(int max_line_len, std::size_t budget_bytes) {
+    auto& c = line_cache();
+    c.clear();
+    std::size_t per_entry = 295 + 2 * static_cast<std::size_t>(max_line_len);
+    c.set_max_entries(std::max<std::size_t>(1, budget_bytes / per_entry));
 }
 
 // Convert a vector<int8_t> to a std::string of the same byte content for use
@@ -252,14 +296,10 @@ BatchResult solve_one_batch(const std::vector<std::int8_t>& states,
 
     LineKey key{line_to_bytes(line), &states};
     auto& cache = line_cache();
-    auto it = cache.find(key);
-    const LineSolveResult* result_ptr = nullptr;
-    if (it == cache.end()) {
+    const LineSolveResult* result_ptr = cache.find_and_promote(key);
+    if (result_ptr == nullptr) {
         LineSolveResult res = solve_line_batch(line, states);
-        auto ins = cache.emplace(std::move(key), std::move(res));
-        result_ptr = &ins.first->second;
-    } else {
-        result_ptr = &it->second;
+        result_ptr = cache.insert(std::move(key), std::move(res));
     }
 
     if (result_ptr->total == 0) {
@@ -765,7 +805,15 @@ void solve(const std::vector<std::vector<int>>& rows,
            const std::vector<std::vector<int>>& cols,
            std::function<bool(const Picture&)> on_solution,
            Strategy* out_strategy) {
-    reset_line_cache();
+    std::size_t budget = 1024ULL * 1024ULL * 1024ULL;  // 1 GB default
+    const char* env = std::getenv("LINE_CACHE_BUDGET_MB");
+    if (env != nullptr) {
+        try {
+            budget = static_cast<std::size_t>(std::stoull(env)) * 1024ULL * 1024ULL;
+        } catch (...) {}
+    }
+    int max_line = static_cast<int>(std::max(rows.size(), cols.size()));
+    reset_line_cache(max_line, budget);
 
     const int H = static_cast<int>(rows.size());
     const int W = static_cast<int>(cols.size());
