@@ -1,0 +1,47 @@
+# solver=1.6.0
+# cpu=AMD EPYC 7H12 64-Core Processor
+# isolated_core=5
+# strategy=basic
+# n_solutions=1
+# solve_time=0.00010
+2
+2
+15
+14
+13
+12
+11
+10
+8
+8
+8
+8
+8
+8
+8
+8
+8
+12
+14
+16
+---
+0
+0
+0
+0
+1
+1 1
+2 2
+3 2
+4 3
+5 3
+6 3
+18
+18
+18
+20
+20
+18
+18
+18
+6 3
