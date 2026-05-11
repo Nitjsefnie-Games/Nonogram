@@ -3,7 +3,7 @@
 # isolated_core=5
 # strategy=basic
 # n_solutions=1
-# solve_time=0.00130
+# solve_time=0.00140
 7 10 4 10
 6 4 6 7 4 1 9
 5 2 3 5 2 8

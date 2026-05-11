@@ -1,0 +1,37 @@
+# solver=1.6.0
+# cpu=AMD EPYC 7H12 64-Core Processor
+# isolated_core=5
+# strategy=contra
+# n_solutions=1
+# solve_time=0.00030
+1
+2
+3
+4
+4
+4
+1 4
+1 4
+2 4
+3 4
+8
+7
+6
+5
+3
+---
+8
+7
+6
+5
+4
+4
+4
+4
+4
+4
+4
+4
+4
+4
+4
