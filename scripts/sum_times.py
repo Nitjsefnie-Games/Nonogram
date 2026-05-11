@@ -15,7 +15,7 @@ import os
 import re
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 HEADER = re.compile(r"^# (\w+)=(.*)$")
 
@@ -26,7 +26,20 @@ class Aggregate:
     n: int = 0
     max: float = 0.0
     max_path: str = ""
-    min: float = float("inf")
+    times: list = field(default_factory=list)
+
+
+def percentile(sorted_data, p):
+    """Linear-interpolated percentile. p in [0, 100]. sorted_data must be sorted ascending."""
+    if not sorted_data:
+        return 0.0
+    n = len(sorted_data)
+    k = (n - 1) * p / 100.0
+    f = int(k)
+    c = k - f
+    if f + 1 < n:
+        return sorted_data[f] * (1 - c) + sorted_data[f + 1] * c
+    return sorted_data[f]
 
 
 def parse_blocks(path):
@@ -89,8 +102,7 @@ def main():
                 if t > agg.max:
                     agg.max = t
                     agg.max_path = path
-                if t < agg.min:
-                    agg.min = t
+                agg.times.append(t)
 
     if not sums:
         print(f"No matching headers found ({files_seen} files scanned).", file=sys.stderr)
@@ -100,11 +112,16 @@ def main():
     w_solver = max(len(s) for (s, _), _ in rows)
     w_cpu = max(len(c) for (_, c), _ in rows)
 
-    print(f"{'solver':<{w_solver}}  {'cpu':<{w_cpu}}    n       sum         mean        min          max  (max file)")
-    print("-" * (w_solver + w_cpu + 70))
+    print(f"{'solver':<{w_solver}}  {'cpu':<{w_cpu}}    n       sum         p10        p25       mean        p75        p90        max  (max file)")
+    print("-" * (w_solver + w_cpu + 90))
     for (solver, cpu), agg in rows:
         mean = agg.sum / agg.n
-        print(f"{solver:<{w_solver}}  {cpu:<{w_cpu}}  {agg.n:>4}  {agg.sum:>10.3f}s  {mean:>9.4f}s  {agg.min:>9.4f}s  {agg.max:>10.3f}s  {agg.max_path}")
+        sorted_t = sorted(agg.times)
+        p10 = percentile(sorted_t, 10)
+        p25 = percentile(sorted_t, 25)
+        p75 = percentile(sorted_t, 75)
+        p90 = percentile(sorted_t, 90)
+        print(f"{solver:<{w_solver}}  {cpu:<{w_cpu}}  {agg.n:>4}  {agg.sum:>10.3f}s  {p10:>8.4f}s  {p25:>8.4f}s  {mean:>8.4f}s  {p75:>8.4f}s  {p90:>8.4f}s  {agg.max:>9.3f}s  {agg.max_path}")
     print(f"\n({files_seen} files scanned)")
 
 
