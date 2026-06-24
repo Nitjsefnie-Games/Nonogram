@@ -171,6 +171,7 @@ struct SolveState {
     bool used_contradiction = false;
     bool used_backtrack = false;
     bool skip_probing = false;
+    bool keep_probing = false;  // anytime mode: never latch skip_probing
     std::deque<int> probe_outcomes;
 
     // Benchmark hook: if MAX_NODES is set (>0), abort the search after that many
@@ -212,7 +213,7 @@ struct SolveState {
             int sum = 0;
             for (int v : probe_outcomes) sum += v;
             double yield_rate = static_cast<double>(sum) / static_cast<double>(PROBING_WINDOW);
-            if (yield_rate < PROBING_THRESHOLD) {
+            if (yield_rate < PROBING_THRESHOLD && !keep_probing) {
                 skip_probing = true;
             }
         }
@@ -811,7 +812,8 @@ bool solve_real(const std::vector<LineSpec>& mapped_rows,
 void solve(const std::vector<std::vector<int>>& rows,
            const std::vector<std::vector<int>>& cols,
            std::function<bool(const Picture&)> on_solution,
-           Strategy* out_strategy) {
+           Strategy* out_strategy,
+           bool keep_probing) {
     std::size_t budget = 1024ULL * 1024ULL * 1024ULL;  // 1 GB default
     const char* env = std::getenv("LINE_CACHE_BUDGET_MB");
     if (env != nullptr) {
@@ -840,6 +842,8 @@ void solve(const std::vector<std::vector<int>>& rows,
     }
 
     SolveState state;
+    // Anytime mode via flag or ANYTIME env var (for scripting/benchmarks).
+    state.keep_probing = keep_probing || (std::getenv("ANYTIME") != nullptr);
     Trail trail;
     // Reserve enough headroom that the trail rarely reallocates.
     trail.changed_cell_indices.reserve(static_cast<std::size_t>(H) * static_cast<std::size_t>(W));

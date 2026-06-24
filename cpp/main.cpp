@@ -22,6 +22,9 @@ void print_usage(std::FILE* stream) {
     std::fprintf(stream, "  Column clues (one per line, space-separated numbers)\n");
     std::fprintf(stream, "\nOptions:\n");
     std::fprintf(stream, "  --print          Print each solution as a grid\n");
+    std::fprintf(stream, "  --anytime        Keep lookahead probing on for the whole search\n");
+    std::fprintf(stream, "                   (far more solutions/sec on deep enumerations that\n");
+    std::fprintf(stream, "                    otherwise stall; slower on easy puzzles)\n");
     std::fprintf(stream, "  --max N          Stop after finding N solutions\n");
     std::fprintf(stream, "  --print-every N  Log count + rate + elapsed every N solutions\n");
     std::fprintf(stream, "                   (default: progressive batches starting at 10, x1.1)\n");
@@ -104,11 +107,14 @@ int main(int argc, char** argv) {
     long long max_solutions = -1;  // -1 = no cap
     bool have_max = false;
     long long print_every = 0;     // 0 = use progressive default
+    bool anytime = false;          // keep lookahead probing on for whole search
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
         if (std::strcmp(a, "--print") == 0) {
             print_progress = true;
+        } else if (std::strcmp(a, "--anytime") == 0) {
+            anytime = true;
         } else if (std::strcmp(a, "--max") == 0) {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "--max requires a value\n");
@@ -224,7 +230,7 @@ int main(int argc, char** argv) {
     };
 
     Strategy strategy = Strategy::BASIC;
-    solve(clues.rows, clues.cols, callback, &strategy);
+    solve(clues.rows, clues.cols, callback, &strategy, anytime);
 
     auto end = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(end - start).count();
