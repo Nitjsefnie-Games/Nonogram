@@ -92,6 +92,11 @@ class LineCache {
 public:
     std::size_t max_entries_ = 1'000'000;  // default; set by reset_line_cache
 
+    // 0.9 over ankerl's 0.8 default: a denser bucket array fits cache better on
+    // this lookup-bound, memory-latency-dominated path (~+3.5%). 0.95 is worse
+    // (collisions). Set once; harmless on the empty map.
+    LineCache() { map_.max_load_factor(0.9F); }
+
     void set_max_entries(std::size_t n) { max_entries_ = std::max<std::size_t>(1, n); }
     void set_reserve_enabled(bool e) { reserve_enabled_ = e; }
 
