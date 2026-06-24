@@ -92,8 +92,9 @@ public:
     std::size_t max_entries_ = 1'000'000;  // default; set by reset_line_cache
 
     void set_max_entries(std::size_t n) { max_entries_ = std::max<std::size_t>(1, n); }
+    void set_reserve_enabled(bool e) { reserve_enabled_ = e; }
 
-    void clear() { map_.clear(); }
+    void clear() { map_.clear(); reserve_at_ = kReserveTrigger; }
 
     LineSolveResult* find_and_promote(const LineKeyView& key) {
         auto it = map_.find(key);
@@ -103,12 +104,25 @@ public:
     LineSolveResult* insert(LineKey key, LineSolveResult value) {
         if (map_.size() >= max_entries_) {
             map_.clear();  // OOM-safe generational eviction (cold path)
+            reserve_at_ = kReserveTrigger;
+        }
+        // Lazy reserve-ahead: only once a workload proves large (so small/medium
+        // puzzles never pay the upfront allocation) reserve well ahead of need,
+        // eliminating the repeated ankerl rehash-moves that dominate the insert
+        // path on big enumerations. Enabled only in anytime mode so the default
+        // path's timings (and over-reserve on medium enumerations) are untouched.
+        if (reserve_enabled_ && map_.size() >= reserve_at_ && reserve_at_ < max_entries_) {
+            reserve_at_ = std::min(max_entries_, reserve_at_ * 8);
+            map_.reserve(reserve_at_);
         }
         auto res = map_.emplace(std::move(key), std::move(value));
         return &res.first->second;
     }
 
 private:
+    static constexpr std::size_t kReserveTrigger = 1u << 18;  // 262144
+    std::size_t reserve_at_ = kReserveTrigger;
+    bool reserve_enabled_ = false;
     ankerl::unordered_dense::map<LineKey, LineSolveResult, LineKeyHash, LineKeyEq> map_;
 };
 
@@ -117,11 +131,12 @@ LineCache& line_cache() {
     return cache;
 }
 
-void reset_line_cache(int max_line_len, std::size_t budget_bytes) {
+void reset_line_cache(int max_line_len, std::size_t budget_bytes, bool reserve_enabled) {
     auto& c = line_cache();
     c.clear();
     std::size_t per_entry = 295 + 2 * static_cast<std::size_t>(max_line_len);
     c.set_max_entries(std::max<std::size_t>(1, budget_bytes / per_entry));
+    c.set_reserve_enabled(reserve_enabled);
 }
 
 
@@ -809,7 +824,8 @@ void solve(const std::vector<std::vector<int>>& rows,
         } catch (...) {}
     }
     int max_line = static_cast<int>(std::max(rows.size(), cols.size()));
-    reset_line_cache(max_line, budget);
+    const bool anytime = keep_probing || (std::getenv("ANYTIME") != nullptr);
+    reset_line_cache(max_line, budget, anytime);
 
     const int H = static_cast<int>(rows.size());
     const int W = static_cast<int>(cols.size());
@@ -829,8 +845,7 @@ void solve(const std::vector<std::vector<int>>& rows,
     }
 
     SolveState state;
-    // Anytime mode via flag or ANYTIME env var (for scripting/benchmarks).
-    state.keep_probing = keep_probing || (std::getenv("ANYTIME") != nullptr);
+    state.keep_probing = anytime;
     Trail trail;
     // Reserve enough headroom that the trail rarely reallocates.
     trail.changed_cell_indices.reserve(static_cast<std::size_t>(H) * static_cast<std::size_t>(W));
