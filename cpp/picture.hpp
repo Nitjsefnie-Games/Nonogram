@@ -1,7 +1,6 @@
 #pragma once
 #include <cstdint>
 #include <deque>
-#include <unordered_set>
 #include <vector>
 
 class Picture {
@@ -31,8 +30,6 @@ public:
     std::vector<std::uint8_t> col_dirty;
     std::deque<int> row_queue;
     std::deque<int> col_queue;
-    std::unordered_set<int> solved_rows;
-    std::unordered_set<int> solved_cols;
     int unknown_count;
 
 private:

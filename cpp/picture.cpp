@@ -73,8 +73,6 @@ Picture Picture::copy() const {
     new_pic.col_dirty = col_dirty;
     new_pic.row_queue = row_queue;
     new_pic.col_queue = col_queue;
-    new_pic.solved_rows = solved_rows;
-    new_pic.solved_cols = solved_cols;
     new_pic.unknown_count = unknown_count;
     return new_pic;
 }
