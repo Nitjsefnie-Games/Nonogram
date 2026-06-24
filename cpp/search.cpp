@@ -262,14 +262,6 @@ BatchResult solve_one_batch(const LineSpec& spec,
         return BatchResult{false, nullptr, nullptr};
     }
 
-    if (result_ptr->fully_solved) {
-        if (is_col) {
-            pic.solved_cols.insert(index);
-        } else {
-            pic.solved_rows.insert(index);
-        }
-    }
-
     if (result_ptr->positions.empty()) {
         return BatchResult{true, nullptr, nullptr};
     }
@@ -406,15 +398,11 @@ struct ProbeGuard {
     Picture& pic;
     Trail& trail;
     int saved_unknown_count;
-    std::unordered_set<int> saved_solved_rows;
-    std::unordered_set<int> saved_solved_cols;
 
     ProbeGuard(Picture& p, Trail& t)
         : pic(p),
           trail(t),
-          saved_unknown_count(p.unknown_count),
-          saved_solved_rows(p.solved_rows),
-          saved_solved_cols(p.solved_cols) {
+          saved_unknown_count(p.unknown_count) {
         // Precondition: queues empty, dirty all zero.
         assert(p.row_queue.empty() && p.col_queue.empty());
     }
@@ -429,8 +417,6 @@ struct ProbeGuard {
             px[*it] = UNKNOWN;
         }
         pic.unknown_count = saved_unknown_count;
-        pic.solved_rows = std::move(saved_solved_rows);
-        pic.solved_cols = std::move(saved_solved_cols);
 
         // Drain any pending queue entries and clear their dirty flags.
         // (Anything in the queue has dirty[i] = 1 by construction; clearing
@@ -500,9 +486,7 @@ ProbeResult probe_cell(int row,
 void revert_branch(Picture& pic,
                    Trail& trail,
                    std::size_t mark,
-                   int saved_unknown_count,
-                   std::unordered_set<int>& saved_solved_rows,
-                   std::unordered_set<int>& saved_solved_cols) {
+                   int saved_unknown_count) {
     std::int8_t* px = pic.pixels.data();
     while (trail.changed_cell_indices.size() > mark) {
         int idx = trail.changed_cell_indices.back();
@@ -510,8 +494,6 @@ void revert_branch(Picture& pic,
         px[idx] = UNKNOWN;
     }
     pic.unknown_count = saved_unknown_count;
-    pic.solved_rows = std::move(saved_solved_rows);
-    pic.solved_cols = std::move(saved_solved_cols);
     while (!pic.row_queue.empty()) {
         int i = pic.row_queue.front();
         pic.row_queue.pop_front();
@@ -679,8 +661,6 @@ bool solve_backtrack(const std::vector<LineSpec>& mapped_rows,
 
         const std::size_t mark = trail.changed_cell_indices.size();
         const int saved_unknown_count = pic.unknown_count;
-        std::unordered_set<int> saved_solved_rows = pic.solved_rows;
-        std::unordered_set<int> saved_solved_cols = pic.solved_cols;
 
         // Apply the branch pixel directly (bypass set_pixel; record on trail).
         const int br_idx = row * W + col;
@@ -698,8 +678,7 @@ bool solve_backtrack(const std::vector<LineSpec>& mapped_rows,
             if (!solve_real(mapped_rows, mapped_cols, pic, state, wrapped, trail)) {
                 return false;
             }
-            revert_branch(pic, trail, mark, saved_unknown_count,
-                          saved_solved_rows, saved_solved_cols);
+            revert_branch(pic, trail, mark, saved_unknown_count);
             if (!found_solution_in_first) {
                 state.first_branch_failed();
             }
@@ -707,8 +686,7 @@ bool solve_backtrack(const std::vector<LineSpec>& mapped_rows,
             if (!solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail)) {
                 return false;
             }
-            revert_branch(pic, trail, mark, saved_unknown_count,
-                          saved_solved_rows, saved_solved_cols);
+            revert_branch(pic, trail, mark, saved_unknown_count);
         }
     }
 
