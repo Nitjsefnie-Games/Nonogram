@@ -201,7 +201,9 @@ struct SolveState {
     }
 
     void record_probe(bool found_contradiction) {
-        if (skip_probing) return;
+        // In anytime mode skip_probing can never latch, so the whole yield
+        // window is dead work on every probe -- skip it entirely.
+        if (keep_probing || skip_probing) return;
         // Mirror picture.py: don't let yield-window disable probing until
         // we've already found multiple solutions.
         if (solutions_found < probing_min_solutions) return;
