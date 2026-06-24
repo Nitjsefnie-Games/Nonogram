@@ -34,7 +34,7 @@ namespace {
 
 struct LineKey {
     std::string line_bytes;
-    const std::vector<std::int8_t>* states_ptr;
+    const LineSpec* states_ptr;
 
     bool operator==(const LineKey& o) const noexcept {
         return states_ptr == o.states_ptr && line_bytes == o.line_bytes;
@@ -218,15 +218,15 @@ struct SolveState {
 
 using OnSolution = std::function<bool(const Picture&)>;
 
-bool solve_real(const std::vector<std::vector<std::int8_t>>& mapped_rows,
-                const std::vector<std::vector<std::int8_t>>& mapped_cols,
+bool solve_real(const std::vector<LineSpec>& mapped_rows,
+                const std::vector<LineSpec>& mapped_cols,
                 Picture& pic,
                 SolveState& state,
                 const OnSolution& on_solution,
                 Trail& trail);
 
-bool solve_backtrack(const std::vector<std::vector<std::int8_t>>& mapped_rows,
-                     const std::vector<std::vector<std::int8_t>>& mapped_cols,
+bool solve_backtrack(const std::vector<LineSpec>& mapped_rows,
+                     const std::vector<LineSpec>& mapped_cols,
                      Picture& pic,
                      SolveState& state,
                      const OnSolution& on_solution,
@@ -238,8 +238,8 @@ bool solve_backtrack(const std::vector<std::vector<std::int8_t>>& mapped_rows,
 // ---------------------------------------------------------------------------
 
 bool solve_check(Picture& pic,
-                 const std::vector<std::vector<std::int8_t>>& mapped_rows,
-                 const std::vector<std::vector<std::int8_t>>& mapped_cols) {
+                 const std::vector<LineSpec>& mapped_rows,
+                 const std::vector<LineSpec>& mapped_cols) {
     const int H = pic.height();
     const int W = pic.width();
 
@@ -288,17 +288,17 @@ struct BatchResult {
     const std::vector<std::int8_t>* values;
 };
 
-BatchResult solve_one_batch(const std::vector<std::int8_t>& states,
+BatchResult solve_one_batch(const LineSpec& spec,
                             int index,
                             bool is_col,
                             Picture& pic) {
     std::vector<std::int8_t> line = is_col ? pic.get_col(index) : pic.get_row(index);
 
-    LineKey key{line_to_bytes(line), &states};
+    LineKey key{line_to_bytes(line), &spec};
     auto& cache = line_cache();
     const LineSolveResult* result_ptr = cache.find_and_promote(key);
     if (result_ptr == nullptr) {
-        LineSolveResult res = solve_line_batch(line, states);
+        LineSolveResult res = solve_line_batch(line, spec);
         result_ptr = cache.insert(std::move(key), std::move(res));
     }
 
@@ -370,7 +370,7 @@ void write_intersection(const std::vector<int>& positions,
 // false, on success returns true.
 // ---------------------------------------------------------------------------
 
-bool solve_lines(const std::vector<std::vector<std::int8_t>>& mapped,
+bool solve_lines(const std::vector<LineSpec>& mapped,
                  Picture& pic,
                  bool is_row,
                  Trail& trail) {
@@ -495,8 +495,8 @@ struct ProbeGuard {
 ProbeResult probe_cell(int row,
                        int col,
                        std::int8_t val,
-                       const std::vector<std::vector<std::int8_t>>& mapped_rows,
-                       const std::vector<std::vector<std::int8_t>>& mapped_cols,
+                       const std::vector<LineSpec>& mapped_rows,
+                       const std::vector<LineSpec>& mapped_cols,
                        Picture& pic) {
     Trail trail;
     // Reserve enough headroom that most probes don't reallocate. Linear in
@@ -567,8 +567,8 @@ void revert_branch(Picture& pic,
     }
 }
 
-bool solve_backtrack(const std::vector<std::vector<std::int8_t>>& mapped_rows,
-                     const std::vector<std::vector<std::int8_t>>& mapped_cols,
+bool solve_backtrack(const std::vector<LineSpec>& mapped_rows,
+                     const std::vector<LineSpec>& mapped_cols,
                      Picture& pic,
                      SolveState& state,
                      const OnSolution& on_solution,
@@ -763,8 +763,8 @@ bool solve_backtrack(const std::vector<std::vector<std::int8_t>>& mapped_rows,
 // solve_real
 // ---------------------------------------------------------------------------
 
-bool solve_real(const std::vector<std::vector<std::int8_t>>& mapped_rows,
-                const std::vector<std::vector<std::int8_t>>& mapped_cols,
+bool solve_real(const std::vector<LineSpec>& mapped_rows,
+                const std::vector<LineSpec>& mapped_cols,
                 Picture& pic,
                 SolveState& state,
                 const OnSolution& on_solution,
@@ -820,16 +820,16 @@ void solve(const std::vector<std::vector<int>>& rows,
 
     Picture pic(H, W);
 
-    std::vector<std::vector<std::int8_t>> mapped_rows;
+    std::vector<LineSpec> mapped_rows;
     mapped_rows.reserve(rows.size());
     for (const auto& clue : rows) {
-        mapped_rows.push_back(states_pregen(clue));
+        mapped_rows.push_back(make_line_spec(clue));
     }
 
-    std::vector<std::vector<std::int8_t>> mapped_cols;
+    std::vector<LineSpec> mapped_cols;
     mapped_cols.reserve(cols.size());
     for (const auto& clue : cols) {
-        mapped_cols.push_back(states_pregen(clue));
+        mapped_cols.push_back(make_line_spec(clue));
     }
 
     SolveState state;
