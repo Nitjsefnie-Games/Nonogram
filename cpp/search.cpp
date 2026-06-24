@@ -165,8 +165,6 @@ struct SolveState {
 
     int probing_min_solutions;
 
-    int depth = 0;
-    std::uint64_t progress_bits = 0;
     int solutions_found = 0;
     bool used_contradiction = false;
     bool used_backtrack = false;
@@ -219,40 +217,6 @@ struct SolveState {
                 skip_probing = true;
             }
         }
-    }
-
-    void enter_backtrack() {
-        depth += 1;
-    }
-
-    void first_branch_failed() {
-        int bit_pos = depth - 1;
-        if (bit_pos < 0) return;
-        if (!(progress_bits & (1ULL << bit_pos))) {
-            progress_bits |= (1ULL << bit_pos);
-        } else {
-            carry_from(bit_pos);
-        }
-    }
-
-    void carry_from(int bit_pos) {
-        progress_bits &= ~(1ULL << bit_pos);
-        if (bit_pos > 0) {
-            int parent_pos = bit_pos - 1;
-            if (!(progress_bits & (1ULL << parent_pos))) {
-                progress_bits |= (1ULL << parent_pos);
-            } else {
-                carry_from(parent_pos);
-            }
-        }
-    }
-
-    void exit_backtrack() {
-        int bit_pos = depth - 1;
-        if (bit_pos >= 0) {
-            progress_bits &= ~(1ULL << bit_pos);
-        }
-        depth -= 1;
     }
 
     void solution_found() { solutions_found += 1; }
@@ -722,18 +686,12 @@ bool solve_backtrack(const std::vector<LineSpec>& mapped_rows,
     const std::int8_t first_val = best_first_val;
     const std::int8_t second_val = (first_val == FULL) ? EMPTY : FULL;
 
-    state.enter_backtrack();
-
     // Iterative two-branch loop, no pic.copy(). Each branch records a trail
     // mark + small snapshot, applies the branch pixel, recurses, then on
     // normal return reverts pic to the entry state for the next branch.
-    //
     // On stop signal (solve_real returns false) we propagate immediately
-    // WITHOUT reverting or calling exit_backtrack — the caller is aborting,
-    // pic state is no longer observed.
-    //
-    // exit_backtrack is invoked exactly once, after both branches complete.
-    bool found_solution_in_first = false;
+    // without reverting — the caller is aborting, pic state is no longer
+    // observed.
     for (int branch = 0; branch < 2; ++branch) {
         const std::int8_t val = (branch == 0) ? first_val : second_val;
 
@@ -748,27 +706,12 @@ bool solve_backtrack(const std::vector<LineSpec>& mapped_rows,
         pic.mark_row_dirty(row);
         pic.mark_col_dirty(col);
 
-        if (branch == 0) {
-            OnSolution wrapped = [&](const Picture& p) {
-                found_solution_in_first = true;
-                return on_solution(p);
-            };
-            if (!solve_real(mapped_rows, mapped_cols, pic, state, wrapped, trail)) {
-                return false;
-            }
-            revert_branch(pic, trail, mark, saved_unknown_count);
-            if (!found_solution_in_first) {
-                state.first_branch_failed();
-            }
-        } else {
-            if (!solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail)) {
-                return false;
-            }
-            revert_branch(pic, trail, mark, saved_unknown_count);
+        if (!solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail)) {
+            return false;
         }
+        revert_branch(pic, trail, mark, saved_unknown_count);
     }
 
-    state.exit_backtrack();
     return true;
 }
 
