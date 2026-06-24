@@ -17,7 +17,13 @@ enum class Strategy {
 //
 // If out_strategy is non-null, *out_strategy is written before solve() returns,
 // reflecting which technique was needed during the search.
+// keep_probing: "anytime" mode. When true, the adaptive probing-shutoff is
+// disabled so lookahead pruning stays active for the whole search. This makes
+// otherwise-walling deep enumerations (e.g. pikachu) keep finding solutions,
+// at the cost of per-node probing overhead on easy puzzles. Default false
+// preserves the original adaptive behavior exactly.
 void solve(const std::vector<std::vector<int>>& rows,
            const std::vector<std::vector<int>>& cols,
            std::function<bool(const Picture&)> on_solution,
-           Strategy* out_strategy = nullptr);
+           Strategy* out_strategy = nullptr,
+           bool keep_probing = false);
