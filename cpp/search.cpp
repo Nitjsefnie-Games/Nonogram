@@ -18,6 +18,7 @@
 #include <deque>
 #include <functional>
 #include <list>
+#include <map>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -230,15 +231,15 @@ struct SolveState {
 
 using OnSolution = std::function<bool(const Picture&)>;
 
-bool solve_real(const std::vector<LineSpec>& mapped_rows,
-                const std::vector<LineSpec>& mapped_cols,
+bool solve_real(const std::vector<const LineSpec*>& mapped_rows,
+                const std::vector<const LineSpec*>& mapped_cols,
                 Picture& pic,
                 SolveState& state,
                 const OnSolution& on_solution,
                 Trail& trail);
 
-bool solve_backtrack(const std::vector<LineSpec>& mapped_rows,
-                     const std::vector<LineSpec>& mapped_cols,
+bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
+                     const std::vector<const LineSpec*>& mapped_cols,
                      Picture& pic,
                      SolveState& state,
                      const OnSolution& on_solution,
@@ -349,7 +350,7 @@ void write_intersection(const std::vector<int>& deductions,
 // false, on success returns true.
 // ---------------------------------------------------------------------------
 
-bool solve_lines(const std::vector<LineSpec>& mapped,
+bool solve_lines(const std::vector<const LineSpec*>& mapped,
                  Picture& pic,
                  bool is_row,
                  Trail& trail) {
@@ -359,7 +360,7 @@ bool solve_lines(const std::vector<LineSpec>& mapped,
         const int index = queue.front();
         queue.pop_front();
         dirty[index] = 0;
-        BatchResult r = solve_one_batch(mapped[index], index, !is_row, pic);
+        BatchResult r = solve_one_batch(*mapped[index], index, !is_row, pic);
         if (!r.success) {
             return false;
         }
@@ -437,8 +438,8 @@ struct ProbeGuard {
 ProbeResult probe_cell(int row,
                        int col,
                        std::int8_t val,
-                       const std::vector<LineSpec>& mapped_rows,
-                       const std::vector<LineSpec>& mapped_cols,
+                       const std::vector<const LineSpec*>& mapped_rows,
+                       const std::vector<const LineSpec*>& mapped_cols,
                        Picture& pic) {
     // Reusable per-probe trail. probe_cell never nests (it calls only
     // solve_lines, which never probes), and the previous probe's ProbeGuard
@@ -508,8 +509,8 @@ void revert_branch(Picture& pic,
     }
 }
 
-bool solve_backtrack(const std::vector<LineSpec>& mapped_rows,
-                     const std::vector<LineSpec>& mapped_cols,
+bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
+                     const std::vector<const LineSpec*>& mapped_cols,
                      Picture& pic,
                      SolveState& state,
                      const OnSolution& on_solution,
@@ -724,8 +725,8 @@ bool solve_backtrack(const std::vector<LineSpec>& mapped_rows,
 // solve_real
 // ---------------------------------------------------------------------------
 
-bool solve_real(const std::vector<LineSpec>& mapped_rows,
-                const std::vector<LineSpec>& mapped_cols,
+bool solve_real(const std::vector<const LineSpec*>& mapped_rows,
+                const std::vector<const LineSpec*>& mapped_cols,
                 Picture& pic,
                 SolveState& state,
                 const OnSolution& on_solution,
@@ -780,17 +781,30 @@ void solve(const std::vector<std::vector<int>>& rows,
 
     Picture pic(H, W);
 
-    std::vector<LineSpec> mapped_rows;
-    mapped_rows.reserve(rows.size());
-    for (const auto& clue : rows) {
-        mapped_rows.push_back(make_line_spec(clue));
-    }
+    // Dedupe LineSpecs by clue. A line solve depends only on (content, clue),
+    // not on which row/col it is, so same-clue lines can share a LineSpec and
+    // therefore share line-cache entries -> smaller working set, fewer misses.
+    // spec_pool is reserved to its upper bound so its element addresses (used as
+    // stable cache-key identities) never move.
+    std::vector<LineSpec> spec_pool;
+    spec_pool.reserve(rows.size() + cols.size());
+    std::map<std::vector<int>, const LineSpec*> clue_to_spec;
+    auto get_spec = [&](const std::vector<int>& clue) -> const LineSpec* {
+        auto it = clue_to_spec.find(clue);
+        if (it != clue_to_spec.end()) return it->second;
+        spec_pool.push_back(make_line_spec(clue));
+        const LineSpec* p = &spec_pool.back();
+        clue_to_spec.emplace(clue, p);
+        return p;
+    };
 
-    std::vector<LineSpec> mapped_cols;
+    std::vector<const LineSpec*> mapped_rows;
+    mapped_rows.reserve(rows.size());
+    for (const auto& clue : rows) mapped_rows.push_back(get_spec(clue));
+
+    std::vector<const LineSpec*> mapped_cols;
     mapped_cols.reserve(cols.size());
-    for (const auto& clue : cols) {
-        mapped_cols.push_back(make_line_spec(clue));
-    }
+    for (const auto& clue : cols) mapped_cols.push_back(get_spec(clue));
 
     SolveState state;
     state.keep_probing = anytime;
