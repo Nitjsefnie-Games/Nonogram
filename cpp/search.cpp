@@ -81,54 +81,39 @@ struct LineKeyEq {
     }
 };
 
-struct LineCacheEntry {
-    LineKey key;
-    LineSolveResult value;
-};
-
-class LRULineCache {
+// Plain memoization map. The line cache only ever evicts on puzzles whose
+// distinct-line working set exceeds the budget cap (rare, huge puzzles); the
+// common case never fills it. So instead of an LRU (which stored every key
+// twice and added a list-node indirection per hit), use a flat map directly:
+// one key copy per miss, one fewer pointer chase per hit, smaller entries.
+// Eviction for the OOM-safety case is a generational full clear at capacity.
+class LineCache {
 public:
     std::size_t max_entries_ = 1'000'000;  // default; set by reset_line_cache
 
     void set_max_entries(std::size_t n) { max_entries_ = std::max<std::size_t>(1, n); }
 
-    void clear() {
-        entries_.clear();
-        index_.clear();
-    }
+    void clear() { map_.clear(); }
 
     LineSolveResult* find_and_promote(const LineKeyView& key) {
-        auto it = index_.find(key);
-        if (it == index_.end()) return nullptr;
-        // LRU recency only matters once the cache is full enough to evict. Until
-        // then, skip the per-hit list splice entirely (it was ~5% of the hot
-        // path on cache-bound puzzles). When at capacity, resume move-to-front
-        // so eviction stays LRU.
-        if (index_.size() >= max_entries_) {
-            entries_.splice(entries_.begin(), entries_, it->second);
-        }
-        return &it->second->value;
+        auto it = map_.find(key);
+        return it == map_.end() ? nullptr : &it->second;
     }
 
     LineSolveResult* insert(LineKey key, LineSolveResult value) {
-        if (index_.size() >= max_entries_) {
-            // Evict LRU (back of list).
-            index_.erase(entries_.back().key);
-            entries_.pop_back();
+        if (map_.size() >= max_entries_) {
+            map_.clear();  // OOM-safe generational eviction (cold path)
         }
-        entries_.push_front(LineCacheEntry{key, std::move(value)});
-        auto list_it = entries_.begin();
-        index_.emplace(std::move(key), list_it);
-        return &list_it->value;
+        auto res = map_.emplace(std::move(key), std::move(value));
+        return &res.first->second;
     }
 
 private:
-    std::list<LineCacheEntry> entries_;
-    ankerl::unordered_dense::map<LineKey, std::list<LineCacheEntry>::iterator, LineKeyHash, LineKeyEq> index_;
+    ankerl::unordered_dense::map<LineKey, LineSolveResult, LineKeyHash, LineKeyEq> map_;
 };
 
-LRULineCache& line_cache() {
-    static LRULineCache cache;
+LineCache& line_cache() {
+    static LineCache cache;
     return cache;
 }
 
