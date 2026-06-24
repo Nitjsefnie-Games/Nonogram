@@ -286,8 +286,7 @@ bool solve_backtrack(const std::vector<LineSpec>& mapped_rows,
 
 struct BatchResult {
     bool success;
-    const std::vector<int>* positions; // pointer into cache entry; valid until next cache mutation
-    const std::vector<std::int8_t>* values;
+    const std::vector<int>* deductions; // packed (pos,val); points into cache entry
 };
 
 BatchResult solve_one_batch(const LineSpec& spec,
@@ -326,14 +325,14 @@ BatchResult solve_one_batch(const LineSpec& spec,
     }
 
     if (result_ptr->total == 0) {
-        return BatchResult{false, nullptr, nullptr};
+        return BatchResult{false, nullptr};
     }
 
-    if (result_ptr->positions.empty()) {
-        return BatchResult{true, nullptr, nullptr};
+    if (result_ptr->deductions.empty()) {
+        return BatchResult{true, nullptr};
     }
 
-    return BatchResult{true, &result_ptr->positions, &result_ptr->values};
+    return BatchResult{true, &result_ptr->deductions};
 }
 
 // ---------------------------------------------------------------------------
@@ -345,8 +344,7 @@ BatchResult solve_one_batch(const LineSpec& spec,
 // recorded index back to UNKNOWN.
 // ---------------------------------------------------------------------------
 
-void write_intersection(const std::vector<int>& positions,
-                        const std::vector<std::int8_t>& values,
+void write_intersection(const std::vector<int>& deductions,
                         int line_index,
                         Picture& pic,
                         bool is_row,
@@ -355,10 +353,10 @@ void write_intersection(const std::vector<int>& positions,
         const int row = line_index;
         const int W = pic.width();
         std::int8_t* px = pic.pixels.data() + static_cast<std::size_t>(row) * static_cast<std::size_t>(W);
-        for (std::size_t i = 0; i < positions.size(); ++i) {
-            const int col = positions[i];
+        for (int enc : deductions) {
+            const int col = deduce_pos(enc);
             if (px[col] == UNKNOWN) {
-                px[col] = values[i];
+                px[col] = deduce_val(enc);
                 pic.unknown_count -= 1;
                 pic.mark_col_dirty(col);
                 trail.changed_cell_indices.push_back(row * W + col);
@@ -367,11 +365,11 @@ void write_intersection(const std::vector<int>& positions,
     } else {
         const int col = line_index;
         const int W = pic.width();
-        for (std::size_t i = 0; i < positions.size(); ++i) {
-            const int row = positions[i];
+        for (int enc : deductions) {
+            const int row = deduce_pos(enc);
             std::int8_t& cell = pic.pixels[static_cast<std::size_t>(row) * static_cast<std::size_t>(W) + static_cast<std::size_t>(col)];
             if (cell == UNKNOWN) {
-                cell = values[i];
+                cell = deduce_val(enc);
                 pic.unknown_count -= 1;
                 pic.mark_row_dirty(row);
                 trail.changed_cell_indices.push_back(row * W + col);
@@ -399,8 +397,8 @@ bool solve_lines(const std::vector<LineSpec>& mapped,
         if (!r.success) {
             return false;
         }
-        if (r.positions != nullptr) {
-            write_intersection(*r.positions, *r.values, index, pic, is_row, trail);
+        if (r.deductions != nullptr) {
+            write_intersection(*r.deductions, index, pic, is_row, trail);
         }
     }
     return true;
