@@ -233,50 +233,6 @@ bool solve_backtrack(const std::vector<LineSpec>& mapped_rows,
                      Trail& trail);
 
 // ---------------------------------------------------------------------------
-// solve_check: validate every not-yet-solved row/col; mark fully-known lines
-// as solved. Returns false on contradiction.
-// ---------------------------------------------------------------------------
-
-bool solve_check(Picture& pic,
-                 const std::vector<LineSpec>& mapped_rows,
-                 const std::vector<LineSpec>& mapped_cols) {
-    const int H = pic.height();
-    const int W = pic.width();
-
-    for (int i = 0; i < H; ++i) {
-        if (pic.solved_rows.count(i)) continue;
-        std::vector<std::int8_t> line = pic.get_row(i);
-        if (!check_line_valid(line, mapped_rows[i])) {
-            return false;
-        }
-        bool has_unknown = false;
-        for (std::int8_t v : line) {
-            if (v == UNKNOWN) { has_unknown = true; break; }
-        }
-        if (!has_unknown) {
-            pic.solved_rows.insert(i);
-        }
-    }
-
-    for (int j = 0; j < W; ++j) {
-        if (pic.solved_cols.count(j)) continue;
-        std::vector<std::int8_t> line = pic.get_col(j);
-        if (!check_line_valid(line, mapped_cols[j])) {
-            return false;
-        }
-        bool has_unknown = false;
-        for (std::int8_t v : line) {
-            if (v == UNKNOWN) { has_unknown = true; break; }
-        }
-        if (!has_unknown) {
-            pic.solved_cols.insert(j);
-        }
-    }
-
-    return true;
-}
-
-// ---------------------------------------------------------------------------
 // solve_one_batch: returns (success, positions, values). On success==false,
 // positions/values empty (caller must check success first).
 // fully_solved bookkeeping: insert into pic.solved_{rows,cols} on the fly.
@@ -515,10 +471,11 @@ ProbeResult probe_cell(int row,
     pic.mark_row_dirty(row);
     pic.mark_col_dirty(col);
 
-    if (!solve_check(pic, mapped_rows, mapped_cols)) {
-        return ProbeResult{false, 0};
-    }
-
+    // No separate full-board validation pass: only the row+col just set can
+    // be inconsistent (the board was consistent at probe entry), and both are
+    // dirty, so solve_lines below re-solves them and reports any contradiction
+    // via solve_line_batch's total==0. solve_check was a redundant O(H+W)
+    // re-validation of every line on every probe.
     while (pic.has_dirty()) {
         if (!solve_lines(mapped_rows, pic, true, trail)) {
             return ProbeResult{false, 0};
@@ -769,15 +726,12 @@ bool solve_real(const std::vector<LineSpec>& mapped_rows,
                 SolveState& state,
                 const OnSolution& on_solution,
                 Trail& trail) {
-    if (!solve_check(pic, mapped_rows, mapped_cols)) {
-        return true;
-    }
-
-    if (pic.is_solved()) {
-        state.solution_found();
-        return on_solution(pic);
-    }
-
+    // Drain all dirty lines first (this both propagates and validates every
+    // changed line via solve_line_batch's total==0). The board was consistent
+    // on entry except for the freshly-dirtied lines, so this fully validates
+    // it — replacing the old redundant solve_check full-board pass. The
+    // is_solved() callback must come AFTER this drain so an invalid completing
+    // assignment is rejected (solve_lines returns false) rather than accepted.
     while (pic.has_dirty()) {
         if (!solve_lines(mapped_rows, pic, true, trail)) {
             return true;
