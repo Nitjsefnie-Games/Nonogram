@@ -89,6 +89,82 @@ LineSpec make_line_spec(const std::vector<int>& clue) {
     return spec;
 }
 
+// Specialized single-word path (len_states <= 64). Avoids the per-word loops
+// and carry-propagating shifts of the general routine; shifts are plain <<1/>>1.
+// Behavior is identical to the general path for n_words == 1.
+namespace {
+LineSolveResult solve_line_batch_1w(const std::int8_t* line, std::size_t n,
+                                    const LineSpec& spec) {
+    const std::size_t len_states = spec.len_states;
+    const std::uint64_t sv = spec.state_valid[0];
+    const std::uint64_t em = spec.empty_mask[0];
+    const std::uint64_t fm = spec.full_mask[0];
+
+    LineSolveResult result;
+    result.total = 0;
+    result.fully_solved = false;
+
+    g_scratch.ensure(n + 1, 1);
+    std::uint64_t* fwd = g_scratch.forward.data();
+    std::uint64_t* bwd = g_scratch.backward.data();
+
+    fwd[0] = 1ULL;
+    for (std::size_t p = 0; p < n; ++p) {
+        const std::uint64_t cur = fwd[p];
+        const std::uint64_t sh = cur << 1;
+        const std::int8_t cell = line[p];
+        std::uint64_t nxt;
+        if (cell == UNKNOWN)      nxt = (cur & em) | (sh & sv);
+        else if (cell == EMPTY)   nxt = (cur & em) | (sh & em);
+        else                      nxt = sh & fm;
+        fwd[p + 1] = nxt;
+    }
+
+    std::uint64_t accept = 1ULL << (len_states - 1);
+    if (len_states >= 2) accept |= 1ULL << (len_states - 2);
+    if ((fwd[n] & accept) == 0) {
+        return result;  // unsat
+    }
+
+    bwd[n] = accept;
+    for (std::size_t pi = n; pi-- > 0; ) {
+        const std::uint64_t cur = bwd[pi + 1];
+        const std::int8_t cell = line[pi];
+        std::uint64_t bp;
+        if (cell == UNKNOWN)      { bp = (cur & em) | (cur >> 1); }
+        else if (cell == EMPTY)   { const std::uint64_t m = cur & em; bp = m | (m >> 1); }
+        else                      { bp = (cur & fm) >> 1; }
+        bwd[pi] = bp;
+    }
+
+    result.positions.reserve(n);
+    result.values.reserve(n);
+    int n_changed = 0, n_unknown_total = 0;
+    for (std::size_t p = 0; p < n; ++p) {
+        if (line[p] != UNKNOWN) continue;
+        ++n_unknown_total;
+        const std::uint64_t bw = bwd[p + 1];
+        const std::uint64_t f = fwd[p];
+        const std::uint64_t bw_empty = bw & em;
+        const std::uint64_t bw_full = bw & fm;
+        const bool can_empty = (f & (bw_empty | (bw_empty >> 1))) != 0;
+        const bool can_full = (f & (bw_full >> 1)) != 0;
+        if (can_empty && !can_full) {
+            result.positions.push_back(static_cast<int>(p));
+            result.values.push_back(EMPTY);
+            ++n_changed;
+        } else if (can_full && !can_empty) {
+            result.positions.push_back(static_cast<int>(p));
+            result.values.push_back(FULL);
+            ++n_changed;
+        }
+    }
+    result.total = 1;
+    result.fully_solved = (n_unknown_total == n_changed);
+    return result;
+}
+}  // namespace
+
 LineSolveResult solve_line_batch(const std::int8_t* line, std::size_t n,
                                  const LineSpec& spec) {
     const std::size_t len_states = spec.len_states;
@@ -101,6 +177,10 @@ LineSolveResult solve_line_batch(const std::int8_t* line, std::size_t n,
     if (len_states == 0 || n_words == 0) {
         // Degenerate: no states means no clue at all (empty puzzle line).
         return result;
+    }
+
+    if (n_words == 1) {
+        return solve_line_batch_1w(line, n, spec);
     }
 
     const std::uint64_t* state_valid = spec.state_valid.data();
