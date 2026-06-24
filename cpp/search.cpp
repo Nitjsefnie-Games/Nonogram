@@ -52,13 +52,14 @@ struct LineKeyView {
 };
 
 inline std::size_t mix_line_key(std::string_view bytes, const LineSpec* p) noexcept {
-    std::size_t h1 = std::hash<std::string_view>{}(bytes);
-    std::size_t h2 = std::hash<const void*>{}(static_cast<const void*>(p));
-    return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+    namespace wy = ankerl::unordered_dense::detail::wyhash;
+    std::uint64_t h = wy::hash(bytes.data(), bytes.size());
+    return wy::hash(h ^ reinterpret_cast<std::uintptr_t>(p));
 }
 
 struct LineKeyHash {
     using is_transparent = void;
+    using is_avalanching = void;  // wyhash output is already well-mixed
     std::size_t operator()(const LineKey& k) const noexcept {
         return mix_line_key(k.line_bytes, k.states_ptr);
     }
@@ -273,27 +274,33 @@ BatchResult solve_one_batch(const LineSpec& spec,
                             int index,
                             bool is_col,
                             Picture& pic) {
-    // Gather the line into a reusable buffer (no per-call allocation).
-    static thread_local std::vector<std::int8_t> line;
+    // Obtain the line cells. Rows are contiguous in pic.pixels, so we point
+    // straight at them (no copy). Columns are strided, so gather into a
+    // reusable thread_local buffer.
     const int W = pic.width();
     const std::int8_t* px = pic.pixels.data();
+    const std::int8_t* line;
+    std::size_t line_n;
     if (is_col) {
+        static thread_local std::vector<std::int8_t> col_buf;
         const int H = pic.height();
-        line.resize(static_cast<std::size_t>(H));
+        col_buf.resize(static_cast<std::size_t>(H));
         for (int r = 0; r < H; ++r) {
-            line[r] = px[static_cast<std::size_t>(r) * W + index];
+            col_buf[r] = px[static_cast<std::size_t>(r) * W + index];
         }
+        line = col_buf.data();
+        line_n = col_buf.size();
     } else {
-        const std::int8_t* row = px + static_cast<std::size_t>(index) * W;
-        line.assign(row, row + W);
+        line = px + static_cast<std::size_t>(index) * W;
+        line_n = static_cast<std::size_t>(W);
     }
 
-    std::string_view view_bytes(reinterpret_cast<const char*>(line.data()), line.size());
+    std::string_view view_bytes(reinterpret_cast<const char*>(line), line_n);
     LineKeyView vkey{view_bytes, &spec};
     auto& cache = line_cache();
     const LineSolveResult* result_ptr = cache.find_and_promote(vkey);
     if (result_ptr == nullptr) {
-        LineSolveResult res = solve_line_batch(line, spec);
+        LineSolveResult res = solve_line_batch(line, line_n, spec);
         LineKey okey{std::string(view_bytes), &spec};
         result_ptr = cache.insert(std::move(okey), std::move(res));
     }

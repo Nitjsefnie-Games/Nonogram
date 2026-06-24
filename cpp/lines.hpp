@@ -23,8 +23,5 @@ struct LineSpec {
 
 LineSpec make_line_spec(const std::vector<int>& clue);
 
-LineSolveResult solve_line_batch(const std::vector<std::int8_t>& line,
+LineSolveResult solve_line_batch(const std::int8_t* line, std::size_t n,
                                  const LineSpec& spec);
-
-bool check_line_valid(const std::vector<std::int8_t>& line,
-                      const LineSpec& spec);
