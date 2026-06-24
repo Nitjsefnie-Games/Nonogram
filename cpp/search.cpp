@@ -339,37 +339,6 @@ bool solve_lines(const std::vector<LineSpec>& mapped,
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Neighbour scores: for each cell, count of (top, bottom, left, right)
-// neighbours that are filled (non-UNKNOWN). Out-of-bounds counts as 1.
-// ---------------------------------------------------------------------------
-
-std::vector<int> get_neighbor_scores(const Picture& pic) {
-    const int H = pic.height();
-    const int W = pic.width();
-    std::vector<int> scores(static_cast<std::size_t>(H) * static_cast<std::size_t>(W), 0);
-    const std::int8_t* px = pic.pixels.data();
-    for (int r = 0; r < H; ++r) {
-        for (int c = 0; c < W; ++c) {
-            int s = 0;
-            // top
-            if (r == 0) s += 1;
-            else s += (px[(r - 1) * W + c] != UNKNOWN) ? 1 : 0;
-            // bottom
-            if (r == H - 1) s += 1;
-            else s += (px[(r + 1) * W + c] != UNKNOWN) ? 1 : 0;
-            // left
-            if (c == 0) s += 1;
-            else s += (px[r * W + (c - 1)] != UNKNOWN) ? 1 : 0;
-            // right
-            if (c == W - 1) s += 1;
-            else s += (px[r * W + (c + 1)] != UNKNOWN) ? 1 : 0;
-            scores[r * W + c] = s;
-        }
-    }
-    return scores;
-}
-
 int count_solved_pixels(const Picture& pic) {
     return pic.height() * pic.width() - pic.unknown_count;
 }
@@ -514,27 +483,33 @@ bool solve_backtrack(const std::vector<LineSpec>& mapped_rows,
                      Trail& trail) {
     const int H = pic.height();
     const int W = pic.width();
-    std::vector<int> scores = get_neighbor_scores(pic);
+    const std::int8_t* px = pic.pixels.data();
+
+    // Reusable scratch buffers. Safe to share across recursive solve_backtrack
+    // frames: every frame fully consumes these during cell-selection, BEFORE
+    // any recursive solve_real call (forced-commit returns immediately; the
+    // branch loop only touches plain locals). Avoids 4 heap allocations per
+    // backtrack node.
+    static thread_local std::vector<int> unknowns_in_row;
+    static thread_local std::vector<int> unknowns_in_col;
+    unknowns_in_row.assign(static_cast<std::size_t>(H), 0);
+    unknowns_in_col.assign(static_cast<std::size_t>(W), 0);
 
     // Per-row / per-col UNKNOWN counts, used as the "most constrained line"
     // signal in the composite sort key (lower => more constrained line).
-    std::vector<int> unknowns_in_row(static_cast<std::size_t>(H), 0);
-    std::vector<int> unknowns_in_col(static_cast<std::size_t>(W), 0);
-
-    // Collect unknown coords in row-major order (matches np.argwhere order).
-    std::vector<std::pair<int, int>> unknown_coords;
-    unknown_coords.reserve(static_cast<std::size_t>(pic.unknown_count));
+    int n_unknown = 0;
     for (int r = 0; r < H; ++r) {
+        const std::int8_t* row_px = px + static_cast<std::size_t>(r) * W;
         for (int c = 0; c < W; ++c) {
-            if (pic.pixels[r * W + c] == UNKNOWN) {
-                unknown_coords.emplace_back(r, c);
+            if (row_px[c] == UNKNOWN) {
                 unknowns_in_row[r] += 1;
                 unknowns_in_col[c] += 1;
+                ++n_unknown;
             }
         }
     }
 
-    if (unknown_coords.empty()) {
+    if (n_unknown == 0) {
         return true;
     }
 
@@ -542,45 +517,73 @@ bool solve_backtrack(const std::vector<LineSpec>& mapped_rows,
     int best_col = -1;
     std::int8_t best_first_val = FULL;
 
+    // Neighbor score: count of filled (non-UNKNOWN) orthogonal neighbours,
+    // out-of-bounds counting as 1. Computed on demand only for the unknown
+    // cells we actually score (mirrors the old get_neighbor_scores values).
+    auto neighbor_score = [&](int r, int c) -> int {
+        int s = 0;
+        s += (r == 0)     ? 1 : (px[(r - 1) * W + c] != UNKNOWN);
+        s += (r == H - 1) ? 1 : (px[(r + 1) * W + c] != UNKNOWN);
+        s += (c == 0)     ? 1 : (px[r * W + (c - 1)] != UNKNOWN);
+        s += (c == W - 1) ? 1 : (px[r * W + (c + 1)] != UNKNOWN);
+        return s;
+    };
+
     // Composite key: ascending line_constraint, then descending neighbor.
     // Returned via a pair so std::less ordering matches the desired ordering
     // (we negate neighbor so larger neighbor compares smaller, i.e. wins ties).
     auto composite_key = [&](int r, int c) {
         int line_constraint = unknowns_in_row[r] + unknowns_in_col[c];
-        int neighbor = scores[r * W + c];
-        return std::pair<int, int>(line_constraint, -neighbor);
+        return std::pair<int, int>(line_constraint, -neighbor_score(r, c));
     };
 
     if (state.skip_probing) {
-        // Pick the cell with the smallest composite key (most-constrained
-        // line; tie-broken by highest neighbor score). Equivalent to
-        // sorted_coords[0] under the same key.
-        int best_idx = 0;
-        std::pair<int, int> best_key = composite_key(unknown_coords[0].first,
-                                                     unknown_coords[0].second);
-        for (std::size_t i = 1; i < unknown_coords.size(); ++i) {
-            std::pair<int, int> k = composite_key(unknown_coords[i].first,
-                                                  unknown_coords[i].second);
-            if (k < best_key) {
-                best_key = k;
-                best_idx = static_cast<int>(i);
+        // Pick the unknown cell with the smallest composite key (most-
+        // constrained line; tie-broken by highest neighbor score). Single
+        // row-major scan, no coords/scores arrays materialized.
+        std::pair<int, int> best_key;
+        bool have = false;
+        for (int r = 0; r < H; ++r) {
+            const std::int8_t* row_px = px + static_cast<std::size_t>(r) * W;
+            for (int c = 0; c < W; ++c) {
+                if (row_px[c] != UNKNOWN) continue;
+                std::pair<int, int> k = composite_key(r, c);
+                if (!have || k < best_key) {
+                    best_key = k;
+                    best_row = r;
+                    best_col = c;
+                    have = true;
+                }
             }
         }
-        best_row = unknown_coords[best_idx].first;
-        best_col = unknown_coords[best_idx].second;
         best_first_val = FULL;
     } else {
+        // Collect unknown coords in row-major order (matches np.argwhere order)
+        // together with their composite keys, precomputed once so the sort's
+        // O(n log n) comparisons are cheap pair compares (not repeated
+        // neighbor_score evaluations).
+        static thread_local std::vector<std::pair<int, int>> unknown_coords;
+        static thread_local std::vector<std::pair<int, int>> keys;
+        unknown_coords.clear();
+        keys.clear();
+        for (int r = 0; r < H; ++r) {
+            const std::int8_t* row_px = px + static_cast<std::size_t>(r) * W;
+            for (int c = 0; c < W; ++c) {
+                if (row_px[c] == UNKNOWN) {
+                    unknown_coords.emplace_back(r, c);
+                    keys.emplace_back(composite_key(r, c));
+                }
+            }
+        }
+
         // Sort by composite key ascending: ascending line_constraint, then
         // descending neighbor (stable to keep deterministic order on full ties,
         // mirroring np.argsort which is stable).
-        std::vector<int> order(unknown_coords.size());
+        static thread_local std::vector<int> order;
+        order.resize(unknown_coords.size());
         for (std::size_t i = 0; i < order.size(); ++i) order[i] = static_cast<int>(i);
         std::stable_sort(order.begin(), order.end(),
-            [&](int a, int b) {
-                int ra = unknown_coords[a].first, ca = unknown_coords[a].second;
-                int rb = unknown_coords[b].first, cb = unknown_coords[b].second;
-                return composite_key(ra, ca) < composite_key(rb, cb);
-            });
+            [&](int a, int b) { return keys[a] < keys[b]; });
 
         int best_pixels = -1;
         bool have_best = false;
