@@ -100,8 +100,13 @@ public:
     LineSolveResult* find_and_promote(const LineKeyView& key) {
         auto it = index_.find(key);
         if (it == index_.end()) return nullptr;
-        // Move to front (most recently used).
-        entries_.splice(entries_.begin(), entries_, it->second);
+        // LRU recency only matters once the cache is full enough to evict. Until
+        // then, skip the per-hit list splice entirely (it was ~5% of the hot
+        // path on cache-bound puzzles). When at capacity, resume move-to-front
+        // so eviction stays LRU.
+        if (index_.size() >= max_entries_) {
+            entries_.splice(entries_.begin(), entries_, it->second);
+        }
         return &it->second->value;
     }
 
@@ -168,6 +173,12 @@ struct SolveState {
     bool skip_probing = false;
     std::deque<int> probe_outcomes;
 
+    // Benchmark hook: if MAX_NODES is set (>0), abort the search after that many
+    // backtrack nodes. Lets pikachu-class never-terminating puzzles be timed
+    // over a deterministic, fixed amount of work. 0 = unlimited (normal).
+    std::uint64_t node_limit = 0;
+    std::uint64_t nodes = 0;
+
     SolveState() {
         const char* env = std::getenv("PROBING_MIN_SOLUTIONS");
         probing_min_solutions = 2;
@@ -176,6 +187,14 @@ struct SolveState {
                 probing_min_solutions = std::stoi(env);
             } catch (...) {
                 probing_min_solutions = 2;
+            }
+        }
+        const char* nenv = std::getenv("MAX_NODES");
+        if (nenv != nullptr) {
+            try {
+                node_limit = std::stoull(nenv);
+            } catch (...) {
+                node_limit = 0;
             }
         }
     }
@@ -528,6 +547,12 @@ bool solve_backtrack(const std::vector<LineSpec>& mapped_rows,
                      SolveState& state,
                      const OnSolution& on_solution,
                      Trail& trail) {
+    // Benchmark abort: stop after node_limit backtrack nodes (return false
+    // propagates as a stop signal, exactly like the --max callback).
+    if (state.node_limit && ++state.nodes > state.node_limit) {
+        return false;
+    }
+
     const int H = pic.height();
     const int W = pic.width();
     const std::int8_t* px = pic.pixels.data();
