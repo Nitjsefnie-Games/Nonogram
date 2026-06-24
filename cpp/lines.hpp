@@ -14,7 +14,6 @@ inline std::int8_t deduce_val(int enc) { return static_cast<std::int8_t>(enc >> 
 struct LineSolveResult {
     std::vector<int> deductions;  // packed (pos, val); see deduce_pack
     int total;       // 0 = unsat, 1 = sat
-    bool fully_solved;
 };
 
 // Precomputed, puzzle-lifetime line specification: the DFA states for a clue
