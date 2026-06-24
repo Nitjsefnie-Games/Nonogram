@@ -102,7 +102,6 @@ LineSolveResult solve_line_batch_1w(const std::int8_t* line, std::size_t n,
 
     LineSolveResult result;
     result.total = 0;
-    result.fully_solved = false;
 
     g_scratch.ensure(n + 1, 1);
     std::uint64_t* fwd = g_scratch.forward.data();
@@ -138,10 +137,8 @@ LineSolveResult solve_line_batch_1w(const std::int8_t* line, std::size_t n,
     }
 
     result.deductions.reserve(n);
-    int n_changed = 0, n_unknown_total = 0;
     for (std::size_t p = 0; p < n; ++p) {
         if (line[p] != UNKNOWN) continue;
-        ++n_unknown_total;
         const std::uint64_t bw = bwd[p + 1];
         const std::uint64_t f = fwd[p];
         const std::uint64_t bw_empty = bw & em;
@@ -150,14 +147,11 @@ LineSolveResult solve_line_batch_1w(const std::int8_t* line, std::size_t n,
         const bool can_full = (f & (bw_full >> 1)) != 0;
         if (can_empty && !can_full) {
             result.deductions.push_back(deduce_pack(static_cast<int>(p), EMPTY));
-            ++n_changed;
         } else if (can_full && !can_empty) {
             result.deductions.push_back(deduce_pack(static_cast<int>(p), FULL));
-            ++n_changed;
         }
     }
     result.total = 1;
-    result.fully_solved = (n_unknown_total == n_changed);
     return result;
 }
 }  // namespace
@@ -169,7 +163,6 @@ LineSolveResult solve_line_batch(const std::int8_t* line, std::size_t n,
 
     LineSolveResult result;
     result.total = 0;
-    result.fully_solved = false;
 
     if (len_states == 0 || n_words == 0) {
         // Degenerate: no states means no clue at all (empty puzzle line).
@@ -288,14 +281,10 @@ LineSolveResult solve_line_batch(const std::int8_t* line, std::size_t n,
     std::uint64_t* bw_empty_shifted = g_scratch.bw_empty_shifted.data();
     std::uint64_t* bw_full_shifted = g_scratch.bw_full_shifted.data();
 
-    int n_changed = 0;
-    int n_unknown_total = 0;
-
     for (std::size_t p = 0; p < n; ++p) {
         if (line[p] != UNKNOWN) {
             continue;
         }
-        ++n_unknown_total;
 
         const std::uint64_t* bw_pp1 = backward + (p + 1) * n_words;
         const std::uint64_t* fwd_p = forward + p * n_words;
@@ -319,15 +308,12 @@ LineSolveResult solve_line_batch(const std::int8_t* line, std::size_t n,
 
         if (can_empty && !can_full) {
             result.deductions.push_back(deduce_pack(static_cast<int>(p), EMPTY));
-            ++n_changed;
         } else if (can_full && !can_empty) {
             result.deductions.push_back(deduce_pack(static_cast<int>(p), FULL));
-            ++n_changed;
         }
     }
 
     result.total = 1;
-    result.fully_solved = (n_unknown_total == n_changed);
     return result;
 }
 
