@@ -598,31 +598,36 @@ bool solve_backtrack(const std::vector<LineSpec>& mapped_rows,
         best_first_val = FULL;
     } else {
         // Collect unknown coords in row-major order (matches np.argwhere order)
-        // together with their composite keys, precomputed once so the sort's
-        // O(n log n) comparisons are cheap pair compares (not repeated
-        // neighbor_score evaluations).
+        // with a single-int sort key encoding the composite ordering: ascending
+        // line_constraint, then descending neighbor (0..4). enc = lc*5 + (4-nb)
+        // is order-equivalent to the (lc, -nb) pair, and its range is tiny, so a
+        // stable counting sort (O(n), no merge buffer / comparator indirection)
+        // replaces the O(n log n) stable_sort while producing the identical order.
         static thread_local std::vector<std::pair<int, int>> unknown_coords;
-        static thread_local std::vector<std::pair<int, int>> keys;
+        static thread_local std::vector<int> enc;
         unknown_coords.clear();
-        keys.clear();
+        enc.clear();
+        int max_enc = 0;
         for (int r = 0; r < H; ++r) {
             const std::int8_t* row_px = px + static_cast<std::size_t>(r) * W;
             for (int c = 0; c < W; ++c) {
-                if (row_px[c] == UNKNOWN) {
-                    unknown_coords.emplace_back(r, c);
-                    keys.emplace_back(composite_key(r, c));
-                }
+                if (row_px[c] != UNKNOWN) continue;
+                unknown_coords.emplace_back(r, c);
+                int lc = unknowns_in_row[r] + unknowns_in_col[c];
+                int e = lc * 5 + (4 - neighbor_score(r, c));
+                enc.push_back(e);
+                if (e > max_enc) max_enc = e;
             }
         }
 
-        // Sort by composite key ascending: ascending line_constraint, then
-        // descending neighbor (stable to keep deterministic order on full ties,
-        // mirroring np.argsort which is stable).
+        const std::size_t nu = unknown_coords.size();
         static thread_local std::vector<int> order;
-        order.resize(unknown_coords.size());
-        for (std::size_t i = 0; i < order.size(); ++i) order[i] = static_cast<int>(i);
-        std::stable_sort(order.begin(), order.end(),
-            [&](int a, int b) { return keys[a] < keys[b]; });
+        static thread_local std::vector<int> bucket;
+        order.resize(nu);
+        bucket.assign(static_cast<std::size_t>(max_enc) + 2, 0);
+        for (std::size_t i = 0; i < nu; ++i) bucket[enc[i] + 1]++;
+        for (int k = 1; k <= max_enc + 1; ++k) bucket[k] += bucket[k - 1];
+        for (std::size_t i = 0; i < nu; ++i) order[bucket[enc[i]]++] = static_cast<int>(i);
 
         int best_pixels = -1;
         bool have_best = false;
