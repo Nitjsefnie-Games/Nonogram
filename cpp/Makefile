@@ -3,7 +3,8 @@ CXX = g++
 # path (it was outlined as a real call, ~2.5% call overhead on the trail/queue
 # pushes in the hot loop); measured ~+4% on the --max 300000 anytime benchmark.
 CXXFLAGS = -O3 -march=native -flto -std=c++17 -Wall -Wextra -pedantic \
-           --param max-inline-insns-auto=120 --param max-inline-insns-single=600
+           --param max-inline-insns-auto=120 --param max-inline-insns-single=600 \
+           -funroll-loops
 
 SRCS = main.cpp lines.cpp picture.cpp puzzle_io.cpp search.cpp
 OBJS = $(SRCS:.cpp=.o)
