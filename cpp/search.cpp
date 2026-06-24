@@ -19,6 +19,7 @@
 #include <functional>
 #include <list>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -32,6 +33,7 @@ namespace {
 // Cleared at the entry of solve().
 // ---------------------------------------------------------------------------
 
+// Owning key, stored in the cache. line_bytes holds the line's cell bytes.
 struct LineKey {
     std::string line_bytes;
     const LineSpec* states_ptr;
@@ -41,12 +43,40 @@ struct LineKey {
     }
 };
 
+// Borrowed lookup key: a view over the current line buffer, so cache HITS need
+// no std::string allocation. Heterogeneous (transparent) lookup matches it
+// against stored owning LineKeys.
+struct LineKeyView {
+    std::string_view line_bytes;
+    const LineSpec* states_ptr;
+};
+
+inline std::size_t mix_line_key(std::string_view bytes, const LineSpec* p) noexcept {
+    std::size_t h1 = std::hash<std::string_view>{}(bytes);
+    std::size_t h2 = std::hash<const void*>{}(static_cast<const void*>(p));
+    return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+}
+
 struct LineKeyHash {
+    using is_transparent = void;
     std::size_t operator()(const LineKey& k) const noexcept {
-        std::size_t h1 = std::hash<std::string>{}(k.line_bytes);
-        std::size_t h2 = std::hash<const void*>{}(static_cast<const void*>(k.states_ptr));
-        // Mix
-        return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+        return mix_line_key(k.line_bytes, k.states_ptr);
+    }
+    std::size_t operator()(const LineKeyView& k) const noexcept {
+        return mix_line_key(k.line_bytes, k.states_ptr);
+    }
+};
+
+struct LineKeyEq {
+    using is_transparent = void;
+    bool operator()(const LineKey& a, const LineKey& b) const noexcept {
+        return a.states_ptr == b.states_ptr && a.line_bytes == b.line_bytes;
+    }
+    bool operator()(const LineKey& a, const LineKeyView& b) const noexcept {
+        return a.states_ptr == b.states_ptr && std::string_view(a.line_bytes) == b.line_bytes;
+    }
+    bool operator()(const LineKeyView& a, const LineKey& b) const noexcept {
+        return a.states_ptr == b.states_ptr && a.line_bytes == std::string_view(b.line_bytes);
     }
 };
 
@@ -66,7 +96,7 @@ public:
         index_.clear();
     }
 
-    LineSolveResult* find_and_promote(const LineKey& key) {
+    LineSolveResult* find_and_promote(const LineKeyView& key) {
         auto it = index_.find(key);
         if (it == index_.end()) return nullptr;
         // Move to front (most recently used).
@@ -88,7 +118,7 @@ public:
 
 private:
     std::list<LineCacheEntry> entries_;
-    ankerl::unordered_dense::map<LineKey, std::list<LineCacheEntry>::iterator, LineKeyHash> index_;
+    ankerl::unordered_dense::map<LineKey, std::list<LineCacheEntry>::iterator, LineKeyHash, LineKeyEq> index_;
 };
 
 LRULineCache& line_cache() {
@@ -103,11 +133,6 @@ void reset_line_cache(int max_line_len, std::size_t budget_bytes) {
     c.set_max_entries(std::max<std::size_t>(1, budget_bytes / per_entry));
 }
 
-// Convert a vector<int8_t> to a std::string of the same byte content for use
-// as a hashmap key.
-std::string line_to_bytes(const std::vector<std::int8_t>& line) {
-    return std::string(reinterpret_cast<const char*>(line.data()), line.size());
-}
 
 // ---------------------------------------------------------------------------
 // Trail — records cell-index mutations so probe_cell and solve_backtrack can
@@ -248,14 +273,29 @@ BatchResult solve_one_batch(const LineSpec& spec,
                             int index,
                             bool is_col,
                             Picture& pic) {
-    std::vector<std::int8_t> line = is_col ? pic.get_col(index) : pic.get_row(index);
+    // Gather the line into a reusable buffer (no per-call allocation).
+    static thread_local std::vector<std::int8_t> line;
+    const int W = pic.width();
+    const std::int8_t* px = pic.pixels.data();
+    if (is_col) {
+        const int H = pic.height();
+        line.resize(static_cast<std::size_t>(H));
+        for (int r = 0; r < H; ++r) {
+            line[r] = px[static_cast<std::size_t>(r) * W + index];
+        }
+    } else {
+        const std::int8_t* row = px + static_cast<std::size_t>(index) * W;
+        line.assign(row, row + W);
+    }
 
-    LineKey key{line_to_bytes(line), &spec};
+    std::string_view view_bytes(reinterpret_cast<const char*>(line.data()), line.size());
+    LineKeyView vkey{view_bytes, &spec};
     auto& cache = line_cache();
-    const LineSolveResult* result_ptr = cache.find_and_promote(key);
+    const LineSolveResult* result_ptr = cache.find_and_promote(vkey);
     if (result_ptr == nullptr) {
         LineSolveResult res = solve_line_batch(line, spec);
-        result_ptr = cache.insert(std::move(key), std::move(res));
+        LineKey okey{std::string(view_bytes), &spec};
+        result_ptr = cache.insert(std::move(okey), std::move(res));
     }
 
     if (result_ptr->total == 0) {
