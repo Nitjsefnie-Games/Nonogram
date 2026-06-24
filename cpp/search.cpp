@@ -271,11 +271,15 @@ BatchResult solve_one_batch(const LineSpec& spec,
         static thread_local std::vector<std::int8_t> col_buf;
         const int H = pic.height();
         col_buf.resize(static_cast<std::size_t>(H));
+        // Hoist the thread_local base pointer into a local; otherwise the
+        // compiler reloads col_buf.data() from TLS (fs:) on every iteration.
+        std::int8_t* cb = col_buf.data();
+        const std::int8_t* src = px + index;
         for (int r = 0; r < H; ++r) {
-            col_buf[r] = px[static_cast<std::size_t>(r) * W + index];
+            cb[r] = src[static_cast<std::size_t>(r) * W];
         }
-        line = col_buf.data();
-        line_n = col_buf.size();
+        line = cb;
+        line_n = static_cast<std::size_t>(H);
     } else {
         line = px + static_cast<std::size_t>(index) * W;
         line_n = static_cast<std::size_t>(W);
