@@ -476,10 +476,12 @@ ProbeResult probe_cell(int row,
                        const std::vector<LineSpec>& mapped_rows,
                        const std::vector<LineSpec>& mapped_cols,
                        Picture& pic) {
-    Trail trail;
-    // Reserve enough headroom that most probes don't reallocate. Linear in
-    // the number of unknowns.
-    trail.changed_cell_indices.reserve(static_cast<std::size_t>(pic.unknown_count));
+    // Reusable per-probe trail. probe_cell never nests (it calls only
+    // solve_lines, which never probes), and the previous probe's ProbeGuard
+    // already reverted every cell it touched, so we just clear the index buffer
+    // and reuse its capacity — no per-probe heap allocation.
+    static thread_local Trail trail;
+    trail.changed_cell_indices.clear();
 
     ProbeGuard guard(pic, trail);
 
