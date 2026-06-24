@@ -89,9 +89,8 @@ LineSpec make_line_spec(const std::vector<int>& clue) {
     return spec;
 }
 
-LineSolveResult solve_line_batch(const std::vector<std::int8_t>& line,
+LineSolveResult solve_line_batch(const std::int8_t* line, std::size_t n,
                                  const LineSpec& spec) {
-    const std::size_t n = line.size();
     const std::size_t len_states = spec.len_states;
     const std::size_t n_words = spec.n_words;
 
@@ -258,66 +257,3 @@ LineSolveResult solve_line_batch(const std::vector<std::int8_t>& line,
     return result;
 }
 
-bool check_line_valid(const std::vector<std::int8_t>& line,
-                      const LineSpec& spec) {
-    const std::size_t n = line.size();
-    const std::size_t len_states = spec.len_states;
-    const std::size_t n_words = spec.n_words;
-
-    if (len_states == 0 || n_words == 0) {
-        return false;
-    }
-
-    const std::uint64_t* state_valid = spec.state_valid.data();
-    const std::uint64_t* empty_mask = spec.empty_mask.data();
-    const std::uint64_t* full_mask = spec.full_mask.data();
-
-    g_scratch.ensure(n + 1, n_words);
-    std::uint64_t* forward = g_scratch.forward.data();
-    std::uint64_t* cur = g_scratch.cur.data();
-    std::uint64_t* shifted = g_scratch.shifted.data();
-
-    for (std::size_t w = 0; w < n_words; ++w) forward[w] = 0;
-    forward[0] = 1ULL;
-
-    for (std::size_t p = 0; p < n; ++p) {
-        std::uint64_t* fwd_p = forward + p * n_words;
-        std::uint64_t* fwd_next = forward + (p + 1) * n_words;
-        for (std::size_t w = 0; w < n_words; ++w) {
-            cur[w] = fwd_p[w];
-        }
-
-        std::int8_t cell = line[p];
-        if (cell == UNKNOWN) {
-            shift_left_1(cur, shifted, n_words);
-            for (std::size_t w = 0; w < n_words; ++w) {
-                fwd_next[w] = (cur[w] & empty_mask[w]) | (shifted[w] & state_valid[w]);
-            }
-        } else if (cell == EMPTY) {
-            shift_left_1(cur, shifted, n_words);
-            for (std::size_t w = 0; w < n_words; ++w) {
-                fwd_next[w] = (cur[w] & empty_mask[w]) | (shifted[w] & empty_mask[w]);
-            }
-        } else { // FULL
-            shift_left_1(cur, shifted, n_words);
-            for (std::size_t w = 0; w < n_words; ++w) {
-                fwd_next[w] = shifted[w] & full_mask[w];
-            }
-        }
-    }
-
-    const std::uint64_t* fwd_n = forward + n * n_words;
-    std::size_t accept_w1 = (len_states - 1) / 64;
-    std::uint64_t accept_b1 = 1ULL << ((len_states - 1) % 64);
-    if ((fwd_n[accept_w1] & accept_b1) != 0) {
-        return true;
-    }
-    if (len_states >= 2) {
-        std::size_t accept_w2 = (len_states - 2) / 64;
-        std::uint64_t accept_b2 = 1ULL << ((len_states - 2) % 64);
-        if ((fwd_n[accept_w2] & accept_b2) != 0) {
-            return true;
-        }
-    }
-    return false;
-}
