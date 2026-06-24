@@ -137,8 +137,7 @@ LineSolveResult solve_line_batch_1w(const std::int8_t* line, std::size_t n,
         bwd[pi] = bp;
     }
 
-    result.positions.reserve(n);
-    result.values.reserve(n);
+    result.deductions.reserve(n);
     int n_changed = 0, n_unknown_total = 0;
     for (std::size_t p = 0; p < n; ++p) {
         if (line[p] != UNKNOWN) continue;
@@ -150,12 +149,10 @@ LineSolveResult solve_line_batch_1w(const std::int8_t* line, std::size_t n,
         const bool can_empty = (f & (bw_empty | (bw_empty >> 1))) != 0;
         const bool can_full = (f & (bw_full >> 1)) != 0;
         if (can_empty && !can_full) {
-            result.positions.push_back(static_cast<int>(p));
-            result.values.push_back(EMPTY);
+            result.deductions.push_back(deduce_pack(static_cast<int>(p), EMPTY));
             ++n_changed;
         } else if (can_full && !can_empty) {
-            result.positions.push_back(static_cast<int>(p));
-            result.values.push_back(FULL);
+            result.deductions.push_back(deduce_pack(static_cast<int>(p), FULL));
             ++n_changed;
         }
     }
@@ -284,8 +281,7 @@ LineSolveResult solve_line_batch(const std::int8_t* line, std::size_t n,
     }
 
     // Determine each unknown cell.
-    result.positions.reserve(n);
-    result.values.reserve(n);
+    result.deductions.reserve(n);
 
     std::uint64_t* bw_empty = g_scratch.bw_empty.data();
     std::uint64_t* bw_full = g_scratch.bw_full.data();
@@ -322,12 +318,10 @@ LineSolveResult solve_line_batch(const std::int8_t* line, std::size_t n,
         }
 
         if (can_empty && !can_full) {
-            result.positions.push_back(static_cast<int>(p));
-            result.values.push_back(EMPTY);
+            result.deductions.push_back(deduce_pack(static_cast<int>(p), EMPTY));
             ++n_changed;
         } else if (can_full && !can_empty) {
-            result.positions.push_back(static_cast<int>(p));
-            result.values.push_back(FULL);
+            result.deductions.push_back(deduce_pack(static_cast<int>(p), FULL));
             ++n_changed;
         }
     }
