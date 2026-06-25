@@ -27,3 +27,16 @@ void solve(const std::vector<std::vector<int>>& rows,
            std::function<bool(const Picture&)> on_solution,
            Strategy* out_strategy = nullptr,
            bool keep_probing = false);
+
+// Knuth-style estimate of the TOTAL number of solutions, without enumerating.
+// Performs n_dives random weighted root-to-leaf dives (Knuth 1975): at each
+// branching node it counts the viable child values, multiplies a running weight
+// by that count, and descends into a uniformly-random viable child. The mean of
+// the per-dive weights (weight if the dive reaches a full solution, 0 if it
+// dead-ends) is an unbiased estimate of the solution count. High variance, so
+// it gives an order of magnitude. Writes diagnostics (hit rate, max weight) to
+// stderr. Returns the mean estimate.
+double estimate_solutions(const std::vector<std::vector<int>>& rows,
+                          const std::vector<std::vector<int>>& cols,
+                          long n_dives,
+                          unsigned long seed);

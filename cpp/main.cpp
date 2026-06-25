@@ -108,6 +108,7 @@ int main(int argc, char** argv) {
     bool have_max = false;
     long long print_every = 0;     // 0 = use progressive default
     bool anytime = false;          // keep lookahead probing on for whole search
+    long long estimate_dives = 0;  // >0: Knuth-estimate solution count, don't solve
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -115,6 +116,17 @@ int main(int argc, char** argv) {
             print_progress = true;
         } else if (std::strcmp(a, "--anytime") == 0) {
             anytime = true;
+        } else if (std::strcmp(a, "--estimate") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "--estimate requires a dive count\n");
+                return 1;
+            }
+            try {
+                estimate_dives = std::stoll(argv[++i]);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "--estimate: invalid integer: %s\n", e.what());
+                return 1;
+            }
         } else if (std::strcmp(a, "--max") == 0) {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "--max requires a value\n");
@@ -173,6 +185,25 @@ int main(int argc, char** argv) {
     }
 
     std::printf("Puzzle size: %zu rows x %zu cols\n", clues.rows.size(), clues.cols.size());
+    std::fflush(stdout);
+
+    if (estimate_dives > 0) {
+        std::printf("Estimating solution count via %lld Knuth dives...\n", estimate_dives);
+        std::fflush(stdout);
+        auto t0 = std::chrono::steady_clock::now();
+        const char* se = std::getenv("ESTIMATE_SEED");
+        unsigned long seed = se ? std::strtoul(se, nullptr, 10) : 0xC0FFEEUL;
+        double est = estimate_solutions(clues.rows, clues.cols, static_cast<long>(estimate_dives), seed);
+        double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("Estimated total solutions: %.4e   (%.1fs)\n", est, secs);
+        if (est > 0.0) {
+            double per_day = 6.4e9;  // ~74k/s observed
+            std::printf("At ~74,000 solutions/s that is ~%.2e years to fully enumerate.\n",
+                        est / per_day / 365.25);
+        }
+        return 0;
+    }
+
     std::printf("Solving...\n");
     std::fflush(stdout);
 
