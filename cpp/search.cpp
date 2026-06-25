@@ -13,12 +13,15 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <climits>
 #include <cstring>
 #include <deque>
 #include <functional>
 #include <list>
 #include <map>
+#include <random>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -758,6 +761,57 @@ bool solve_real(const std::vector<const LineSpec*>& mapped_rows,
     return solve_backtrack(mapped_rows, mapped_cols, pic, state, on_solution, trail);
 }
 
+// One Knuth dive: descend a single random root-to-leaf path, accumulating the
+// product of viable-branch counts. Returns that weight if the path reaches a
+// full solution, 0.0 if it dead-ends. Mutates pic in place (no backtracking;
+// the caller discards pic after each dive).
+double estimate_dive(const std::vector<const LineSpec*>& mapped_rows,
+                     const std::vector<const LineSpec*>& mapped_cols,
+                     Picture& pic, Trail& trail, std::mt19937_64& rng) {
+    const int H = pic.height();
+    const int W = pic.width();
+    double weight = 1.0;
+    std::vector<int> ur(static_cast<std::size_t>(H)), uc(static_cast<std::size_t>(W));
+    while (true) {
+        while (pic.has_dirty()) {
+            if (!solve_lines(mapped_rows, pic, true, trail)) return 0.0;
+            if (!solve_lines(mapped_cols, pic, false, trail)) return 0.0;
+        }
+        if (pic.is_solved()) return weight;
+
+        // Pick the most-constrained unknown cell (fewest unknowns in row+col).
+        std::fill(ur.begin(), ur.end(), 0);
+        std::fill(uc.begin(), uc.end(), 0);
+        const std::int8_t* px = pic.pixels.data();
+        for (int r = 0; r < H; ++r) {
+            const std::int8_t* row = px + static_cast<std::size_t>(r) * W;
+            for (int c = 0; c < W; ++c) if (row[c] == UNKNOWN) { ++ur[r]; ++uc[c]; }
+        }
+        int br = -1, bc = -1, bk = INT_MAX;
+        for (int r = 0; r < H; ++r) {
+            const std::int8_t* row = px + static_cast<std::size_t>(r) * W;
+            for (int c = 0; c < W; ++c) {
+                if (row[c] != UNKNOWN) continue;
+                int k = ur[r] + uc[c];
+                if (k < bk) { bk = k; br = r; bc = c; }
+            }
+        }
+        if (br < 0) return weight;  // no unknowns (already solved-equivalent)
+
+        // Count viable values via lookahead probes (each reverts pic).
+        ProbeResult pf = probe_cell(br, bc, FULL, mapped_rows, mapped_cols, pic);
+        ProbeResult pe = probe_cell(br, bc, EMPTY, mapped_rows, mapped_cols, pic);
+        const int nv = (pf.ok ? 1 : 0) + (pe.ok ? 1 : 0);
+        if (nv == 0) return 0.0;
+        std::int8_t val;
+        if (nv == 2) { val = (rng() & 1ULL) ? FULL : EMPTY; weight *= 2.0; }
+        else         { val = pf.ok ? FULL : EMPTY; }
+        pic.set_pixel(br, bc, val);
+        pic.mark_row_dirty(br);
+        pic.mark_col_dirty(bc);
+    }
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -828,4 +882,59 @@ void solve(const std::vector<std::vector<int>>& rows,
             *out_strategy = Strategy::BASIC;
         }
     }
+}
+
+double estimate_solutions(const std::vector<std::vector<int>>& rows,
+                          const std::vector<std::vector<int>>& cols,
+                          long n_dives,
+                          unsigned long seed) {
+    std::size_t budget = 1024ULL * 1024ULL * 1024ULL;
+    const char* env = std::getenv("LINE_CACHE_BUDGET_MB");
+    if (env != nullptr) {
+        try { budget = static_cast<std::size_t>(std::stoull(env)) * 1024ULL * 1024ULL; }
+        catch (...) {}
+    }
+    int max_line = static_cast<int>(std::max(rows.size(), cols.size()));
+    reset_line_cache(max_line, budget, false);
+
+    const int H = static_cast<int>(rows.size());
+    const int W = static_cast<int>(cols.size());
+
+    // Dedupe specs by clue (same as solve()).
+    std::vector<LineSpec> spec_pool;
+    spec_pool.reserve(rows.size() + cols.size());
+    std::map<std::vector<int>, const LineSpec*> clue_to_spec;
+    auto get_spec = [&](const std::vector<int>& clue) -> const LineSpec* {
+        auto it = clue_to_spec.find(clue);
+        if (it != clue_to_spec.end()) return it->second;
+        spec_pool.push_back(make_line_spec(clue));
+        const LineSpec* p = &spec_pool.back();
+        clue_to_spec.emplace(clue, p);
+        return p;
+    };
+    std::vector<const LineSpec*> mapped_rows;
+    mapped_rows.reserve(rows.size());
+    for (const auto& clue : rows) mapped_rows.push_back(get_spec(clue));
+    std::vector<const LineSpec*> mapped_cols;
+    mapped_cols.reserve(cols.size());
+    for (const auto& clue : cols) mapped_cols.push_back(get_spec(clue));
+
+    std::mt19937_64 rng(seed);
+    double sum = 0.0;
+    long hits = 0;
+    double maxw = 0.0;
+    for (long d = 0; d < n_dives; ++d) {
+        Picture pic(H, W);
+        Trail trail;
+        double est = estimate_dive(mapped_rows, mapped_cols, pic, trail, rng);
+        sum += est;
+        if (est > 0.0) { ++hits; if (est > maxw) maxw = est; }
+    }
+    double mean = (n_dives > 0) ? sum / static_cast<double>(n_dives) : 0.0;
+    std::fprintf(stderr,
+                 "estimate: dives=%ld solution-hits=%ld (%.3f%%) max-dive-weight=%.3e\n",
+                 n_dives, hits,
+                 n_dives ? 100.0 * static_cast<double>(hits) / static_cast<double>(n_dives) : 0.0,
+                 maxw);
+    return mean;
 }
