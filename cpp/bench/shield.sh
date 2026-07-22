@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
-# Shield CPU core 5 for benchmarking. Reversible via unshield.sh.
-# Restricts every top-level cgroup to cores 0-4, steers movable IRQs off 5,
-# then makes /sys/fs/cgroup/bench an exclusive partition owning core 5.
+# Shield one CPU core for benchmarking. Reversible via unshield.sh.
+# Restricts every top-level cgroup to the remaining cores, steers movable IRQs
+# off the shielded one, then makes /sys/fs/cgroup/bench an exclusive partition
+# owning it.
+#
+# Usage: shield.sh [core]     (default: highest online core)
 set -u
 CG=/sys/fs/cgroup
-CORE=5
-OTHERS=0-4
+if [ $# -ge 1 ]; then
+  CORE=$1
+else
+  # highest online core, e.g. "0-5" -> 5, "0-3,8-11" -> 11
+  CORE=$(tr ',' '\n' < "$CG/cpuset.cpus.effective" | tail -1 | sed 's/.*-//')
+fi
+OTHERS=0-$((CORE - 1))
 
 echo "[shield] restricting top-level cgroups to ${OTHERS}"
 for d in "$CG"/*/; do
