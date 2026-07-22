@@ -10,8 +10,10 @@ CG=/sys/fs/cgroup
 if [ $# -ge 1 ]; then
   CORE=$1
 else
-  # highest online core, e.g. "0-5" -> 5, "0-3,8-11" -> 11
-  CORE=$(tr ',' '\n' < "$CG/cpuset.cpus.effective" | tail -1 | sed 's/.*-//')
+  # Highest ONLINE core, e.g. "0-5" -> 5, "0-3,8-11" -> 11.
+  # Deliberately not cpuset.cpus.effective: that set shrinks every time this
+  # script runs, so re-running it would shield a second core, then a third.
+  CORE=$(tr ',' '\n' < /sys/devices/system/cpu/online | tail -1 | sed 's/.*-//')
 fi
 OTHERS=0-$((CORE - 1))
 
