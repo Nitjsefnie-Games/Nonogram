@@ -2,7 +2,9 @@
 # Reverse shield.sh: dissolve the bench partition and give every cgroup all cores.
 set -u
 CG=/sys/fs/cgroup
-ALL=0-5
+# Every online core, e.g. "0-11". Was hardcoded 0-5, which on a 12-core box
+# confined every top-level cgroup and IRQ to half the machine on "unshield".
+ALL=$(cat /sys/devices/system/cpu/online)
 
 if [ -d "$CG/bench" ]; then
   echo member > "$CG/bench/cpuset.cpus.partition" 2>/dev/null
