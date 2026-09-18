@@ -1,5 +1,6 @@
 #pragma once
 #include <functional>
+#include <string>
 #include <vector>
 #include "picture.hpp"
 
@@ -27,7 +28,16 @@ void solve(const std::vector<std::vector<int>>& rows,
            std::function<bool(const Picture&)> on_solution,
            Strategy* out_strategy = nullptr,
            bool keep_probing = false,
-           double balance_k = 0.0);
+           double balance_k = 0.0,
+           bool count_mode = false,
+           std::string* out_count = nullptr);
+// count_mode: count solutions instead of visiting them. on_solution is never
+// called; the exact total is written to *out_count in decimal. After
+// propagation at every branch node the unknown cells are split into regions
+// that share no row or column, each region is counted on its own with the
+// same search, and the counts multiply (every full solution is one choice
+// per region), so solution-rich puzzles whose ambiguity is spread over
+// separate patches are counted without visiting each combination.
 // balance_k > 0 scores a branch cell by balance_k * min(f, e) - max(f, e)
 // (f, e = cells settled by probing it FULL / EMPTY) instead of min(f, e)
 // with ties toward the smaller max. Exhaustive searches on hard unique

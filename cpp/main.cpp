@@ -257,12 +257,36 @@ int main(int argc, char** argv) {
     // Running estimate of the total and of the time to finish: solutions
     // found / fraction of the search space completed, and elapsed scaled
     // the same way (see explored_fraction()).
+    // Alongside the whole-run average, an exponential moving average of the
+    // recent progress (mass covered per second, solutions per unit of mass)
+    // between prints: it tracks the region the search is in now, so when
+    // the fraction stops moving its ETA grows instead of staying put.
+    double last_frac = 0.0, last_elapsed = 0.0;
+    long long last_solutions = 0;
+    double ema_mass_rate = 0.0, ema_density = 0.0;
+    bool ema_ready = false;
     auto est_suffix = [&]() -> std::string {
         const double frac = explored_fraction();
         if (!(frac > 0.0)) return std::string();
-        char buf[96];
-        std::snprintf(buf, sizeof buf, " est~%.2e %.3g%% eta~%s", static_cast<double>(solution_count) / frac,
-                      frac * 100.0, fmt_duration(p_elapsed / frac - p_elapsed).c_str());
+        char buf[192];
+        int n = std::snprintf(buf, sizeof buf, " est~%.2e %.3g%% eta~%s", static_cast<double>(solution_count) / frac,
+                              frac * 100.0, fmt_duration(p_elapsed / frac - p_elapsed).c_str());
+        const double dt = p_elapsed - last_elapsed, dm = frac - last_frac;
+        if (dt > 0.0) {
+            const double mass_rate = dm / dt;
+            const double density = dm > 0.0 ? static_cast<double>(solution_count - last_solutions) / dm : ema_density;
+            const double a = 0.3;
+            ema_mass_rate = ema_ready ? (1.0 - a) * ema_mass_rate + a * mass_rate : mass_rate;
+            ema_density = ema_ready ? (1.0 - a) * ema_density + a * density : density;
+            ema_ready = true;
+            const double remaining = 1.0 - frac;
+            const double ema_total = static_cast<double>(solution_count) + remaining * ema_density;
+            if (ema_mass_rate > 0.0)
+                std::snprintf(buf + n, sizeof buf - n, " ema~%.2e eta~%s", ema_total, fmt_duration(remaining / ema_mass_rate).c_str());
+            else
+                std::snprintf(buf + n, sizeof buf - n, " ema~%.2e eta~stalled", ema_total);
+        }
+        last_frac = frac; last_elapsed = p_elapsed; last_solutions = solution_count;
         return std::string(buf);
     };
 
@@ -316,7 +340,13 @@ int main(int argc, char** argv) {
     };
 
     Strategy strategy = Strategy::BASIC;
-    solve(clues.rows, clues.cols, callback, &strategy, anytime, balance_k);
+    // An exhaustive run counts: independent regions of the grid are
+    // counted separately and multiplied, so no solution is visited one by
+    // one. Runs that need the solutions themselves (--print, --max N,
+    // --anytime) enumerate.
+    const bool count_mode = !print_progress && !have_max && !anytime;
+    std::string count_str;
+    solve(clues.rows, clues.cols, callback, &strategy, anytime, balance_k, count_mode, &count_str);
 
     auto end = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(end - start).count();
@@ -324,10 +354,21 @@ int main(int argc, char** argv) {
 
     std::putchar('\n');
     std::printf("\nTime: %.4fs\n", elapsed);
-    std::printf("Found %s solution(s) (%s/s)\n",
-                fmt_int_commas(solution_count).c_str(),
-                fmt_rate(rate).c_str());
-    if (explored_fraction() < 1.0 - 1e-12 && solution_count > 0)
+    if (count_mode) {
+        std::string with_commas;
+        int n = 0;
+        for (auto it = count_str.rbegin(); it != count_str.rend(); ++it) {
+            if (n > 0 && n % 3 == 0) with_commas.insert(with_commas.begin(), ',');
+            with_commas.insert(with_commas.begin(), *it);
+            ++n;
+        }
+        std::printf("Found %s solution(s) (counted)\n", with_commas.c_str());
+    } else {
+        std::printf("Found %s solution(s) (%s/s)\n",
+                    fmt_int_commas(solution_count).c_str(),
+                    fmt_rate(rate).c_str());
+    }
+    if (!count_mode && explored_fraction() < 1.0 - 1e-12 && solution_count > 0)
         std::printf("Explored %.3g%% of the search space; estimated total ~%.3e solutions, ~%s to finish\n",
                     explored_fraction() * 100.0, static_cast<double>(solution_count) / explored_fraction(),
                     fmt_duration(elapsed / explored_fraction() - elapsed).c_str());
