@@ -26,6 +26,7 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -321,6 +322,12 @@ private:
     }
 
     bool keys_equal(const unsigned char* s, const std::uint64_t* key) const {
+        if (kw_ == 2) {  // the common case: no loop with a runtime trip count
+            std::uint64_t a, b;
+            std::memcpy(&a, s, 8);
+            std::memcpy(&b, s + 8, 8);
+            return ((a ^ key[0]) | (b ^ key[1])) == 0;
+        }
         std::uint64_t diff = 0;
         for (int w = 0; w < kw_; ++w) {
             std::uint64_t v;
@@ -609,12 +616,13 @@ BatchResult solve_one_batch_legacy(const LineSpec& spec,
     return g_fast_cache.insert(key, tag, res);
 }
 
-inline BatchResult solve_one_batch(const LineSpec& spec,
+template <bool FAST>
+inline BatchResult solve_one_batch(const std::vector<const LineSpec*>& mapped,
                                    int index,
                                    bool is_col,
                                    Picture& pic) {
-    if (!g_fast_mode) {
-        return solve_one_batch_legacy(spec, index, is_col, pic);
+    if (!FAST) {
+        return solve_one_batch_legacy(*mapped[index], index, is_col, pic);
     }
 
     const int kw = pic.key_words;
@@ -625,7 +633,7 @@ inline BatchResult solve_one_batch(const LineSpec& spec,
     if (g_debug_stats) ++g_stat_lookups;
     unsigned char* s = g_fast_cache.find(key, tag);
     if (s == nullptr) {
-        s = solve_one_batch_miss(spec, index, is_col, pic, key, tag);
+        s = solve_one_batch_miss(*mapped[index], index, is_col, pic, key, tag);
     }
 
     const std::size_t hdr = g_fast_cache.header_offset();
@@ -704,20 +712,25 @@ bool solve_lines(const std::vector<const LineSpec*>& mapped,
                  Trail& trail) {
     auto& queue = is_row ? pic.row_queue : pic.col_queue;
     auto& dirty = is_row ? pic.row_dirty : pic.col_dirty;
-    while (!queue.empty()) {
-        const int index = queue.front();
-        queue.pop_front();
-        dirty[index] = 0;
-        BatchResult r = solve_one_batch(*mapped[index], index, !is_row, pic);
-        if (!r.success) {
-            return false;
+    // The fast/legacy choice is per puzzle; decide it once per drain rather
+    // than per line.
+    auto drain = [&](auto fast) -> bool {
+        while (!queue.empty()) {
+            const int index = queue.front();
+            queue.pop_front();
+            dirty[index] = 0;
+            BatchResult r = solve_one_batch<decltype(fast)::value>(mapped, index, !is_row, pic);
+            if (!r.success) {
+                return false;
+            }
+            if (r.n8 > 0 || (r.n8 == BatchResult::kLegacy && r.ded != nullptr)) {
+                write_intersection(r, index, pic, is_row, trail);
+            }
         }
-        if (r.n8 > 0 || (r.n8 == BatchResult::kLegacy && r.ded != nullptr)) {
-            write_intersection(r, index, pic, is_row, trail);
-        }
-    }
-    queue.reset();
-    return true;
+        queue.reset();
+        return true;
+    };
+    return g_fast_mode ? drain(std::true_type{}) : drain(std::false_type{});
 }
 
 int count_solved_pixels(const Picture& pic) {
