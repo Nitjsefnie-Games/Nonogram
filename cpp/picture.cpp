@@ -7,6 +7,8 @@ Picture::Picture(int height, int width)
     : pixels(static_cast<std::size_t>(height) * static_cast<std::size_t>(width), UNKNOWN),
       row_dirty(static_cast<std::size_t>(height), 1),
       col_dirty(static_cast<std::size_t>(width), 1),
+      row_queue(static_cast<std::size_t>(height)),
+      col_queue(static_cast<std::size_t>(width)),
       unknown_count(height * width),
       key_words((std::max(height, width) + 31) / 32),
       row_keys(static_cast<std::size_t>(height) * key_words, 0),
@@ -31,20 +33,6 @@ Picture::Picture(int height, int width)
 }
 
 Picture::~Picture() = default;
-
-void Picture::mark_row_dirty(int row) {
-    if (!row_dirty[row]) {
-        row_dirty[row] = 1;
-        row_queue.push_back(row);
-    }
-}
-
-void Picture::mark_col_dirty(int col) {
-    if (!col_dirty[col]) {
-        col_dirty[col] = 1;
-        col_queue.push_back(col);
-    }
-}
 
 bool Picture::has_dirty() const {
     return !row_queue.empty() || !col_queue.empty();

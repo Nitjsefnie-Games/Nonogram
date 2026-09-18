@@ -10,17 +10,26 @@
 // std::deque without per-op block (de)allocation.
 class FifoQueue {
 public:
-    void push_back(int v) { buf_.push_back(v); }
-    bool empty() const { return head_ >= buf_.size(); }
+    // capacity = number of lines: the dirty-flag dedup bounds the entries
+    // between two resets by that, so the buffer never grows. One spare slot
+    // absorbs push_back_if's unconditional write when the queue is full.
+    explicit FifoQueue(std::size_t capacity = 0) : buf_(capacity + 1), tail_(0), head_(0) {}
+    void push_back(int v) { buf_[tail_++] = v; }
+    // Branch-free conditional enqueue: the value is always written to the
+    // tail slot and the tail advances by `cond`. Whether a line is already
+    // dirty is data-dependent noise to the branch predictor.
+    void push_back_if(int v, bool cond) { buf_[tail_] = v; tail_ += cond; }
+    bool empty() const { return head_ >= tail_; }
     int front() const { return buf_[head_]; }
-    void pop_front() {
-        ++head_;
-        if (head_ >= buf_.size()) { buf_.clear(); head_ = 0; }
-    }
+    void pop_front() { ++head_; }
+    // Call once the queue has been drained (empty() is true) to reclaim the
+    // buffer; kept out of pop_front so the drain loop pays no per-pop check.
+    void reset() { tail_ = 0; head_ = 0; }
 
 private:
     std::vector<int> buf_;
-    std::size_t head_ = 0;
+    std::size_t tail_;
+    std::size_t head_;
 };
 
 class Picture {
@@ -28,8 +37,14 @@ public:
     Picture(int height, int width);
     ~Picture();
 
-    void mark_row_dirty(int row);
-    void mark_col_dirty(int col);
+    void mark_row_dirty(int row) {
+        row_queue.push_back_if(row, !row_dirty[row]);
+        row_dirty[row] = 1;
+    }
+    void mark_col_dirty(int col) {
+        col_queue.push_back_if(col, !col_dirty[col]);
+        col_dirty[col] = 1;
+    }
     bool has_dirty() const;
 
     std::int8_t get_pixel(int row, int col) const;
