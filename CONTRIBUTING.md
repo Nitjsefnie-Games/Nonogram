@@ -142,8 +142,21 @@ solution puzzles that do exercise it are `extreme/6574`, `easy_large/5281`
 and, outside the corpus, `in_progress/8098` (9-Dom). And the survey puzzles
 in `bench/survey/` have many solutions, so a `--max 2` run there measures
 how soon the branch order finds a second solution, not the tree size.
-`bench/nodes.py --env BRANCH_K=<k>` passes the stats build's experimental
-branch-score knob (see the comment in `search.cpp`).
+`bench/nodes.py --env NAME=value` passes the stats build's experiment
+knobs through; each is documented next to its definition in `search.cpp`
+with the numbers that kept it out of the shipped build:
+
+| knob | what it changes |
+|---|---|
+| `BRANCH_K=k` | branch score `k*min - max` instead of min with the balanced tie-break |
+| `ANYTIME_TB=1/2` | anytime-mode tie-break on the max toward larger / smaller min |
+| `FIRST_VAL=1` | explore the branch value whose probe settled fewer cells first |
+| `NO_SKIP=1` | never latch the probing shut-off |
+| `PROBE_WINDOW`, `PROBE_THRESH` | the shut-off's yield window and threshold |
+| `DEAD_WINDOW`, `DEAD_FRAC` | the dead-work watchdog's window and fraction |
+| `EARLY_SOLVE=1` | anytime: stop the probe pass at a probe that completes the grid |
+| `DEBUG_IMPL=1/2` | implication graph with contrapositive edges: count / act |
+| `DEBUG_CACHE_STATS=1` | the counters themselves, including the latched dead/live subtree histogram |
 
 ## House style
 
