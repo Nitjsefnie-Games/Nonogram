@@ -1,4 +1,5 @@
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -98,6 +99,11 @@ void print_grid(const Picture& pic) {
     }
 }
 
+// SIGTERM / SIGINT stop the search at its next branch node instead of
+// killing the process, so a run cut off by a timeout still reports how far
+// it got (explored fraction, and in enumerating mode the solutions so far).
+extern "C" void on_stop_signal(int) { request_stop(); }
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -105,6 +111,8 @@ int main(int argc, char** argv) {
         print_usage(stderr);
         return 1;
     }
+    std::signal(SIGTERM, on_stop_signal);
+    std::signal(SIGINT, on_stop_signal);
 
     std::string filename;
     bool print_progress = false;
@@ -354,6 +362,17 @@ int main(int argc, char** argv) {
 
     std::putchar('\n');
     std::printf("\nTime: %.4fs\n", elapsed);
+    if (stop_requested()) {
+        // No `Found` line: the count is not known. The tooling reads the
+        // absence as a timeout.
+        std::printf("Stopped by signal after %.1fs; explored %.8f%% of the search space\n",
+                    elapsed, explored_fraction() * 100.0);
+        std::printf("Position: %s\n", stop_position().c_str());
+        if (!count_mode)
+            std::printf("Solutions so far: %s (%s/s)\n", fmt_int_commas(solution_count).c_str(), fmt_rate(rate).c_str());
+        std::printf("Strategy: %s\n", strategy_name(strategy));
+        return 0;
+    }
     if (count_mode) {
         std::string with_commas;
         int n = 0;

@@ -10,6 +10,7 @@
 #include "external/ankerl/unordered_dense.h"
 
 #include <sys/mman.h>
+#include <x86intrin.h>
 
 #include <algorithm>
 #include <cassert>
@@ -19,6 +20,7 @@
 #include <cstdlib>
 #include <climits>
 #include <cmath>
+#include <csignal>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -228,6 +230,9 @@ std::uint64_t g_stat_nodes = 0;  // solve_backtrack entries that branched
 std::uint64_t g_stat_probe_lookups_hist[64] = {};  // lookups per probe (capped)
 std::uint64_t g_stat_probe_cur = 0;
 std::uint64_t g_stat_probe_ok = 0;
+// State cache by the node's unknown-cell count (bucket = log2): lookups,
+// hits, and the branch nodes the hits saved (sum of 2^work).
+std::uint64_t g_stat_sc_lookups[24] = {}, g_stat_sc_hits[24] = {}, g_stat_sc_saved[24] = {}, g_stat_sc_gated[24] = {};
 
 // BRANCH_K=<k> (stats build only): score branch cells by k*min - max instead
 // of the shipped (min, then smaller max) order, for exploring the balance
@@ -273,7 +278,21 @@ const double g_probe_thresh = std::getenv("PROBE_THRESH") ? std::atof(std::geten
 // DEAD_WINDOW / DEAD_FRAC override the dead-work watchdog's window and fraction.
 const std::uint64_t g_dead_window = std::getenv("DEAD_WINDOW") ? std::strtoull(std::getenv("DEAD_WINDOW"), nullptr, 10) : 4096;
 const double g_dead_frac = std::getenv("DEAD_FRAC") ? std::atof(std::getenv("DEAD_FRAC")) : 0.9;
+// NO_STATE_CACHE=1 (count mode) turns the region state cache off, for
+// measuring what it saves (see SolveState::state_cache).
+const bool g_no_state_cache = std::getenv("NO_STATE_CACHE") != nullptr;
+// STATE_CACHE_PROBE_ONLY=1 keys and looks up every node but never takes a
+// hit, so the tree is the no-cache tree and the instruction delta against
+// NO_STATE_CACHE=1 is the cache's own cost.
+const bool g_state_cache_probe_only = std::getenv("STATE_CACHE_PROBE_ONLY") != nullptr;
+// STATE_CACHE_YIELD=<x> overrides the per-bucket gate's threshold (nodes
+// saved per lookup below which a node-size bucket stops using the cache;
+// 0 never gates).
+const double g_state_cache_yield = std::getenv("STATE_CACHE_YIELD") ? std::atof(std::getenv("STATE_CACHE_YIELD")) : 0.5;
 #else
+constexpr double g_state_cache_yield = 0.5;
+constexpr bool g_no_state_cache = false;
+constexpr bool g_state_cache_probe_only = false;
 constexpr std::uint64_t g_dead_window = 4096;
 constexpr double g_dead_frac = 0.9;
 constexpr int g_debug_impl = 0;
@@ -287,7 +306,13 @@ constexpr double g_probe_thresh = 0.01;
 std::uint64_t g_stat_probe_pairs = 0, g_stat_probe_hits = 0;  // probe pairs, and those with a contradiction
 // Fraction of the search space completed so far; see SolveState::branch_depth.
 double g_explored_mass = 0.0;
+volatile std::sig_atomic_t g_stop_requested = 0;
+std::string g_stop_path;  // SolveState::branch_path when the stop was taken
 std::vector<double> g_half_pow;  // g_half_pow[d] = 2^-d, d up to the cell count + 1
+// Leaf mass is scaled by 1/k inside a k-region split (each region search
+// sums to the split node's whole share on its own), so the fraction reads
+// right mid-search too.
+double g_mass_scale = 1.0;
 
 // Clues of the puzzle being solved (stats build: search-area report).
 const std::vector<std::vector<int>>* g_row_clues = nullptr;
@@ -584,8 +609,21 @@ struct Trail {
     std::vector<std::uint64_t> row_bucket;
     std::vector<int> col_hist;
     int row_words = 0;
+    // Lines whose packed key changed since the state cache last read their
+    // hash (count mode only; see SolveState::state_cache). settle and
+    // unsettle are exactly the net cell changes between two branch nodes,
+    // so the flags are set there, not per cell change inside Picture:
+    // probes change and revert thousands of cells per node.
+    bool track_hash = false;
+    std::vector<std::uint8_t> row_hash_dirty, col_hash_dirty;
+    std::vector<int> dirty_rows, dirty_cols;
+    void mark_hash_dirty(int r, int c) {
+        if (!row_hash_dirty[static_cast<std::size_t>(r)]) { row_hash_dirty[static_cast<std::size_t>(r)] = 1; dirty_rows.push_back(r); }
+        if (!col_hash_dirty[static_cast<std::size_t>(c)]) { col_hash_dirty[static_cast<std::size_t>(c)] = 1; dirty_cols.push_back(c); }
+    }
 
     void settle(int r, int c) {
+        if (track_hash) mark_hash_dirty(r, c);
         const int old = row_unknown[r]--;
         std::uint64_t* b = row_bucket.data() + static_cast<std::size_t>(r >> 6);
         const std::uint64_t bit = 1ULL << (r & 63);
@@ -596,6 +634,7 @@ struct Trail {
         ++col_hist[oc - 1];
     }
     void unsettle(int r, int c) {
+        if (track_hash) mark_hash_dirty(r, c);
         const int old = row_unknown[r]++;
         std::uint64_t* b = row_bucket.data() + static_cast<std::size_t>(r >> 6);
         const std::uint64_t bit = 1ULL << (r & 63);
@@ -613,6 +652,199 @@ inline int trail_pack(int row, int col) { return (row << 16) | col; }
 inline int trail_row(int e) { return e >> 16; }
 inline int trail_col(int e) { return e & 0xFFFF; }
 
+// Zero-filled array on 2 MB-aligned memory advised for transparent huge
+// pages: the state table is accessed at random, so with 4 KB pages every
+// lookup was also a TLB miss.
+template <class T>
+class HugeArray {
+public:
+    HugeArray() = default;
+    ~HugeArray() { release(); }
+    HugeArray(const HugeArray&) = delete;
+    HugeArray& operator=(const HugeArray&) = delete;
+    void assign(std::size_t n) {
+        release();
+        const std::size_t align = 2u << 20;
+        std::size_t bytes = n * sizeof(T);
+        bytes = (bytes + align - 1) / align * align;
+        void* p = std::aligned_alloc(align, bytes);
+        if (p == nullptr) throw std::bad_alloc();
+        madvise(p, bytes, MADV_HUGEPAGE);
+        std::memset(p, 0, bytes);
+        data_ = static_cast<T*>(p);
+        n_ = n;
+    }
+    void swap(HugeArray& o) noexcept { std::swap(data_, o.data_); std::swap(n_, o.n_); }
+    T& operator[](std::size_t i) { return data_[i]; }
+    const T& operator[](std::size_t i) const { return data_[i]; }
+    const T* begin() const { return data_; }
+    const T* end() const { return data_ + n_; }
+
+private:
+    void release() { std::free(data_); data_ = nullptr; n_ = 0; }
+    T* data_ = nullptr;
+    std::size_t n_ = 0;
+};
+
+// Fixed-budget table of region counts by state (see SolveState::state_cache).
+// Open addressing over 32-byte slots: a 120-bit key (two words of a wyhash
+// chain over the region's line keys; the top byte of the second word holds
+// the entry's work, log2 of the branch nodes its subtree cost), then the
+// count. The key is a hash, not the state: with n entries the chance of a
+// false hit is about n^2 / 2^121, under 1e-20 at a billion entries. A
+// lookup probes a window of kWindow slots; an insert into a full window
+// evicts the entry with the least work, since an entry's value is the
+// search it saves. The budget is STATE_CACHE_MB (default 512).
+class StateTable {
+public:
+    struct Key { std::uint64_t a, b; };
+    static constexpr int kWindow = 8;
+    static constexpr std::uint64_t kWorkMask = 0xFFULL << 56;
+
+    // Starts at kMinSlots and doubles at half load up to the budget, so a
+    // puzzle with a few hundred nodes never touches (or zeroes) the budget.
+    void init(std::size_t budget_bytes) {
+        std::size_t want = std::max<std::size_t>(budget_bytes / sizeof(Slot), kMinSlots);
+        max_slots_ = kMinSlots;
+        while (max_slots_ * 2 <= want) max_slots_ *= 2;
+        nslots_ = kMinSlots;
+        slots_.assign(nslots_);
+        mask_ = nslots_ - 1;
+        count_ = 0;
+    }
+    std::size_t size() const { return count_; }
+    std::size_t slots() const { return nslots_; }
+
+    // Empty slots have a == 0 && b == 0; a real key with both words zero is
+    // nudged so it can never read as empty.
+    static Key normalize(std::uint64_t a, std::uint64_t b) {
+        b &= ~kWorkMask;
+        if (a == 0 && b == 0) b = 1;
+        return Key{a, b};
+    }
+
+    // Two candidate windows, one per key word; an entry lives in whichever
+    // was emptier when it was inserted. A window's slots are contiguous, so
+    // a lookup touches at most two runs of four cache lines.
+    // The occupied slots of a window are always a prefix of it (an insert
+    // takes the first free slot; an eviction happens only in a full
+    // window), so a scan stops at the first empty slot.
+    // work_lg, when given, receives the hit entry's work byte (log2 of the
+    // branch nodes its subtree cost when it was stored).
+    const u128* find(Key k, int* work_lg = nullptr) const {
+        const std::size_t ia = bucket(k.a);
+        const std::size_t ib = bucket(k.b);
+        for (int p = 0; p < kWindow; ++p) {
+            const Slot& s = slots_[ia + static_cast<std::size_t>(p)];
+            if (s.a == k.a && (s.b & ~kWorkMask) == k.b) { if (work_lg) *work_lg = static_cast<int>(s.b >> 56); return &s.count; }
+            if (s.a == 0 && s.b == 0) break;
+        }
+        for (int p = 0; p < kWindow; ++p) {
+            const Slot& s = slots_[ib + static_cast<std::size_t>(p)];
+            if (s.a == k.a && (s.b & ~kWorkMask) == k.b) { if (work_lg) *work_lg = static_cast<int>(s.b >> 56); return &s.count; }
+            if (s.a == 0 && s.b == 0) break;
+        }
+        return nullptr;
+    }
+    void prefetch(Key k) const {
+        __builtin_prefetch(&slots_[bucket(k.a)]);
+        __builtin_prefetch(&slots_[bucket(k.b)]);
+    }
+    // Windows are aligned, non-overlapping buckets of kWindow slots, so the
+    // occupied-prefix property holds for each.
+    std::size_t bucket(std::uint64_t h) const {
+        return static_cast<std::size_t>(h) & mask_ & ~static_cast<std::size_t>(kWindow - 1);
+    }
+
+    // Returns true when an occupied slot was overwritten.
+    bool insert(Key k, u128 count, std::uint64_t work_nodes) {
+        if ((count_ + 1) * 2 > nslots_ && nslots_ < max_slots_) grow();
+        return place(k.a, k.b | (static_cast<std::uint64_t>(encode_work(work_nodes)) << 56), count);
+    }
+    // The work byte is log2 of the node count with two fraction bits
+    // (byte = 4*lg + next two mantissa bits), so decode_work is within 20%.
+    static int encode_work(std::uint64_t n) {
+        if (n < 4) return static_cast<int>(n);  // 0..3 exact: byte/4 == 0 plus the fraction
+        int lg = 0;
+        while ((n >> (lg + 1)) != 0) ++lg;
+        const int frac = static_cast<int>((n >> (lg - 2)) & 3);
+        return std::min(255, lg * 4 + frac);
+    }
+    static std::uint64_t decode_work(int byte) {
+        const int lg = byte >> 2, frac = byte & 3;
+        if (lg == 0) return static_cast<std::uint64_t>(frac);
+        return (4ULL + static_cast<std::uint64_t>(frac)) << (lg - 2);
+    }
+
+private:
+    struct Slot { std::uint64_t a, b; u128 count; };
+    static constexpr std::size_t kMinSlots = 4096;
+
+    void grow() {
+        HugeArray<Slot> old;
+        old.swap(slots_);
+        nslots_ *= 2;
+        mask_ = nslots_ - 1;
+        slots_.assign(nslots_);
+        count_ = 0;
+        for (const Slot& s : old) {
+            if (s.a == 0 && s.b == 0) continue;
+            place(s.a, s.b, s.count);
+        }
+    }
+
+    // b carries the work byte. Returns true when an occupied slot was overwritten.
+    bool place(std::uint64_t a, std::uint64_t b, u128 count) {
+        const Key k{a, b & ~kWorkMask};
+        const std::size_t base[2] = {bucket(k.a), bucket(k.b)};
+        // The emptier window takes the entry; on a tie the first. The
+        // occupied slots are a prefix, so the first empty one ends the scan.
+        std::size_t free_at[2];
+        int free_n[2] = {0, 0};
+        std::size_t victim = base[0];
+        std::uint64_t victim_work = ~0ULL;
+        for (int w = 0; w < 2; ++w) {
+            for (int p = 0; p < kWindow; ++p) {
+                const std::size_t j = base[w] + static_cast<std::size_t>(p);
+                const Slot& s = slots_[j];
+                if (s.a == 0 && s.b == 0) {
+                    free_at[w] = j;
+                    free_n[w] = kWindow - p;
+                    break;
+                }
+                const std::uint64_t wk = s.b >> 56;
+                if (wk < victim_work) { victim_work = wk; victim = j; }
+            }
+        }
+        if (free_n[0] + free_n[1] > 0) {
+            const int w = (free_n[1] > free_n[0]) ? 1 : 0;
+            Slot& s = slots_[free_at[w]];
+            s.a = k.a; s.b = b; s.count = count;
+            ++count_;
+            return false;
+        }
+        Slot& s = slots_[victim];
+        s.a = k.a; s.b = b; s.count = count;
+        return true;
+    }
+
+    HugeArray<Slot> slots_;
+    std::size_t nslots_ = 0, mask_ = 0, count_ = 0, max_slots_ = 0;
+};
+
+// 128-bit hash of one line for the state cache: its tag (index plus a
+// row/column bit) and its packed key words, two independent wyhash chains.
+inline StateTable::Key hash_line(std::uint64_t tag, const std::uint64_t* words, int kw) {
+    namespace wy = ankerl::unordered_dense::detail::wyhash;
+    std::uint64_t ha = wy::mix(0x243F6A8885A308D3ULL ^ tag, 0xE7037ED1A0B428DBULL);
+    std::uint64_t hb = wy::mix(0x13198A2E03707344ULL ^ tag, 0x8EBC6AF09C88C6E3ULL);
+    for (int w = 0; w < kw; ++w) {
+        ha = wy::mix(ha ^ words[w], 0xE7037ED1A0B428DBULL);
+        hb = wy::mix(hb ^ words[w], 0x8EBC6AF09C88C6E3ULL);
+    }
+    return StateTable::Key{ha, hb};
+}
+
 // ---------------------------------------------------------------------------
 // SolveState — mirrors picture.py SolveState (without print_state).
 // ---------------------------------------------------------------------------
@@ -629,6 +861,13 @@ struct SolveState {
     // completed subtrees. solutions / explored_mass is a running estimate
     // of the total count (exact fraction, uniform-density extrapolation).
     int branch_depth = 0;
+    // The path from the root to the node being searched: '0' / '1' for the
+    // first / second branch value, 'a' + i for the i-th region of a split.
+    // Two runs of the same tree (same policy) stopped at different times
+    // compare by this string lexicographically, a prefix ranking below its
+    // extensions; the explored fraction cannot separate them once both sit
+    // inside one big subtree.
+    std::string branch_path;
     // Count mode (solve(..., count_mode=true)): no solution callbacks; every
     // solve_real / solve_backtrack call leaves the number of solutions of
     // the subtree it just searched in `result`. After propagation the
@@ -646,6 +885,49 @@ struct SolveState {
     // split below. Key: the region's row and column indices with their
     // packed line keys (index identifies the clue, key the cells).
     std::unordered_map<std::string, u128> region_cache;
+    // Count of the whole current region by state, consulted at every
+    // count-mode branch node: the state is the region's rows with unknowns
+    // (their packed keys) and the columns those rows have unknowns in, so
+    // two branch orders that settle the same cells reach the same key and
+    // the second is not searched. The split above only separates regions
+    // that share no line; this catches the recurrence inside one region.
+    // Measured before it shipped (stats build, count mode, bench/nodes.py,
+    // 0 mismatches): corpus branch nodes 5,121,344 -> 1,571,730 (-69%),
+    // probes -30%; hard/7382 2,800,356 -> 532,363 nodes, medium/12130
+    // 1,235,610 -> 598,608, easy_medium/108 587,907 -> 133,835,
+    // easy_large/6689 36,944 -> 5,187; the one puzzle with more nodes is
+    // easy_large/3929 (+5.9k of 15k). PGO wall: 7382 22.2 -> 16.3 s,
+    // 12130 6.8 -> 5.7 s, 108 0.40 -> 0.23 s, 6689 0.12 -> 0.04 s; 4774
+    // 0.30 -> 0.36 s and 3929 0.10 -> 0.15 s (cheap nodes, few lookups
+    // per gate window). On the partially solved class, explored fraction
+    // after 300 s, cache on / off: 10810 32x, 7290 25x, 10088 5.8x, 9798
+    // 4.8x, 5903 2x, 7785 1.6x, 5485 1.07x, 2712 / 2647 / 3867 / pikachu
+    // slightly ahead, 12548 / 13480 / 9892 identical (both inside one
+    // subtree the fraction cannot resolve); none behind.
+    StateTable state_cache;
+    // Per-line contributions to the state key (the line's hash while it has
+    // unknowns, zero otherwise) and their running combination over the
+    // whole grid, both brought up to date from the trail's dirty lists at
+    // every branch node.
+    std::vector<StateTable::Key> row_hash, col_hash;
+    StateTable::Key grid_key{0, 0};
+    std::uint64_t state_lookups = 0, state_hits = 0, state_evictions = 0;
+    // Adaptive gate by node size (bucket = log2 of the unknown cells):
+    // hits come almost only from small nodes, and which sizes pay differs
+    // by puzzle (10810: the 16-63-cell buckets took 2.2M lookups for 363
+    // hits while the 4-15-cell ones hit 30%; on 3867 every bucket up to 31
+    // cells pays). Every kScWindow lookups in a bucket, the cycles its hits
+    // saved (the entries' work bytes) are compared with the cycles the
+    // lookups cost; below sc_yield times that the bucket stops looking up
+    // and storing for kScResample nodes, then samples again.
+    // STATE_CACHE_YIELD overrides the factor (default 1: break-even).
+    static constexpr int kScBuckets = 24;
+    static constexpr std::uint32_t kScWindow = 16384;
+    static constexpr std::uint32_t kScResample = 16 * kScWindow;
+    std::uint32_t sc_lookups[kScBuckets] = {}, sc_skipped[kScBuckets] = {};
+    std::uint64_t sc_saved[kScBuckets] = {}, sc_lookup_cycles[kScBuckets] = {};
+    bool sc_off[kScBuckets] = {};
+    double sc_yield = 1.0;
     bool skip_probing = false;
     // Dead-work watchdog for the latched (no-probing) mode. The yield window
     // shuts probing off when few probes find contradictions, but that is
@@ -683,6 +965,7 @@ struct SolveState {
     // over a deterministic, fixed amount of work. 0 = unlimited (normal).
     std::uint64_t node_limit = 0;
     std::uint64_t nodes = 0;
+    std::uint64_t branch_nodes = 0;  // every branch node; the state cache's work measure
 
     SolveState() {
         const char* env = std::getenv("PROBING_MIN_SOLUTIONS");
@@ -1225,8 +1508,13 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                      const OnSolution& on_solution,
                      Trail& trail) {
     // Benchmark abort: stop after node_limit backtrack nodes (return false
-    // propagates as a stop signal, exactly like the --max callback).
+    // propagates as a stop signal, exactly like the --max callback). The
+    // same path serves request_stop() (SIGTERM/SIGINT in main).
     if (state.node_limit && ++state.nodes > state.node_limit) {
+        return false;
+    }
+    if (g_stop_requested) {
+        g_stop_path = state.branch_path;
         return false;
     }
 
@@ -1260,6 +1548,82 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
     if (n_unknown == 0) {
         state.result = 1;
         return true;
+    }
+
+    // Looked up before the split and the probing: a hit here saves both.
+    StateTable::Key state_key{0, 0};
+    const bool use_state_cache = state.count_mode && !g_no_state_cache;
+    bool cache_this_node = use_state_cache;  // cleared when the node's size bucket is gated off
+    int nb = 0;  // node-size bucket: log2 of the unknown cells
+    while ((n_unknown >> (nb + 1)) != 0 && nb < SolveState::kScBuckets - 1) ++nb;
+    if (use_state_cache && state.sc_off[nb]) {
+        // Gated off: no key, no lookup, no store (the trail's dirty lists
+        // keep accumulating and are applied at the next node that needs
+        // the key). Sample again after a stretch, the tree changes.
+        cache_this_node = false;
+        if (++state.sc_skipped[nb] >= SolveState::kScResample) {
+            state.sc_off[nb] = false;
+            state.sc_skipped[nb] = 0;
+        }
+    }
+    // Work is measured in cycles (rdtsc): the entry's work byte holds what
+    // its subtree cost, which is what a hit saves, in the same currency as
+    // the lookup's own cost. Both cost ~25 cycles to read.
+    const std::uint64_t tsc_at_entry = cache_this_node ? __rdtsc() : 0;
+    if (cache_this_node) {
+        // The key combines one 128-bit hash per line with unknowns (XOR in
+        // one word, sum in the other, so the order of lines does not
+        // matter). Each line's contribution (its hash, or zero once it has
+        // no unknowns) and their whole-grid combination are kept in
+        // SolveState and updated here for the lines the trail flagged since
+        // the last node, so a node pays for its changed lines only: the
+        // multiply chain over every line cost 10810 +36% cycles per node,
+        // this +4%. A region search combines the region's lines explicitly.
+        StateTable::Key* rh = state.row_hash.data();
+        StateTable::Key* ch = state.col_hash.data();
+        const std::uint64_t* ck = pic.col_keys.data();
+        StateTable::Key& gk = state.grid_key;
+        for (int r : trail.dirty_rows) {
+            gk.a ^= rh[r].a; gk.b -= rh[r].b;
+            rh[r] = uir[r] > 0 ? hash_line(static_cast<std::uint64_t>(r) | (1ULL << 40), rk + static_cast<std::size_t>(r) * kw, kw)
+                               : StateTable::Key{0, 0};
+            gk.a ^= rh[r].a; gk.b += rh[r].b;
+            trail.row_hash_dirty[static_cast<std::size_t>(r)] = 0;
+        }
+        trail.dirty_rows.clear();
+        for (int c : trail.dirty_cols) {
+            gk.a ^= ch[c].a; gk.b -= ch[c].b;
+            ch[c] = uic[c] > 0 ? hash_line(static_cast<std::uint64_t>(c) | (1ULL << 41), ck + static_cast<std::size_t>(c) * kw, kw)
+                               : StateTable::Key{0, 0};
+            gk.a ^= ch[c].a; gk.b += ch[c].b;
+            trail.col_hash_dirty[static_cast<std::size_t>(c)] = 0;
+        }
+        trail.dirty_cols.clear();
+        if (!region) {
+            state_key = StateTable::normalize(gk.a, gk.b);
+        } else {
+            // The region's rows, and the columns those rows have unknowns in.
+            static thread_local std::vector<std::uint64_t> col_mask;
+            col_mask.assign(static_cast<std::size_t>(kw), 0);
+            std::uint64_t ka = 0, kb = 0;
+            for (int r = 0; r < H; ++r) {
+                if (uir[r] == 0 || !region[r]) continue;
+                ka ^= rh[r].a; kb += rh[r].b;
+                for (int w = 0; w < kw; ++w) col_mask[static_cast<std::size_t>(w)] |= rk[r * kw + w] & kUnknownBits;
+            }
+            for (int w = 0; w < kw; ++w) {
+                std::uint64_t m = col_mask[static_cast<std::size_t>(w)];
+                while (m != 0) {
+                    const int c = 32 * w + (__builtin_ctzll(m) >> 1);
+                    m &= m - 1;
+                    ka ^= ch[c].a; kb += ch[c].b;
+                }
+            }
+            state_key = StateTable::normalize(ka, kb);
+        }
+        // The lookup itself follows the split detection below, so the
+        // table's cache misses overlap with that scan.
+        state.state_cache.prefetch(state_key);
     }
 
     if (state.count_mode) {
@@ -1308,8 +1672,38 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             }
             std::fprintf(stderr, "\n");
         }
+        if (cache_this_node) {
+            ++state.state_lookups;
+            int hit_work = 0;
+            if (g_debug_stats) ++g_stat_sc_lookups[nb];
+            const u128* hit = state.state_cache.find(state_key, &hit_work);
+            state.sc_lookup_cycles[nb] += __rdtsc() - tsc_at_entry;
+            if (hit) {
+                ++state.state_hits;
+                const std::uint64_t saved = StateTable::decode_work(hit_work);
+                state.sc_saved[nb] += saved;
+                if (g_debug_stats) { ++g_stat_sc_hits[nb]; g_stat_sc_saved[nb] += saved; }
+            }
+            if (++state.sc_lookups[nb] == SolveState::kScWindow) {
+                if (static_cast<double>(state.sc_saved[nb]) < state.sc_yield * static_cast<double>(state.sc_lookup_cycles[nb])) {
+                    state.sc_off[nb] = true;
+                    if (g_debug_stats) ++g_stat_sc_gated[nb];
+                }
+                state.sc_lookups[nb] = 0;
+                state.sc_saved[nb] = 0;
+                state.sc_lookup_cycles[nb] = 0;
+            }
+            if (hit && !g_state_cache_probe_only) {
+                state.result = *hit;
+                return true;
+            }
+        }
         if (roots > 1) {
             ++state.regions_split;
+            // Each region search below sums its leaves to this node's whole
+            // share of the search space, so k regions would add it k times;
+            // the share is restored once when the split completes.
+            const double mass_at_split = g_explored_mass;
             std::vector<char> saved_region = state.region_row;
             std::vector<int> roots_copy = root_list;
             std::vector<int> row_root(root_of_row.begin(), root_of_row.end());
@@ -1318,8 +1712,12 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             std::vector<int> col_root(static_cast<std::size_t>(W), -1);
             for (int c = 0; c < W; ++c) if (uic[c] > 0) col_root[c] = find(H + c);
             const std::uint64_t* ck = pic.col_keys.data();
+            const double scale_at_split = g_mass_scale;
+            g_mass_scale = scale_at_split / static_cast<double>(roots_copy.size());
             u128 total = 1;
+            int region_index = 0;
             for (int root : roots_copy) {
+                const char region_char = static_cast<char>('a' + (region_index++ & 15));
                 std::string key;
                 key.reserve(static_cast<std::size_t>(H + W) * (kw * 8 + 2));
                 for (int r = 0; r < H; ++r) {
@@ -1336,6 +1734,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 auto hit = state.region_cache.find(key);
                 if (hit != state.region_cache.end()) {
                     ++state.region_cache_hits;
+                    g_explored_mass += g_half_pow[static_cast<std::size_t>(state.branch_depth)] * g_mass_scale;
                     total *= hit->second;
                     if (total == 0) break;
                     continue;
@@ -1345,7 +1744,9 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 ++state.region_calls;
                 const std::size_t mark = trail.changed_cell_indices.size();
                 const int saved_unknown_count = pic.unknown_count;
+                state.branch_path.push_back(region_char);
                 if (!solve_backtrack(mapped_rows, mapped_cols, pic, state, on_solution, trail)) return false;
+                state.branch_path.pop_back();
                 state.region_cache.emplace(std::move(key), state.result);
                 total *= state.result;
                 revert_branch(pic, trail, mark, saved_unknown_count);
@@ -1353,6 +1754,11 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             }
             state.region_row = saved_region;
             state.result = total;
+            g_mass_scale = scale_at_split;
+            g_explored_mass = mass_at_split + g_half_pow[static_cast<std::size_t>(state.branch_depth)] * scale_at_split;
+            if (cache_this_node) {
+                if (state.state_cache.insert(state_key, total, __rdtsc() - tsc_at_entry)) ++state.state_evictions;
+            }
             return true;
         }
     }
@@ -1616,9 +2022,13 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         std::fprintf(stderr, "cache-stats: search-area=%d of %d cells; log2 placements rows=%.1f cols=%.1f min=%.1f\n",
                      pic.unknown_count, H * W, lr, lc, std::min(lr, lc));
     }
+    // STATE_CACHE: the region's state is its rows with unknowns (with their
+    // packed keys) plus the columns those rows have unknowns in; a region
+    // row's known cells are in its key, so the key determines the count.
     state.mark_backtrack();
     if (g_debug_stats) ++g_stat_nodes;
     const std::uint64_t nodes_before = g_stat_all_nodes;
+    ++state.branch_nodes;
     const int sols_before = state.solutions_found;
     const bool latched_here = state.skip_probing;
     if (g_debug_stats) ++g_stat_all_nodes;
@@ -1649,7 +2059,9 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
 
         const double mass_before = g_explored_mass;
         ++state.branch_depth;
+        state.branch_path.push_back(branch == 0 ? '0' : '1');
         const bool go_on = solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
+        state.branch_path.pop_back();
         --state.branch_depth;
         if (!go_on) {
             return false;
@@ -1657,13 +2069,20 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         subtree_total += state.result;
         // A child that branched has already accounted for its own subtree
         // through its children; only a leaf child is added here.
-        if (g_explored_mass == mass_before) g_explored_mass += g_half_pow[static_cast<std::size_t>(state.branch_depth) + 1];
+        if (g_explored_mass == mass_before) g_explored_mass += g_half_pow[static_cast<std::size_t>(state.branch_depth) + 1] * g_mass_scale;
         revert_branch(pic, trail, mark, saved_unknown_count);
     }
     state.result = subtree_total;
+    if (cache_this_node) {
+        if (state.state_cache.insert(state_key, subtree_total, __rdtsc() - tsc_at_entry)) ++state.state_evictions;
+    }
 
     if (latched_here) {
-        const bool dead = state.solutions_found == sols_before;
+        // Count mode has the exact subtree count; the solution counter
+        // misses region leaves and state-cache hits, and a hit subtree
+        // read as dead made the watchdog pin probing on (10810: 32 probes
+        // per node instead of 12, 15% behind the no-cache run at 60 s).
+        const bool dead = state.count_mode ? subtree_total == 0 : state.solutions_found == sols_before;
         state.note_latched_subtree(dead);
         if (g_debug_stats) {
             const std::uint64_t n = g_stat_all_nodes - nodes_before;
@@ -1847,6 +2266,25 @@ void solve(const std::vector<std::vector<int>>& rows,
     trail.col_hist.assign(static_cast<std::size_t>(H + 1), 0);
     trail.col_hist[static_cast<std::size_t>(H)] = W;
     state.count_mode = count_mode;
+    if (count_mode && !g_no_state_cache) {
+        std::size_t state_budget = 512ULL * 1024ULL * 1024ULL;
+        if (const char* env = std::getenv("STATE_CACHE_MB")) {
+            try { state_budget = static_cast<std::size_t>(std::stoull(env)) * 1024ULL * 1024ULL; } catch (...) {}
+        }
+        state.state_cache.init(state_budget);
+        state.row_hash.assign(static_cast<std::size_t>(H), StateTable::Key{0, 0});
+        state.col_hash.assign(static_cast<std::size_t>(W), StateTable::Key{0, 0});
+        state.grid_key = StateTable::Key{0, 0};
+        state.sc_yield = g_state_cache_yield;
+        // Every line starts flagged, so the first node computes them all.
+        trail.track_hash = true;
+        trail.row_hash_dirty.assign(static_cast<std::size_t>(H), 1);
+        trail.col_hash_dirty.assign(static_cast<std::size_t>(W), 1);
+        trail.dirty_rows.resize(static_cast<std::size_t>(H));
+        trail.dirty_cols.resize(static_cast<std::size_t>(W));
+        for (int r = 0; r < H; ++r) trail.dirty_rows[static_cast<std::size_t>(r)] = r;
+        for (int c = 0; c < W; ++c) trail.dirty_cols[static_cast<std::size_t>(c)] = c;
+    }
     (void)solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
     if (out_count != nullptr) {
         u128 v = state.result;
@@ -1857,6 +2295,20 @@ void solve(const std::vector<std::vector<int>>& rows,
     if (g_debug_stats && count_mode)
         std::fprintf(stderr, "cache-stats: region splits=%llu region searches=%llu cache hits=%llu\n",
                      static_cast<unsigned long long>(state.regions_split), static_cast<unsigned long long>(state.region_calls), static_cast<unsigned long long>(state.region_cache_hits));
+    if (g_debug_stats && count_mode && !g_no_state_cache)
+    {
+        std::fprintf(stderr, "cache-stats: state lookups=%llu hits=%llu evictions=%llu entries=%zu of %zu slots\n",
+                     static_cast<unsigned long long>(state.state_lookups), static_cast<unsigned long long>(state.state_hits),
+                     static_cast<unsigned long long>(state.state_evictions), state.state_cache.size(), state.state_cache.slots());
+        std::fprintf(stderr, "cache-stats: state cache by unknown cells (2^k..): lookups/hits/Mcycles-saved/times-gated");
+        for (int k = 0; k < 24; ++k) {
+            if (g_stat_sc_lookups[k] == 0) continue;
+            std::fprintf(stderr, " %d:%llu/%llu/%llu/%llu", k, static_cast<unsigned long long>(g_stat_sc_lookups[k]),
+                         static_cast<unsigned long long>(g_stat_sc_hits[k]), static_cast<unsigned long long>(g_stat_sc_saved[k] >> 20),
+                         static_cast<unsigned long long>(g_stat_sc_gated[k]));
+        }
+        std::fprintf(stderr, "\n");
+    }
 
     if (g_debug_stats) {
         std::fprintf(stderr, "cache-stats: lookups=%llu misses=%llu probes=%llu\ncache-stats: deductions-per-entry histogram:",
@@ -1901,6 +2353,9 @@ void solve(const std::vector<std::vector<int>>& rows,
 }
 
 double explored_fraction() { return g_explored_mass; }
+void request_stop() { g_stop_requested = 1; }
+bool stop_requested() { return g_stop_requested != 0; }
+const std::string& stop_position() { return g_stop_path; }
 
 double estimate_solutions(const std::vector<std::vector<int>>& rows,
                           const std::vector<std::vector<int>>& cols,
