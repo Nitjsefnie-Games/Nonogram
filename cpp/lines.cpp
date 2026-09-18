@@ -136,20 +136,25 @@ void solve_line_batch_1w(const std::int8_t* line, std::size_t n,
         bwd[pi] = (cur & stay[v]) | ((cur & step[v]) >> 1);
     }
 
+    // Branch-free collection: every cell writes a candidate into the next
+    // output slot and the cursor advances only for an UNKNOWN cell that is
+    // determined (exactly one of can_empty / can_full). Whether a cell is
+    // unknown or determined is data-dependent noise to the branch predictor.
+    result.deductions.resize(n);
+    int* out = result.deductions.data();
+    std::size_t k = 0;
     for (std::size_t p = 0; p < n; ++p) {
-        if (line[p] != UNKNOWN) continue;
         const std::uint64_t bw = bwd[p + 1];
         const std::uint64_t f = fwd[p];
         const std::uint64_t bw_empty = bw & em;
         const std::uint64_t bw_full = bw & fm;
-        const bool can_empty = (f & (bw_empty | (bw_empty >> 1))) != 0;
-        const bool can_full = (f & (bw_full >> 1)) != 0;
-        if (can_empty && !can_full) {
-            result.deductions.push_back(deduce_pack(static_cast<int>(p), EMPTY));
-        } else if (can_full && !can_empty) {
-            result.deductions.push_back(deduce_pack(static_cast<int>(p), FULL));
-        }
+        const int can_empty = (f & (bw_empty | (bw_empty >> 1))) != 0;
+        const int can_full = (f & (bw_full >> 1)) != 0;
+        // FULL iff can_full (when determined, exactly one is set).
+        out[k] = deduce_pack(static_cast<int>(p), static_cast<std::int8_t>(can_full));
+        k += static_cast<std::size_t>((line[p] == UNKNOWN) & (can_empty ^ can_full));
     }
+    result.deductions.resize(k);
     result.total = 1;
 }
 }  // namespace
