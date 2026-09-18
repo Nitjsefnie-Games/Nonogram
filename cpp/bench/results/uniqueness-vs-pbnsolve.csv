@@ -1,0 +1,22 @@
+# Uniqueness task (find a solution, decide whether it is unique): pbnsolve 1.10 (-O2, from the
+# github.com/avi-levy/pbnsolve mirror, "-b -u") vs cpp/solver "--max 2" (commit 22f5b8c, plain -O3),
+# both on the shielded core of this box, one run each, 300 s cap. 2026-09-18.
+puzzle,pbnsolve_s,ours_s,pbnsolve_result
+803,0.196,0.067,unique
+2040,0.381,0.014,unique
+6739,0.424,0.006,multiple
+108,0.052,0.001,multiple
+3163,0.143,0.045,unique
+3929,0.046,0.024,multiple
+6689,0.137,0.014,multiple
+6574,1.454,0.464,unique
+8-dom,0.640,0.284,unique
+9-dom,4.818,2.157,unique
+10-dom,50.988,16.852,unique
+2712,2.968,0.419,multiple
+10088,>300,0.070,timeout
+18297,200.940,18.002,multiple
+9892,>300,8.842,timeout
+12548,>300,194.552,timeout
+22336,>300,>300,timeout
+pikachu,84.361,0.147,multiple
