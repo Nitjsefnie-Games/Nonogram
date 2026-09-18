@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <climits>
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -223,6 +224,19 @@ std::uint64_t g_stat_nodes = 0;  // solve_backtrack entries that branched
 std::uint64_t g_stat_probe_lookups_hist[64] = {};  // lookups per probe (capped)
 std::uint64_t g_stat_probe_cur = 0;
 std::uint64_t g_stat_probe_ok = 0;
+
+// BRANCH_K=<k> (stats build only): score branch cells by k*min - max instead
+// of the shipped (min, then smaller max) order, for exploring the balance
+// penalty. Values of 4-8 halve 9-Dom's tree again and cut webpbn 12548 13x,
+// but 18297 grows 7-18x and k=3 grows medium/3929 by 50%, so it is not
+// shipped. Unset = the shipped order.
+#ifdef NONOGRAM_STATS
+const bool g_branch_k_set = std::getenv("BRANCH_K") != nullptr;
+const double g_branch_k = g_branch_k_set ? std::atof(std::getenv("BRANCH_K")) : 0.0;
+#else
+constexpr bool g_branch_k_set = false;
+constexpr double g_branch_k = 0.0;
+#endif
 
 inline std::uint16_t load_u16(const unsigned char* p) { std::uint16_t v; std::memcpy(&v, p, 2); return v; }
 inline std::uint32_t load_u32(const unsigned char* p) { std::uint32_t v; std::memcpy(&v, p, 4); return v; }
@@ -1037,6 +1051,8 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         for (std::size_t i = 0; i < nu; ++i) order[bucket[enc[i]]++] = static_cast<int>(i);
 
         int best_pixels = -1;
+        int best_other = INT_MAX;          // the larger probe fill of the best cell
+        double best_score = -HUGE_VAL;     // BRANCH_K experiment only
         bool have_best = false;
         // Forced cells are committed in place and the pass continues; the
         // node restarts once at the end of a pass that committed anything
@@ -1084,18 +1100,36 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             // two propagations (a balanced split) shrinks the tree far more
             // than scoring by the larger one -- 9-Dom (webpbn 8098) 116k ->
             // 5.3k nodes, extreme/6574 102k -> 2.5k, the corpus -63%. Sum,
-            // product and min-with-tie-breaks were all measured worse.
+            // product and Wu et al.'s Min-logd (min plus a log asymmetry
+            // bonus) were all measured worse.
+            // Ties on the min go to the cell whose OTHER probe fills the
+            // least, i.e. the more balanced pair: 9-Dom 5,340 -> 3,232 nodes,
+            // 6574 2,508 -> 154, easy_large/5281 6,776 -> 1,375, no puzzle
+            // in the corpus worse by more than 7 nodes, counts and strategy
+            // labels unchanged. Preferring the imbalanced pair instead gives
+            // 8,114 / 10,305.
             // Anytime mode is the exception: on an enumeration that never
             // finishes the objective is solutions per second, and the
             // greedy max (deepest dive first) delivers them 11% faster on
-            // pikachu, so it keeps max.
+            // pikachu, so it keeps max with first-found ties.
             const int f = full_res.pixels_filled, e = empty_res.pixels_filled;
-            const int max_pixels = state.keep_probing ? std::max(f, e) : std::min(f, e);
-            if (max_pixels > best_pixels) {
-                best_pixels = max_pixels;
+            const int lo = std::min(f, e), hi = std::max(f, e);
+            bool better;
+            if (state.keep_probing) {
+                better = hi > best_pixels;
+            } else if (g_branch_k_set) {
+                const double sc = g_branch_k * lo - hi;
+                better = sc > best_score;
+                if (better) best_score = sc;
+            } else {
+                better = lo > best_pixels || (lo == best_pixels && hi < best_other);
+            }
+            if (better) {
+                best_pixels = state.keep_probing ? hi : lo;
+                best_other = hi;
                 best_row = row;
                 best_col = col;
-                best_first_val = (full_res.pixels_filled >= empty_res.pixels_filled) ? FULL : EMPTY;
+                best_first_val = (f >= e) ? FULL : EMPTY;
                 have_best = true;
             }
         }
