@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -308,6 +309,18 @@ std::uint64_t g_stat_probe_pairs = 0, g_stat_probe_hits = 0;  // probe pairs, an
 double g_explored_mass = 0.0;
 volatile std::sig_atomic_t g_stop_requested = 0;
 std::string g_stop_path;  // SolveState::branch_path when the stop was taken
+// Periodic progress line (see set_progress_interval).
+double g_progress_interval = 0.0;
+std::chrono::steady_clock::time_point g_progress_start, g_progress_next;
+
+void maybe_print_progress() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now < g_progress_next) return;
+    const double elapsed = std::chrono::duration<double>(now - g_progress_start).count();
+    std::printf("progress: explored %.8f%% after %.0fs\n", g_explored_mass * 100.0, elapsed);
+    std::fflush(stdout);
+    g_progress_next = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(g_progress_interval));
+}
 std::vector<double> g_half_pow;  // g_half_pow[d] = 2^-d, d up to the cell count + 1
 // Leaf mass is scaled by 1/k inside a k-region split (each region search
 // sums to the split node's whole share on its own), so the fraction reads
@@ -2028,7 +2041,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
     state.mark_backtrack();
     if (g_debug_stats) ++g_stat_nodes;
     const std::uint64_t nodes_before = g_stat_all_nodes;
-    ++state.branch_nodes;
+    if ((++state.branch_nodes & 0xFFFF) == 0 && g_progress_interval > 0.0) maybe_print_progress();
     const int sols_before = state.solutions_found;
     const bool latched_here = state.skip_probing;
     if (g_debug_stats) ++g_stat_all_nodes;
@@ -2353,6 +2366,11 @@ void solve(const std::vector<std::vector<int>>& rows,
 }
 
 double explored_fraction() { return g_explored_mass; }
+void set_progress_interval(double seconds) {
+    g_progress_interval = seconds;
+    g_progress_start = std::chrono::steady_clock::now();
+    g_progress_next = g_progress_start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));
+}
 void request_stop() { g_stop_requested = 1; }
 bool stop_requested() { return g_stop_requested != 0; }
 const std::string& stop_position() { return g_stop_path; }

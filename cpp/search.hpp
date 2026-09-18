@@ -57,6 +57,11 @@ double explored_fraction();
 // Asks the running solve() to stop at its next branch node (async-signal-
 // safe: sets a flag). solve() then returns as it does for a --max stop, with
 // explored_fraction() valid; stop_requested() tells the caller it happened.
+// Count mode prints nothing until it finishes; with an interval > 0 the
+// search prints "progress: explored X% after Ys" to stdout at most once
+// per interval (checked every 65536 branch nodes), so a long run's log
+// shows where it is.
+void set_progress_interval(double seconds);
 void request_stop();
 bool stop_requested();
 // After a stop: the path from the root to the node the search was at, one
