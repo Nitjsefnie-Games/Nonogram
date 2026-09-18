@@ -359,12 +359,47 @@ std::string g_stop_path;  // SolveState::branch_path when the stop was taken
 double g_progress_interval = 0.0;
 std::chrono::steady_clock::time_point g_progress_start, g_progress_next;
 
+// Solutions in the finished subtrees so far: every open node's finished
+// children summed (a node adds each child's count as it returns and takes
+// its own total back when it returns to its parent, so nothing is counted
+// twice; a region split's product joins only once the split is complete).
+u128 g_counted_so_far = 0;
+bool g_first_solution_printed = false;
+
+std::string u128_str(u128 v) {
+    std::string s;
+    do { s.insert(s.begin(), static_cast<char>('0' + static_cast<int>(v % 10))); v /= 10; } while (v != 0);
+    for (int i = static_cast<int>(s.size()) - 3; i > 0; i -= 3) s.insert(static_cast<std::size_t>(i), ",");
+    return s;
+}
+
+std::string eta_str(double seconds) {
+    char buf[64];
+    if (seconds < 120.0) std::snprintf(buf, sizeof buf, "%.0fs", seconds);
+    else if (seconds < 7200.0) std::snprintf(buf, sizeof buf, "%.1fmin", seconds / 60.0);
+    else if (seconds < 172800.0) std::snprintf(buf, sizeof buf, "%.1fh", seconds / 3600.0);
+    else std::snprintf(buf, sizeof buf, "%.1fd", seconds / 86400.0);
+    return buf;
+}
+
+// "progress: explored X% after Ys, counted N so far, est~E total, eta~T":
+// the same extrapolation the enumerating mode prints (count over the
+// explored fraction, time over the fraction), with the same caveat that
+// the fraction moves in jumps.
+void print_progress_line(double elapsed) {
+    const double frac = g_explored_mass;
+    std::printf("progress: explored %.8f%% after %.0fs, counted %s so far", frac * 100.0, elapsed, u128_str(g_counted_so_far).c_str());
+    if (frac > 0.0 && frac < 1.0) {
+        std::printf(", est~%.3g total, eta~%s", static_cast<double>(g_counted_so_far) / frac, eta_str(elapsed / frac - elapsed).c_str());
+    }
+    std::printf("\n");
+    std::fflush(stdout);
+}
+
 void maybe_print_progress() {
     const auto now = std::chrono::steady_clock::now();
     if (now < g_progress_next) return;
-    const double elapsed = std::chrono::duration<double>(now - g_progress_start).count();
-    std::printf("progress: explored %.8f%% after %.0fs\n", g_explored_mass * 100.0, elapsed);
-    std::fflush(stdout);
+    print_progress_line(std::chrono::duration<double>(now - g_progress_start).count());
     g_progress_next = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(g_progress_interval));
 }
 std::vector<double> g_half_pow;  // g_half_pow[d] = 2^-d, d up to the cell count + 1
@@ -2098,12 +2133,14 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             return false;
         }
         subtree_total += state.result;
+        g_counted_so_far += state.result;  // a finished child; taken back when this node returns its own total
         // A child that branched has already accounted for its own subtree
         // through its children; only a leaf child is added here.
         if (g_explored_mass == mass_before) g_explored_mass += g_half_pow[static_cast<std::size_t>(state.branch_depth) + 1] * g_mass_scale;
         revert_branch(pic, trail, mark, saved_unknown_count);
     }
     state.result = subtree_total;
+    g_counted_so_far -= subtree_total;  // the parent adds it back as one finished child
     if (cache_this_node) {
         if (state.state_cache.insert(state_key, subtree_total, __rdtsc() - tsc_at_entry)) ++state.state_evictions;
     }
@@ -2154,7 +2191,14 @@ bool solve_real(const std::vector<const LineSpec*>& mapped_rows,
     if (pic.is_solved()) {
         state.solution_found();
         state.result = 1;
-        if (state.count_mode) return true;
+        if (state.count_mode) {
+            if (!g_first_solution_printed && g_progress_interval > 0.0) {
+                g_first_solution_printed = true;
+                std::printf("first solution after %.1fs\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - g_progress_start).count());
+                std::fflush(stdout);
+            }
+            return true;
+        }
         return on_solution(pic);
     }
 
@@ -2399,6 +2443,7 @@ void set_progress_interval(double seconds) {
 void request_stop() { g_stop_requested = 1; }
 bool stop_requested() { return g_stop_requested != 0; }
 const std::string& stop_position() { return g_stop_path; }
+void print_count_progress(double elapsed) { print_progress_line(elapsed); }
 
 double estimate_solutions(const std::vector<std::vector<int>>& rows,
                           const std::vector<std::vector<int>>& cols,

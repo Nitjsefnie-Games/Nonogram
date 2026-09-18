@@ -368,6 +368,7 @@ int main(int argc, char** argv) {
         // absence as a timeout.
         std::printf("Stopped by signal after %.1fs; explored %.8f%% of the search space\n",
                     elapsed, explored_fraction() * 100.0);
+        if (count_mode) print_count_progress(elapsed);
         std::printf("Position: %s\n", stop_position().c_str());
         if (!count_mode)
             std::printf("Solutions so far: %s (%s/s)\n", fmt_int_commas(solution_count).c_str(), fmt_rate(rate).c_str());
