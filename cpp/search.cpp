@@ -643,28 +643,24 @@ inline BatchResult solve_one_batch(const LineSpec& spec,
 template <typename Iter, typename Pos, typename Val>
 inline void write_intersection_impl(Iter first, Iter last, Pos pos_of, Val val_of,
                                     int line_index, Picture& pic, bool is_row, Trail& trail) {
-    const int W = pic.width();
+    // No UNKNOWN re-check: the cache entry was computed for exactly the
+    // line's current content (that is its key), and the line DP only emits
+    // deductions for cells that are UNKNOWN in that content.
     if (is_row) {
         const int row = line_index;
-        const std::int8_t* px = pic.pixels.data() + static_cast<std::size_t>(row) * static_cast<std::size_t>(W);
         for (; first != last; ++first) {
             const int col = pos_of(*first);
-            if (px[col] == UNKNOWN) {
-                pic.set_known(row, col, val_of(*first));
-                pic.mark_col_dirty(col);
-                trail.changed_cell_indices.push_back(trail_pack(row, col));
-            }
+            pic.set_known(row, col, val_of(*first));
+            pic.mark_col_dirty(col);
+            trail.changed_cell_indices.push_back(trail_pack(row, col));
         }
     } else {
         const int col = line_index;
-        const std::int8_t* px = pic.pixels.data();
         for (; first != last; ++first) {
             const int row = pos_of(*first);
-            if (px[static_cast<std::size_t>(row) * static_cast<std::size_t>(W) + static_cast<std::size_t>(col)] == UNKNOWN) {
-                pic.set_known(row, col, val_of(*first));
-                pic.mark_row_dirty(row);
-                trail.changed_cell_indices.push_back(trail_pack(row, col));
-            }
+            pic.set_known(row, col, val_of(*first));
+            pic.mark_row_dirty(row);
+            trail.changed_cell_indices.push_back(trail_pack(row, col));
         }
     }
 }
