@@ -234,6 +234,46 @@ std::uint64_t g_stat_probe_ok = 0;
 // State cache by the node's unknown-cell count (bucket = log2): lookups,
 // hits, and the branch nodes the hits saved (sum of 2^work).
 std::uint64_t g_stat_sc_lookups[24] = {}, g_stat_sc_hits[24] = {}, g_stat_sc_saved[24] = {}, g_stat_sc_gated[24] = {};
+// Cycles spent in subtrees rooted at the topmost node with <= 31 / <= 15
+// unknown cells (what a direct small-region counter could replace), and
+// in the whole solve.
+std::uint64_t g_stat_small31_cycles = 0, g_stat_small15_cycles = 0, g_stat_small31_roots = 0, g_stat_small15_roots = 0;
+int g_stat_small_depth31 = 0, g_stat_small_depth15 = 0;
+struct SmallTimer {
+    std::uint64_t t0 = 0;
+    int which = 0;  // 0 none, 1 = <=31 root, 2 = <=15 root (and 31 if also topmost)
+    bool root31 = false, root15 = false;
+    SmallTimer(int n_unknown) {
+        if (!g_debug_stats) return;
+        if (n_unknown <= 31 && g_stat_small_depth31++ == 0) { root31 = true; ++g_stat_small31_roots; }
+        if (n_unknown <= 15 && g_stat_small_depth15++ == 0) { root15 = true; ++g_stat_small15_roots; }
+        if (root31 || root15) t0 = __rdtsc();
+        which = (n_unknown <= 31) + (n_unknown <= 15);
+    }
+    ~SmallTimer() {
+        if (!g_debug_stats) return;
+        if (which >= 1) --g_stat_small_depth31;
+        if (which >= 2) --g_stat_small_depth15;
+        if (root31 || root15) {
+            const std::uint64_t dt = __rdtsc() - t0;
+            if (root31) g_stat_small31_cycles += dt;
+            if (root15) g_stat_small15_cycles += dt;
+        }
+    }
+};
+
+// Below this many unknown cells a node (other than the root, which keeps
+// probing so the strategy label of a puzzle solved there is unchanged)
+// branches by the cheap latched scan instead of probing every cell: a
+// node with 31 cells pays 62 probes, each a line solve plus propagation,
+// to pick one of them, and on the partially solved puzzles the subtrees
+// under such nodes were 40-63% of the run. Measured (count mode, state
+// cache on): 3867 reaches in 60 s what took 300 s (its 812-cell region
+// 12.5% -> 49.9% explored), 7290 0.14% -> 0.79%, 10810 unchanged; corpus
+// branch nodes +9.3% for probes -27% (7382 532k -> 635k nodes), counts
+// and labels unchanged. 63 grows the corpus 37% and loses 7290; 16 is
+// half the gain.
+constexpr int kSmallNoProbe = 31;
 
 // BRANCH_K=<k> (stats build only): score branch cells by k*min - max instead
 // of the shipped (min, then smaller max) order, for exploring the balance
@@ -268,6 +308,9 @@ const int g_anytime_tb = std::getenv("ANYTIME_TB") ? std::atoi(std::getenv("ANYT
 const bool g_first_val_low = std::getenv("FIRST_VAL") != nullptr;
 // NO_SKIP=1 never latches the adaptive probing shut-off in default mode.
 const bool g_no_skip = std::getenv("NO_SKIP") != nullptr;
+// SMALL_NOPROBE=<n> overrides the small-node probing cut-off (see
+// kSmallNoProbe; 0 disables it).
+const int g_small_noprobe = std::getenv("SMALL_NOPROBE") ? std::atoi(std::getenv("SMALL_NOPROBE")) : kSmallNoProbe;
 // EARLY_SOLVE=1 (anytime mode): stop the probe pass at the first probe that
 // completes the grid and branch on that cell. Measured on pikachu --anytime
 // --max 300000: probes 23.1M -> 21.7M, wall within noise (7.10/7.54/7.01s
@@ -300,6 +343,7 @@ constexpr int g_debug_impl = 0;
 constexpr int g_anytime_tb = 0;
 constexpr bool g_first_val_low = false;
 constexpr bool g_no_skip = false;
+constexpr int g_small_noprobe = kSmallNoProbe;
 constexpr bool g_early_solve = false;
 constexpr std::size_t g_probe_window = 100;
 constexpr double g_probe_thresh = 0.01;
@@ -1561,6 +1605,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
     StateTable::Key state_key{0, 0};
     const bool use_state_cache = state.count_mode && !g_no_state_cache;
     bool cache_this_node = use_state_cache;  // cleared when the node's size bucket is gated off
+    SmallTimer small_timer(n_unknown);
     int nb = 0;  // node-size bucket: log2 of the unknown cells
     while ((n_unknown >> (nb + 1)) != 0 && nb < SolveState::kScBuckets - 1) ++nb;
     if (use_state_cache && state.sc_off[nb]) {
@@ -1771,7 +1816,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         return std::pair<int, int>(line_constraint, -neighbor_score(r, c));
     };
 
-    if (state.skip_probing) {
+    if (state.skip_probing || (g_small_noprobe > 0 && n_unknown <= g_small_noprobe && state.branch_depth > 0)) {
         // Pick the unknown cell with the smallest composite key (most-
         // constrained line; tie-broken by highest neighbor score). Single
         // row-major scan, no coords/scores arrays materialized.
@@ -2269,7 +2314,14 @@ void solve(const std::vector<std::vector<int>>& rows,
         for (int r = 0; r < H; ++r) trail.dirty_rows[static_cast<std::size_t>(r)] = r;
         for (int c = 0; c < W; ++c) trail.dirty_cols[static_cast<std::size_t>(c)] = c;
     }
+    const std::uint64_t solve_tsc0 = g_debug_stats ? __rdtsc() : 0;
     (void)solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
+    if (g_debug_stats && count_mode) {
+        const double total = static_cast<double>(__rdtsc() - solve_tsc0);
+        std::fprintf(stderr, "cache-stats: small-region subtrees: <=31 cells %.1f%% of cycles (%llu roots), <=15 cells %.1f%% (%llu roots)\n",
+                     100.0 * static_cast<double>(g_stat_small31_cycles) / total, static_cast<unsigned long long>(g_stat_small31_roots),
+                     100.0 * static_cast<double>(g_stat_small15_cycles) / total, static_cast<unsigned long long>(g_stat_small15_roots));
+    }
     if (out_count != nullptr) {
         u128 v = state.result;
         std::string s;
