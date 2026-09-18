@@ -5,6 +5,11 @@ CXX = g++
 CXXFLAGS = -O3 -march=native -flto -std=c++17 -Wall -Wextra -pedantic \
            --param max-inline-insns-auto=120 --param max-inline-insns-single=600 \
            -funroll-loops -DNDEBUG
+# Static link: solve time is unchanged, but the corpus pipeline runs one
+# process per puzzle and most puzzles solve in well under a millisecond, so
+# dynamic loading dominated their wall time (easy_large/7368: 2.9ms -> 1.7ms
+# per process, page faults 234 -> 149, measured over 200 runs).
+LDFLAGS = -static
 
 SRCS = main.cpp lines.cpp picture.cpp puzzle_io.cpp search.cpp
 OBJS = $(SRCS:.cpp=.o)
@@ -14,7 +19,7 @@ PGO_DIR = pgo-data
 all: solver
 
 solver: $(OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
 
 # Every object depends on every header: the headers are few and a stale .o
 # built against an old struct layout links (LTO warns about ODR) and misbehaves.
@@ -28,8 +33,8 @@ clean:
 # statistics to stderr. Separate binary because the counters cost ~3% of
 # instructions on the hot path when compiled in.
 stats: solver-stats
-solver-stats: $(SRCS) $(wildcard *.hpp)
-	$(CXX) $(CXXFLAGS) -DNONOGRAM_STATS $(SRCS) -o $@
+solver-stats: $(SRCS) $(wildcard *.hpp) Makefile
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -DNONOGRAM_STATS $(SRCS) -o $@
 
 # Both stages link to the SAME output name: gcc derives the .gcda file names
 # from it (<output>-<source>.gcda), so an instrumented "solver-instrumented"
@@ -39,7 +44,7 @@ solver-stats: $(SRCS) $(wildcard *.hpp)
 pgo: pgo-clean
 	@echo "=== PGO Stage 1: build instrumented binary ==="
 	mkdir -p $(PGO_DIR)
-	$(CXX) $(CXXFLAGS) -fprofile-generate=$(PGO_DIR) $(SRCS) -o solver
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -fprofile-generate=$(PGO_DIR) $(SRCS) -o solver
 	@echo "=== PGO Stage 2: train on representative puzzles ==="
 	./solver ../nonograms/medium/108 --max 200000 > /dev/null
 	./solver ../nonograms/partially_solved/pikachu --anytime --max 30000 > /dev/null
@@ -47,7 +52,7 @@ pgo: pgo-clean
 	./solver ../nonograms/easy_medium/63 > /dev/null
 	./solver ../nonograms/trivial/1 > /dev/null
 	@echo "=== PGO Stage 3: build optimized binary ==="
-	$(CXX) $(CXXFLAGS) -fprofile-use=$(PGO_DIR) -Werror=missing-profile $(SRCS) -o solver
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -fprofile-use=$(PGO_DIR) -Werror=missing-profile $(SRCS) -o solver
 
 pgo-clean:
 	rm -rf $(PGO_DIR) solver-instrumented
