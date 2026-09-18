@@ -69,6 +69,10 @@ bool stop_requested();
 // i-th region of a split). Two stopped runs of the same tree compare by it
 // lexicographically (a prefix ranks below its extensions).
 const std::string& stop_position();
+// Prints count mode's progress line (explored fraction, solutions counted
+// in the finished subtrees, estimated total, ETA) for the given elapsed
+// time; the search prints the same line on its own once per interval.
+void print_count_progress(double elapsed);
 
 // Knuth-style estimate of the TOTAL number of solutions, without enumerating.
 // Performs n_dives random weighted root-to-leaf dives (Knuth 1975): at each
