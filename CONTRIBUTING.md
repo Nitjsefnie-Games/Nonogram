@@ -165,7 +165,7 @@ with the numbers that kept it out of the shipped build:
 | `DEBUG_IMPL=1/2` | implication graph with contrapositive edges: count / act |
 | `NO_STATE_CACHE=1` | count mode without the region state cache (the count of a region's state, keyed by its line keys, reused when another branch order reaches it) |
 | `STATE_CACHE_PROBE_ONLY=1` | key and look up every node but never take a hit: the instruction delta against `NO_STATE_CACHE=1` is the cache's own cost |
-| `STATE_CACHE_YIELD=<x>` | the state cache's per-node-size gate: a size bucket stops using the cache while the cycles its hits save fall below x times the cycles its lookups cost (default 1) |
+| `STATE_CACHE_YIELD=<x>` | the state cache's per-node-size gate: a size bucket stops using the cache while the cycles its hits save fall below x times the cycles its lookups cost (default 1). The gate and the table's eviction read cycle counters, so a long run's tree is not bit-for-bit reproducible; on the corpus neither fires and two `nodes.py` runs agree on every puzzle (checked 2026-09-18), and `0` makes the gate inert for a strictly deterministic tree |
 | `DEBUG_CACHE_STATS=1` | the counters themselves, including the latched dead/live subtree histogram and the state cache's lookups, hits and evictions |
 
 Three things hold in every build. `STATE_CACHE_MB` sets the state cache's
