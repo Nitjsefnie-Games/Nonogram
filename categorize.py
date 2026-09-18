@@ -387,7 +387,20 @@ def main():
                              'Works in both --rebench mode and harvest (default) mode. '
                              'In harvest mode, the saved in_progress file is used as '
                              'the puzzle path passed to the solver.')
+    parser.add_argument('--solver-version', metavar='LABEL', default=None,
+                        help='Label written as "# solver=" in the header blocks. Defaults to '
+                             'the Python solver version, or "cpp-<git short sha>" when '
+                             '--solver-cmd is given, so blocks from the two solvers never '
+                             'replace each other.')
     args = parser.parse_args()
+
+    global SOLVER_VERSION
+    if args.solver_version:
+        SOLVER_VERSION = args.solver_version
+    elif args.solver_cmd:
+        sha = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True).stdout.strip()
+        SOLVER_VERSION = f"cpp-{sha or 'unknown'}"
+    print(f"Header solver label: {SOLVER_VERSION}")
 
     joined = join_solver_cgroup()
     if joined:
