@@ -334,6 +334,37 @@ def rebench_file(path, solver_cmd=None):
         elapsed = time.perf_counter() - start
     else:
         n_solutions, strategy, elapsed = _solve_via_external(solver_cmd, path)
+    return place_with_header(path, rows, cols, n_solutions, strategy, elapsed)
+
+
+def record_file(path, log_path):
+    """Write the golden header from a finished solver run's stdout (a
+    journal dump with the Found / Time / Strategy lines) instead of solving
+    again; a count that took an hour in a service does not need a second
+    hour to be recorded."""
+    try:
+        rows, cols = load_clues(path)
+    except Exception as exc:
+        print(f"  {path}: parse error ({exc})")
+        return False, path, None
+    with open(log_path) as f:
+        out = f.read()
+    m_found = re.search(r"^Found\s+([\d,]+)\s+solution\(s\)", out, re.MULTILINE)
+    m_time = re.search(r"^Time:\s+([0-9]*\.?[0-9]+)s", out, re.MULTILINE)
+    m_strat = re.search(r"^Strategy:\s+(\S+)", out, re.MULTILINE)
+    if not (m_found and m_time and m_strat) or m_strat.group(1) not in _STRATEGY_NAME_TO_ENUM:
+        print(f"  {log_path}: no complete Found / Time / Strategy lines")
+        return False, path, None
+    n_solutions = int(m_found.group(1).replace(",", ""))
+    elapsed = float(m_time.group(1))
+    strategy = _STRATEGY_NAME_TO_ENUM[m_strat.group(1)]
+    ok, new_path, elapsed = place_with_header(path, rows, cols, n_solutions, strategy, elapsed)
+    print(f"  {path}  ->  {new_path}  ({elapsed:.4f}s, {n_solutions} solutions, recorded)")
+    return ok, new_path, elapsed
+
+
+def place_with_header(path, rows, cols, n_solutions, strategy, elapsed):
+    """Prepend the current header block and move the file to its time bucket."""
     strat_cat = strategy.value
 
     with open(path) as f:
@@ -404,6 +435,10 @@ def main():
                         help='Maximum number of puzzles to process')
     parser.add_argument('--timeout', type=float, default=None,
                         help='Maximum solve time per puzzle in seconds (skip if exceeded)')
+    parser.add_argument('--record', nargs=2, metavar=('PUZZLE', 'LOG'),
+                        help='Write the golden header for PUZZLE from LOG, a finished solver run\'s stdout '
+                             '(journalctl -o cat dump with the Found / Time / Strategy lines), and move '
+                             'the file to its time bucket; no re-solve')
     parser.add_argument('--rebench', metavar='DIR',
                         help='Re-solve every puzzle file under DIR with the current solver instead of fetching from webpbn')
     parser.add_argument('--exclude', action='append', default=[], metavar='FOLDER',
@@ -436,6 +471,10 @@ def main():
         print(f"Pinned to exclusive cpuset core(s): {joined}")
     else:
         print(f"(no exclusive cpuset; run scripts/cpuset_setup.sh as root for stable timings)")
+
+    if args.record:
+        record_file(args.record[0], args.record[1])
+        return
 
     if args.rebench:
         rebench_folder(args.rebench, set(args.exclude), solver_cmd=args.solver_cmd)
