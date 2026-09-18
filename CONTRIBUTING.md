@@ -86,6 +86,46 @@ numbers on a loaded machine are noise and will be treated as such.
 A PR that adds a real regression suite (a handful of puzzles with known
 solutions, asserted end to end) is welcome on its own.
 
+### The C++ solver
+
+`cpp/` has its own gate and benchmark protocol; a performance claim about
+the C++ solver should come with these numbers, measured this way:
+
+```
+cd cpp
+bench/shield.sh                      # reserve one core (undo: bench/unshield.sh)
+make pgo                             # the binary that ships: profile-guided
+python3 bench/harness.py gate        # solution count + strategy vs golden
+python3 bench/harness.py gate-anytime   # same puzzles with --anytime (count only)
+python3 bench/harness.py bench 3     # default-mode timing suite, best of 3
+bench/run.sh ./solver ../nonograms/partially_solved/pikachu --anytime --max 300000
+```
+
+The last line is the headline anytime benchmark (time to 300k solutions
+on a puzzle that never finishes). Compare binaries **interleaved** on the
+shielded core, several rounds each, and read best-of-N and medians; on a
+shared machine a single pair of runs is noise. For a behavior-preserving
+change, `bench/diff_test.py <old> <new>` runs the whole corpus through
+both binaries and fails on any difference in solution count or strategy.
+
+Two counters are far less noisy than wall time and settle most decisions:
+
+```
+perf stat -e instructions:u,branch-misses:u ./solver <puzzle> --anytime --max 100000
+```
+
+Instructions retired repeat to well under 0.1% run to run. Cycles and
+wall time still have the last word, because most of the anytime hot path
+is memory latency that no instruction count sees. Small changes also move
+code layout enough to swing plain `-O3` builds by a few percent, so judge
+anything under ~5% on the PGO build.
+
+`make stats` builds `solver-stats`, which with `DEBUG_CACHE_STATS=1` prints
+line-cache and probe statistics to stderr (lookups, misses, deductions per
+entry, lookups per probe). `LINE_CACHE_LEGACY=1` forces the string-keyed
+cache used for lines longer than 128 cells, for differential testing of
+the packed-key one. Neither affects results.
+
 ## House style
 
 - **Python** — numpy arrays over Python lists in anything the solver
