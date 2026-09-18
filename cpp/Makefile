@@ -16,7 +16,9 @@ all: solver
 solver: $(OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
-%.o: %.cpp
+# Every object depends on every header: the headers are few and a stale .o
+# built against an old struct layout links (LTO warns about ODR) and misbehaves.
+%.o: %.cpp $(wildcard *.hpp)
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 clean:
