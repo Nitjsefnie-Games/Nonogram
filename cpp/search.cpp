@@ -408,6 +408,8 @@ bool g_fast_mode = false;
 // their lengths differ. On square puzzles they can, so the bit is dropped
 // there to keep the legacy cache's sharing.
 std::uint16_t g_tag_col_bit = 1;
+// High bit of every 2-bit cell in a packed key: set exactly for UNKNOWN cells.
+constexpr std::uint64_t kUnknownBits = 0xAAAAAAAAAAAAAAAAULL;
 // Tag per row / per column (spec id * 2 + orientation bit), precomputed in
 // solve() so the hit path reads one uint16 instead of dereferencing the
 // LineSpec for its id -- a dependent load ahead of the hash.
@@ -628,7 +630,7 @@ BatchResult solve_one_batch_legacy(const LineSpec& spec,
     // needs the forward validity check, not the backward sweep.
     std::uint64_t any = 0;
     for (int w = 0; w < pic.key_words; ++w) any |= key[w];
-    const bool has_unknown = (any & 0xAAAAAAAAAAAAAAAAULL) != 0;
+    const bool has_unknown = (any & kUnknownBits) != 0;
     solve_line_batch(line, line_n, spec, res, has_unknown);
     return g_fast_cache.insert(key, tag, res);
 }
@@ -918,21 +920,25 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
 
     // Per-row / per-col UNKNOWN counts, used as the "most constrained line"
     // signal in the composite sort key (lower => more constrained line).
-    // Branch-free counting: the unknown/known pattern along a row is data-
-    // dependent and mispredicts if tested per cell.
+    // Read off the packed line keys: UNKNOWN is digit 2 (0b10), so masking
+    // the high bit of every cell and popcounting gives a line's count in
+    // one instruction per key word instead of a pass over its cells.
+    const int kw = pic.key_words;
+    const std::uint64_t* rk = pic.row_keys.data();
+    const std::uint64_t* ck = pic.col_keys.data();
     int n_unknown = 0;
     int* uir = unknowns_in_row.data();
     int* uic = unknowns_in_col.data();
     for (int r = 0; r < H; ++r) {
-        const std::int8_t* row_px = px + static_cast<std::size_t>(r) * W;
         int row_n = 0;
-        for (int c = 0; c < W; ++c) {
-            const int u = row_px[c] == UNKNOWN;
-            row_n += u;
-            uic[c] += u;
-        }
+        for (int w = 0; w < kw; ++w) row_n += __builtin_popcountll(rk[r * kw + w] & kUnknownBits);
         uir[r] = row_n;
         n_unknown += row_n;
+    }
+    for (int c = 0; c < W; ++c) {
+        int col_n = 0;
+        for (int w = 0; w < kw; ++w) col_n += __builtin_popcountll(ck[c * kw + w] & kUnknownBits);
+        uic[c] = col_n;
     }
 
     if (n_unknown == 0) {
@@ -970,15 +976,18 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         std::pair<int, int> best_key;
         bool have = false;
         for (int r = 0; r < H; ++r) {
-            const std::int8_t* row_px = px + static_cast<std::size_t>(r) * W;
-            for (int c = 0; c < W; ++c) {
-                if (row_px[c] != UNKNOWN) continue;
-                std::pair<int, int> k = composite_key(r, c);
-                if (!have || k < best_key) {
-                    best_key = k;
-                    best_row = r;
-                    best_col = c;
-                    have = true;
+            for (int w = 0; w < kw; ++w) {
+                std::uint64_t m = rk[r * kw + w] & kUnknownBits;
+                while (m != 0) {
+                    const int c = 32 * w + (__builtin_ctzll(m) >> 1);
+                    m &= m - 1;
+                    std::pair<int, int> k = composite_key(r, c);
+                    if (!have || k < best_key) {
+                        best_key = k;
+                        best_row = r;
+                        best_col = c;
+                        have = true;
+                    }
                 }
             }
         }
@@ -992,18 +1001,24 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         // replaces the O(n log n) stable_sort while producing the identical order.
         static thread_local std::vector<std::pair<int, int>> unknown_coords;
         static thread_local std::vector<int> enc;
+        // Enumerate the unknown cells from the packed row keys (same
+        // row-major, ascending-column order as a cell scan): each set bit of
+        // key & kUnknownBits is an unknown cell at column 32*w + bit/2.
         unknown_coords.clear();
         enc.clear();
         int max_enc = 0;
         for (int r = 0; r < H; ++r) {
-            const std::int8_t* row_px = px + static_cast<std::size_t>(r) * W;
-            for (int c = 0; c < W; ++c) {
-                if (row_px[c] != UNKNOWN) continue;
-                unknown_coords.emplace_back(r, c);
-                int lc = uir[r] + uic[c];
-                int e = lc * 5 + (4 - neighbor_score(r, c));
-                enc.push_back(e);
-                if (e > max_enc) max_enc = e;
+            for (int w = 0; w < kw; ++w) {
+                std::uint64_t m = rk[r * kw + w] & kUnknownBits;
+                while (m != 0) {
+                    const int c = 32 * w + (__builtin_ctzll(m) >> 1);
+                    m &= m - 1;
+                    unknown_coords.emplace_back(r, c);
+                    int lc = uir[r] + uic[c];
+                    int e = lc * 5 + (4 - neighbor_score(r, c));
+                    enc.push_back(e);
+                    if (e > max_enc) max_enc = e;
+                }
             }
         }
 
