@@ -268,12 +268,14 @@ struct SmallTimer {
 // node with 31 cells pays 62 probes, each a line solve plus propagation,
 // to pick one of them, and on the partially solved puzzles the subtrees
 // under such nodes were 40-63% of the run. Measured (count mode, state
-// cache on): 3867 reaches in 60 s what took 300 s (its 812-cell region
-// 12.5% -> 49.9% explored), 7290 0.14% -> 0.79%, 10810 unchanged; corpus
-// branch nodes +9.3% for probes -27% (7382 532k -> 635k nodes), counts
-// and labels unchanged. 63 grows the corpus 37% and loses 7290; 16 is
-// half the gain.
-constexpr int kSmallNoProbe = 31;
+// cache on), at 31: 3867 reaches in 60 s what took 300 s (its 812-cell
+// region 12.5% -> 49.9% explored), 7290 0.14% -> 0.79%, 10810 unchanged;
+// corpus branch nodes +9.3% for probes -27% (7382 532k -> 635k nodes),
+// counts and labels unchanged. 47 against 31, 60 s: 7785 +21%, 9798
+// +19%, 2712 / 7290 / 10810 / 5903 level, corpus nodes +1.7%, 7382 12.7
+// -> 10.8 s, 12130 2.8 -> 1.9 s. 63 grows the corpus 37% and loses 7290
+// 4.4x; 16 is half the gain.
+constexpr int kSmallNoProbe = 47;
 
 // BRANCH_K=<k> (stats build only): score branch cells by k*min - max instead
 // of the shipped (min, then smaller max) order, for exploring the balance
