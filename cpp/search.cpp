@@ -516,6 +516,17 @@ void reset_line_cache(int height, int width, std::size_t budget_bytes, bool rese
 
 struct Trail {
     std::vector<int> changed_cell_indices;  // packed (row, col); see trail_pack
+    // Per-row / per-col UNKNOWN counts at the last branch node, maintained
+    // from this trail alone: the node entry subtracts every entry pushed
+    // since `counted` (cells settled by branch pixels, commits and real
+    // propagation), and revert_branch adds back the counted entries it pops.
+    // Probes use their own Trail and revert every cell before returning,
+    // so the probe hot path pays nothing (counting inside Picture's
+    // set_known/unset cost pikachu --anytime 3.3% of instructions).
+    // Only the solve() trail carries these; probe trails leave them empty.
+    std::vector<int> row_unknown;
+    std::vector<int> col_unknown;
+    std::size_t counted = 0;
 };
 
 // Trail entries carry (row, col) rather than a linear index so a revert can
@@ -1084,9 +1095,16 @@ void revert_branch(Picture& pic,
                    int saved_unknown_count) {
     while (trail.changed_cell_indices.size() > mark) {
         const int e = trail.changed_cell_indices.back();
+        // Entries below `counted` were subtracted from the per-line counts
+        // at a branch node; add them back. Entries above it never were.
+        if (trail.changed_cell_indices.size() <= trail.counted) {
+            ++trail.row_unknown[trail_row(e)];
+            ++trail.col_unknown[trail_col(e)];
+        }
         trail.changed_cell_indices.pop_back();
         pic.unset(trail_row(e), trail_col(e));
     }
+    if (trail.counted > mark) trail.counted = mark;
     pic.unknown_count = saved_unknown_count;
     while (!pic.row_queue.empty()) {
         int i = pic.row_queue.front();
@@ -1118,38 +1136,27 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
     const int W = pic.width();
     const std::int8_t* px = pic.pixels.data();
 
-    // Reusable scratch buffers. Safe to share across recursive solve_backtrack
-    // frames: every frame fully consumes these during cell-selection, BEFORE
-    // any recursive solve_real call (forced-commit returns immediately; the
-    // branch loop only touches plain locals). Avoids 4 heap allocations per
-    // backtrack node.
-    static thread_local std::vector<int> unknowns_in_row;
-    static thread_local std::vector<int> unknowns_in_col;
-    unknowns_in_row.assign(static_cast<std::size_t>(H), 0);
-    unknowns_in_col.assign(static_cast<std::size_t>(W), 0);
-
     // Per-row / per-col UNKNOWN counts, used as the "most constrained line"
     // signal in the composite sort key (lower => more constrained line).
-    // Read off the packed line keys: UNKNOWN is digit 2 (0b10), so masking
-    // the high bit of every cell and popcounting gives a line's count in
-    // one instruction per key word instead of a pass over its cells.
+    // Brought up to date from the trail entries pushed since the previous
+    // branch node (see Trail); recounting them here by popcounting every
+    // line key was 27% of the latched node on hard/6689.
     const int kw = pic.key_words;
     const std::uint64_t* rk = pic.row_keys.data();
-    const std::uint64_t* ck = pic.col_keys.data();
-    int n_unknown = 0;
-    int* uir = unknowns_in_row.data();
-    int* uic = unknowns_in_col.data();
-    for (int r = 0; r < H; ++r) {
-        int row_n = 0;
-        for (int w = 0; w < kw; ++w) row_n += __builtin_popcountll(rk[r * kw + w] & kUnknownBits);
-        uir[r] = row_n;
-        n_unknown += row_n;
+    const int n_unknown = pic.unknown_count;
+    {
+        const int* tr = trail.changed_cell_indices.data();
+        const std::size_t n = trail.changed_cell_indices.size();
+        int* ru = trail.row_unknown.data();
+        int* cu = trail.col_unknown.data();
+        for (std::size_t i = trail.counted; i < n; ++i) {
+            --ru[trail_row(tr[i])];
+            --cu[trail_col(tr[i])];
+        }
+        trail.counted = n;
     }
-    for (int c = 0; c < W; ++c) {
-        int col_n = 0;
-        for (int w = 0; w < kw; ++w) col_n += __builtin_popcountll(ck[c * kw + w] & kUnknownBits);
-        uic[c] = col_n;
-    }
+    const int* uir = trail.row_unknown.data();
+    const int* uic = trail.col_unknown.data();
 
     if (n_unknown == 0) {
         return true;
@@ -1175,7 +1182,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
     // Returned via a pair so std::less ordering matches the desired ordering
     // (we negate neighbor so larger neighbor compares smaller, i.e. wins ties).
     auto composite_key = [&](int r, int c) {
-        int line_constraint = unknowns_in_row[r] + unknowns_in_col[c];
+        int line_constraint = uir[r] + uic[c];
         return std::pair<int, int>(line_constraint, -neighbor_score(r, c));
     };
 
@@ -1185,7 +1192,15 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         // row-major scan, no coords/scores arrays materialized.
         std::pair<int, int> best_key;
         bool have = false;
+        // Lower bound on any cell's line_constraint in row r is
+        // uir[r] + min_uic, so once a best key is known, rows whose bound
+        // exceeds its line_constraint cannot beat OR tie it and are skipped
+        // without touching their cells; rows that could tie are scanned in
+        // the same row-major order as before, so the choice is identical.
+        int min_uic = INT_MAX;
+        for (int c = 0; c < W; ++c) if (uic[c] > 0 && uic[c] < min_uic) min_uic = uic[c];
         for (int r = 0; r < H; ++r) {
+            if (uir[r] == 0 || (have && uir[r] + min_uic > best_key.first)) continue;
             for (int w = 0; w < kw; ++w) {
                 std::uint64_t m = rk[r * kw + w] & kUnknownBits;
                 while (m != 0) {
@@ -1569,6 +1584,9 @@ void solve(const std::vector<std::vector<int>>& rows,
     Trail trail;
     // Reserve enough headroom that the trail rarely reallocates.
     trail.changed_cell_indices.reserve(static_cast<std::size_t>(H) * static_cast<std::size_t>(W));
+    trail.row_unknown.assign(static_cast<std::size_t>(H), W);
+    trail.col_unknown.assign(static_cast<std::size_t>(W), H);
+    trail.counted = 0;
     (void)solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
 
     if (g_debug_stats) {
