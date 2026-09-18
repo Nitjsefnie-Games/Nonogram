@@ -1,0 +1,36 @@
+# solver=cpp-298d4941
+# cpu=AMD EPYC Processor (with IBPB)
+# strategy=contra
+# n_solutions=1
+# solve_time=0.00060
+1 1
+1 1
+1 1
+5 4
+4 5
+1 1
+1 1
+1 1
+1 1
+1 1
+4 5
+5 4
+1 1
+1 1
+1 1
+---
+1 1
+7
+1 1
+2 2
+1 1
+4 4
+1 1
+2 2
+1 1
+7
+1 1
+2 2
+1 1
+4 4
+1 1
