@@ -202,6 +202,10 @@ std::uint64_t g_stat_lookups = 0;
 std::uint64_t g_stat_misses = 0;
 std::uint64_t g_stat_probes = 0;
 std::uint64_t g_stat_ded_hist[kMaxFastCells + 1] = {};
+std::uint64_t g_stat_unsat = 0, g_stat_noded = 0, g_stat_ded = 0;  // lookup outcomes
+std::uint64_t g_stat_probe_lookups_hist[64] = {};  // lookups per probe (capped)
+std::uint64_t g_stat_probe_cur = 0;
+std::uint64_t g_stat_probe_ok = 0;
 
 inline std::uint16_t load_u16(const unsigned char* p) { std::uint16_t v; std::memcpy(&v, p, 2); return v; }
 inline std::uint32_t load_u32(const unsigned char* p) { std::uint32_t v; std::memcpy(&v, p, 4); return v; }
@@ -578,13 +582,17 @@ BatchResult solve_one_batch(const LineSpec& spec,
 
     const std::size_t hdr = g_fast_cache.header_offset();
     const std::uint8_t flags = s[hdr + 3];
+    if (g_debug_stats) ++g_stat_probe_cur;
     if (!(flags & kFlagSat)) {
+        if (g_debug_stats) ++g_stat_unsat;
         return BatchResult{false, nullptr, 0, nullptr};
     }
     const int n = s[hdr + 2];
     if (n == 0) {
+        if (g_debug_stats) ++g_stat_noded;
         return BatchResult{true, nullptr, 0, nullptr};
     }
+    if (g_debug_stats) ++g_stat_ded;
     const std::uint8_t* ded = (flags & kFlagSpilled)
         ? g_fast_cache.arena() + load_u32(s + hdr + 4)
         : s + hdr + 4;
@@ -744,7 +752,8 @@ ProbeResult probe_cell(int row,
     // and reuse its capacity — no per-probe heap allocation.
     static thread_local Trail trail;
     trail.changed_cell_indices.clear();
-    if (g_debug_stats) ++g_stat_probes;
+    if (g_debug_stats) { ++g_stat_probes; g_stat_probe_cur = 0; }
+    struct ProbeStat { ~ProbeStat() { if (g_debug_stats) ++g_stat_probe_lookups_hist[std::min<std::uint64_t>(g_stat_probe_cur, 63)]; } } probe_stat;
 
     ProbeGuard guard(pic, trail);
 
@@ -769,6 +778,7 @@ ProbeResult probe_cell(int row,
         }
     }
 
+    if (g_debug_stats) ++g_stat_probe_ok;
     return ProbeResult{true, count_solved_pixels(pic)};
 }
 
@@ -1159,6 +1169,12 @@ void solve(const std::vector<std::vector<int>>& rows,
                      static_cast<unsigned long long>(g_stat_probes));
         for (int i = 0; i <= kMaxFastCells; ++i) {
             if (g_stat_ded_hist[i]) std::fprintf(stderr, " %d:%llu", i, static_cast<unsigned long long>(g_stat_ded_hist[i]));
+        }
+        std::fprintf(stderr, "\ncache-stats: lookup outcomes unsat=%llu no-deductions=%llu deductions=%llu; probes ok=%llu\ncache-stats: lookups-per-probe histogram:",
+                     static_cast<unsigned long long>(g_stat_unsat), static_cast<unsigned long long>(g_stat_noded),
+                     static_cast<unsigned long long>(g_stat_ded), static_cast<unsigned long long>(g_stat_probe_ok));
+        for (int i = 0; i < 64; ++i) {
+            if (g_stat_probe_lookups_hist[i]) std::fprintf(stderr, " %d:%llu", i, static_cast<unsigned long long>(g_stat_probe_lookups_hist[i]));
         }
         std::fprintf(stderr, "\n");
     }

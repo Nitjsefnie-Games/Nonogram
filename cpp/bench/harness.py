@@ -8,6 +8,8 @@ each puzzle's header (# n_solutions=, # strategy=).
 Modes:
   gate   -- correctness only: run every gate puzzle to completion, assert
             solution count + strategy match golden. Exit 1 on any mismatch.
+  gate-anytime -- same puzzles with --anytime; asserts the solution count
+            only (probing stays on, so the reported strategy may differ).
   bench  -- timing: run each bench puzzle REPS times, report best/median.
   both   -- gate then bench (default).
 """
@@ -59,13 +61,17 @@ def run(path, extra=(), isolated=True):
     solve_t = float(mt.group(1)) if mt else dt
     return n, strat, solve_t
 
-def do_gate():
-    print("=== GATE (correctness) ===")
+def do_gate(extra=()):
+    label = " ".join(extra)
+    print(f"=== GATE (correctness{' ' + label if label else ''}) ===")
     ok = True
     for p in GATE:
         gn, gs = golden(p)
-        n, s, t = run(p)
-        good = (n == gn and s == gs)
+        n, s, t = run(p, extra)
+        # --anytime keeps lookahead probing on, so the strategy it reports may
+        # legitimately differ from the golden (default-mode) one; the solution
+        # count never may.
+        good = (n == gn and (s == gs or extra))
         ok = ok and good
         print(f"  [{'OK ' if good else 'FAIL'}] {p:22s} n={n} (gold {gn}) strat={s} (gold {gs})  {t:.3f}s")
     print("GATE:", "PASS" if ok else "FAIL")
@@ -92,6 +98,8 @@ if __name__ == "__main__":
     rc = 0
     if mode in ("gate", "both"):
         if not do_gate(): rc = 1
+    if mode == "gate-anytime":
+        if not do_gate(("--anytime",)): rc = 1
     if mode in ("bench", "both"):
         do_bench(reps)
     sys.exit(rc)
