@@ -238,6 +238,56 @@ constexpr bool g_branch_k_set = false;
 constexpr double g_branch_k = 0.0;
 #endif
 
+// DEBUG_IMPL=<n> (stats build only): implication-graph experiment. Every
+// successful probe (p=c) that settles q=v yields the implication p_c -> q_v
+// and its contrapositive q_!v -> p_!c (Wu et al. 2013's FP2 insight;
+// direct implications are already transitively closed by propagation, so
+// only paths that use a contrapositive edge can add anything). A literal
+// that reaches its own negation is false. n=1 counts what that would force
+// at each branch node; n=2 commits those cells and restarts the node.
+// Measured (with the balanced tie-break): 9-Dom 10 forced cells over 3,232
+// nodes (tree 3,232 -> 3,231), extreme/6574 none over 154 nodes,
+// easy_large/5281 3 cells and a slightly larger tree, so it is not shipped.
+#ifdef NONOGRAM_STATS
+const int g_debug_impl = std::getenv("DEBUG_IMPL") ? std::atoi(std::getenv("DEBUG_IMPL")) : 0;
+// ANYTIME_TB=1 breaks anytime-mode ties on the max toward the larger min,
+// =2 toward the smaller min (the shipped order is first-found).
+const int g_anytime_tb = std::getenv("ANYTIME_TB") ? std::atoi(std::getenv("ANYTIME_TB")) : 0;
+// FIRST_VAL=1 explores the branch value whose probe settled FEWER cells
+// first (the shipped order explores the one that settled more).
+const bool g_first_val_low = std::getenv("FIRST_VAL") != nullptr;
+// NO_SKIP=1 never latches the adaptive probing shut-off in default mode.
+const bool g_no_skip = std::getenv("NO_SKIP") != nullptr;
+// PROBE_WINDOW / PROBE_THRESH override the shut-off window and yield threshold.
+const std::size_t g_probe_window = std::getenv("PROBE_WINDOW") ? std::strtoull(std::getenv("PROBE_WINDOW"), nullptr, 10) : 100;
+const double g_probe_thresh = std::getenv("PROBE_THRESH") ? std::atof(std::getenv("PROBE_THRESH")) : 0.01;
+// DEAD_WINDOW / DEAD_FRAC override the dead-work watchdog's window and fraction.
+const std::uint64_t g_dead_window = std::getenv("DEAD_WINDOW") ? std::strtoull(std::getenv("DEAD_WINDOW"), nullptr, 10) : 4096;
+const double g_dead_frac = std::getenv("DEAD_FRAC") ? std::atof(std::getenv("DEAD_FRAC")) : 0.9;
+#else
+constexpr std::uint64_t g_dead_window = 4096;
+constexpr double g_dead_frac = 0.9;
+constexpr int g_debug_impl = 0;
+constexpr int g_anytime_tb = 0;
+constexpr bool g_first_val_low = false;
+constexpr bool g_no_skip = false;
+constexpr std::size_t g_probe_window = 100;
+constexpr double g_probe_thresh = 0.01;
+#endif
+std::uint64_t g_stat_probe_pairs = 0, g_stat_probe_hits = 0;  // probe pairs, and those with a contradiction
+// Dead-subtree histogram for latched (no-probing) branch nodes: bucket i
+// holds subtrees of 2^i .. 2^(i+1)-1 nodes that found no solution.
+std::uint64_t g_stat_dead_hist[40] = {};
+std::uint64_t g_stat_live_hist[40] = {};
+std::uint64_t g_stat_all_nodes = 0;
+std::uint64_t g_stat_impl_nodes = 0, g_stat_impl_nodes_forced = 0, g_stat_impl_forced = 0, g_stat_impl_dead = 0;
+std::uint64_t g_stat_impl_edges = 0;
+// Per-node probe record: for each successful probe, a header (packed cell,
+// value) followed by its settled cells (packed cell, value), all as
+// (trail_pack << 1) | (val == FULL).
+std::vector<int> g_impl_rec;
+std::vector<int> g_impl_off;
+
 inline std::uint16_t load_u16(const unsigned char* p) { std::uint16_t v; std::memcpy(&v, p, 2); return v; }
 inline std::uint32_t load_u32(const unsigned char* p) { std::uint32_t v; std::memcpy(&v, p, 4); return v; }
 inline void store_u16(unsigned char* p, std::uint16_t v) { std::memcpy(p, &v, 2); }
@@ -479,8 +529,6 @@ inline int trail_col(int e) { return e & 0xFFFF; }
 // ---------------------------------------------------------------------------
 
 struct SolveState {
-    static constexpr std::size_t PROBING_WINDOW = 100;
-    static constexpr double PROBING_THRESHOLD = 0.01;
 
     int probing_min_solutions;
 
@@ -488,6 +536,33 @@ struct SolveState {
     bool used_contradiction = false;
     bool used_backtrack = false;
     bool skip_probing = false;
+    // Dead-work watchdog for the latched (no-probing) mode. The yield window
+    // shuts probing off when few probes find contradictions, but that is
+    // the wrong signal for a puzzle whose tree is mostly dead subtrees that
+    // line solving alone discovers late: medium/3929 latches after a dry
+    // stretch, then spends 89% of its 556k latched nodes in dead subtrees,
+    // while probing throughout gives a 36k-node tree. Solution-dense trees
+    // (hard/6689 2.2M solutions, medium/108 564k) are the ones where the
+    // shut-off pays, and there almost every subtree is live. So while
+    // latched, count completed branch subtrees as dead or live, and when a
+    // window of 4096 is over 90% dead, turn probing back on for good.
+    // The window and fraction are conservative on purpose: easy_small/4774
+    // (195k solutions, 11% dead subtrees overall) un-latches at 50%/1024 or
+    // 75%/1024 and loses 4x; at 90%/4096 it stays latched while 3929 still
+    // goes 1.63s -> 0.27s (556k -> 116k nodes).
+    std::uint64_t latched_dead = 0, latched_live = 0;
+    bool probing_pinned = false;  // watchdog fired: never latch again
+
+    void note_latched_subtree(bool dead) {
+        if (dead) ++latched_dead; else ++latched_live;
+        if (latched_dead + latched_live < g_dead_window) return;
+        if (static_cast<double>(latched_dead) > g_dead_frac * static_cast<double>(latched_dead + latched_live)) {
+            skip_probing = false;
+            probing_pinned = true;
+            probe_outcomes.clear();
+        }
+        latched_dead = latched_live = 0;
+    }
     bool keep_probing = false;  // anytime mode: never latch skip_probing
     std::deque<int> probe_outcomes;
 
@@ -518,21 +593,22 @@ struct SolveState {
     }
 
     void record_probe(bool found_contradiction) {
+        if (g_debug_stats) { ++g_stat_probe_pairs; g_stat_probe_hits += found_contradiction; }
         // In anytime mode skip_probing can never latch, so the whole yield
         // window is dead work on every probe -- skip it entirely.
-        if (keep_probing || skip_probing) return;
+        if (keep_probing || skip_probing || probing_pinned || g_no_skip) return;
         // Mirror picture.py: don't let yield-window disable probing until
         // we've already found multiple solutions.
         if (solutions_found < probing_min_solutions) return;
         probe_outcomes.push_back(found_contradiction ? 1 : 0);
-        if (probe_outcomes.size() > PROBING_WINDOW) {
+        if (probe_outcomes.size() > g_probe_window) {
             probe_outcomes.pop_front();
         }
-        if (probe_outcomes.size() == PROBING_WINDOW) {
+        if (probe_outcomes.size() == g_probe_window) {
             int sum = 0;
             for (int v : probe_outcomes) sum += v;
-            double yield_rate = static_cast<double>(sum) / static_cast<double>(PROBING_WINDOW);
-            if (yield_rate < PROBING_THRESHOLD && !keep_probing) {
+            double yield_rate = static_cast<double>(sum) / static_cast<double>(g_probe_window);
+            if (yield_rate < g_probe_thresh && !keep_probing) {
                 skip_probing = true;
             }
         }
@@ -875,7 +951,122 @@ ProbeResult probe_cell(int row,
     }
 
     if (g_debug_stats) ++g_stat_probe_ok;
+    if (g_debug_impl) {
+        g_impl_off.push_back(static_cast<int>(g_impl_rec.size()));
+        const int W = pic.width();
+        for (int e : trail.changed_cell_indices) {
+            const int v = pic.pixels[trail_row(e) * W + trail_col(e)] == FULL ? 1 : 0;
+            g_impl_rec.push_back((e << 1) | v);
+        }
+    }
     return ProbeResult{true, count_solved_pixels(pic)};
+}
+
+// Implication-graph analysis of the current node's probe record (see
+// g_debug_impl). Fills `forced` with (packed cell, value) pairs that every
+// solution below this node must take; returns false when the node is dead.
+bool impl_analyze(const Picture& pic, const std::vector<std::pair<int, int>>& unknown_coords,
+                  std::vector<std::pair<int, std::int8_t>>& forced) {
+    forced.clear();
+    const int H = pic.height(), W = pic.width();
+    const int U = static_cast<int>(unknown_coords.size());
+    const int V = 2 * U;
+    std::vector<int> cell_idx(static_cast<std::size_t>(H) * W, -1);
+    for (int k = 0; k < U; ++k) cell_idx[unknown_coords[k].first * W + unknown_coords[k].second] = k;
+    auto lit = [&](int packed) -> int {
+        const int e = packed >> 1;
+        const int k = cell_idx[trail_row(e) * W + trail_col(e)];
+        return k < 0 ? -1 : 2 * k + (packed & 1);
+    };
+    // Adjacency as CSR.
+    std::vector<int> deg(V + 1, 0);
+    std::vector<std::pair<int, int>> edges;
+    g_impl_off.push_back(static_cast<int>(g_impl_rec.size()));
+    for (std::size_t i = 0; i + 1 < g_impl_off.size(); ++i) {
+        const int a = lit(g_impl_rec[g_impl_off[i]]);
+        if (a < 0) continue;
+        for (int j = g_impl_off[i] + 1; j < g_impl_off[i + 1]; ++j) {
+            const int b = lit(g_impl_rec[j]);
+            if (b < 0) continue;
+            edges.emplace_back(a, b);
+            edges.emplace_back(b ^ 1, a ^ 1);
+        }
+    }
+    g_impl_off.pop_back();
+    g_stat_impl_edges += edges.size();
+    for (auto& e : edges) ++deg[e.first + 1];
+    for (int v = 0; v < V; ++v) deg[v + 1] += deg[v];
+    std::vector<int> adj(edges.size());
+    {
+        std::vector<int> pos(deg.begin(), deg.end() - 1);
+        for (auto& e : edges) adj[pos[e.first]++] = e.second;
+    }
+    // Tarjan SCC (iterative).
+    std::vector<int> index(V, -1), low(V, 0), comp(V, -1), stk;
+    std::vector<char> on(V, 0);
+    int idx = 0, ncomp = 0;
+    std::vector<int> comp_order;  // components in order of completion = reverse topological
+    for (int s = 0; s < V; ++s) {
+        if (index[s] >= 0) continue;
+        std::vector<std::pair<int, int>> call;  // (vertex, next edge position)
+        call.emplace_back(s, deg[s]);
+        index[s] = low[s] = idx++; stk.push_back(s); on[s] = 1;
+        while (!call.empty()) {
+            int v = call.back().first;
+            int& p = call.back().second;
+            if (p < deg[v + 1]) {
+                int w = adj[p++];
+                if (index[w] < 0) {
+                    index[w] = low[w] = idx++; stk.push_back(w); on[w] = 1;
+                    call.emplace_back(w, deg[w]);
+                } else if (on[w]) {
+                    low[v] = std::min(low[v], index[w]);
+                }
+            } else {
+                if (low[v] == index[v]) {
+                    while (true) {
+                        int w = stk.back(); stk.pop_back(); on[w] = 0; comp[w] = ncomp;
+                        if (w == v) break;
+                    }
+                    ++ncomp;
+                }
+                call.pop_back();
+                if (!call.empty()) {
+                    int u = call.back().first;
+                    low[u] = std::min(low[u], low[v]);
+                }
+            }
+        }
+    }
+    // Tarjan numbers components in reverse topological order (a component is
+    // completed after everything it reaches), so reach sets can be built in
+    // component order 0..ncomp-1.
+    const int words = (V + 63) / 64;
+    std::vector<std::uint64_t> reach(static_cast<std::size_t>(ncomp) * words, 0);
+    std::vector<std::vector<int>> members(ncomp);
+    for (int v = 0; v < V; ++v) members[comp[v]].push_back(v);
+    for (int c = 0; c < ncomp; ++c) {
+        std::uint64_t* rc = &reach[static_cast<std::size_t>(c) * words];
+        for (int v : members[c]) {
+            rc[v >> 6] |= 1ULL << (v & 63);
+            for (int p = deg[v]; p < deg[v + 1]; ++p) {
+                const int w = adj[p];
+                const int cw = comp[w];
+                if (cw == c) continue;
+                const std::uint64_t* rw = &reach[static_cast<std::size_t>(cw) * words];
+                for (int i = 0; i < words; ++i) rc[i] |= rw[i];
+            }
+        }
+    }
+    for (int k = 0; k < U; ++k) {
+        const int l0 = 2 * k, l1 = 2 * k + 1;
+        const bool f0 = (reach[static_cast<std::size_t>(comp[l0]) * words + (l1 >> 6)] >> (l1 & 63)) & 1;  // l0 -> l1: l0 false
+        const bool f1 = (reach[static_cast<std::size_t>(comp[l1]) * words + (l0 >> 6)] >> (l0 & 63)) & 1;  // l1 -> l0: l1 false
+        if (f0 && f1) return false;
+        if (f0) forced.emplace_back(trail_pack(unknown_coords[k].first, unknown_coords[k].second), FULL);
+        else if (f1) forced.emplace_back(trail_pack(unknown_coords[k].first, unknown_coords[k].second), EMPTY);
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,6 +1243,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
 
         int best_pixels = -1;
         int best_other = INT_MAX;          // the larger probe fill of the best cell
+        int best_lo = -1;                  // the smaller one (ANYTIME_TB experiment)
         double best_score = -HUGE_VAL;     // BRANCH_K experiment only
         bool have_best = false;
         // Forced cells are committed in place and the pass continues; the
@@ -1059,6 +1251,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         // (see the restart below), not once per forced cell.
         bool committed = false;
         const std::int8_t* pxs = pic.pixels.data();
+        if (g_debug_impl) { g_impl_rec.clear(); g_impl_off.clear(); }
 
         for (int idx : order) {
             int row = unknown_coords[idx].first;
@@ -1117,6 +1310,8 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             bool better;
             if (state.keep_probing) {
                 better = hi > best_pixels;
+                if (g_anytime_tb == 1) better = better || (hi == best_pixels && lo > best_lo);
+                if (g_anytime_tb == 2) better = better || (hi == best_pixels && lo < best_lo);
             } else if (g_branch_k_set) {
                 const double sc = g_branch_k * lo - hi;
                 better = sc > best_score;
@@ -1127,9 +1322,10 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             if (better) {
                 best_pixels = state.keep_probing ? hi : lo;
                 best_other = hi;
+                best_lo = lo;
                 best_row = row;
                 best_col = col;
-                best_first_val = (f >= e) ? FULL : EMPTY;
+                best_first_val = ((f >= e) != g_first_val_low) ? FULL : EMPTY;
                 have_best = true;
             }
         }
@@ -1147,10 +1343,43 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         if (!have_best) {
             return true;
         }
+        if (g_debug_impl) {
+            static thread_local std::vector<std::pair<int, std::int8_t>> forced;
+            ++g_stat_impl_nodes;
+            const bool alive = impl_analyze(pic, unknown_coords, forced);
+            if (!alive) ++g_stat_impl_dead;
+            if (!forced.empty()) { ++g_stat_impl_nodes_forced; g_stat_impl_forced += forced.size(); }
+            if (g_debug_impl >= 2) {
+                if (!alive) return true;
+                if (!forced.empty()) {
+                    state.mark_contradiction();
+                    for (auto& fc : forced) {
+                        const int r = trail_row(fc.first), c = trail_col(fc.first);
+                        if (pxs[r * W + c] != UNKNOWN) {
+                            if (pxs[r * W + c] != fc.second) return true;  // dead
+                            continue;
+                        }
+                        pic.set_known(r, c, fc.second);
+                        trail.changed_cell_indices.push_back(fc.first);
+                        pic.mark_row_dirty(r);
+                        pic.mark_col_dirty(c);
+                        while (pic.has_dirty()) {
+                            if (!solve_lines(mapped_rows, pic, true, trail)) return true;
+                            if (!solve_lines(mapped_cols, pic, false, trail)) return true;
+                        }
+                    }
+                    return solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
+                }
+            }
+        }
     }
 
     state.mark_backtrack();
     if (g_debug_stats) ++g_stat_nodes;
+    const std::uint64_t nodes_before = g_stat_all_nodes;
+    const int sols_before = state.solutions_found;
+    const bool latched_here = state.skip_probing;
+    if (g_debug_stats) ++g_stat_all_nodes;
 
     const int row = best_row;
     const int col = best_col;
@@ -1181,6 +1410,15 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         revert_branch(pic, trail, mark, saved_unknown_count);
     }
 
+    if (latched_here) {
+        const bool dead = state.solutions_found == sols_before;
+        state.note_latched_subtree(dead);
+        if (g_debug_stats) {
+            const std::uint64_t n = g_stat_all_nodes - nodes_before;
+            int b = 0; while ((n >> (b + 1)) != 0 && b < 39) ++b;
+            if (dead) ++g_stat_dead_hist[b]; else ++g_stat_live_hist[b];
+        }
+    }
     return true;
 }
 
@@ -1348,7 +1586,18 @@ void solve(const std::vector<std::vector<int>>& rows,
         for (int i = 0; i < 64; ++i) {
             if (g_stat_probe_lookups_hist[i]) std::fprintf(stderr, " %d:%llu", i, static_cast<unsigned long long>(g_stat_probe_lookups_hist[i]));
         }
+        std::fprintf(stderr, "\ncache-stats: probe-pairs=%llu with-contradiction=%llu\n",
+                     static_cast<unsigned long long>(g_stat_probe_pairs), static_cast<unsigned long long>(g_stat_probe_hits));
+        std::fprintf(stderr, "cache-stats: solutions_found=%d skip_probing=%d\n", state.solutions_found, static_cast<int>(state.skip_probing));
+        std::fprintf(stderr, "cache-stats: latched subtrees dead[log2 size:count]:");
+        for (int i = 0; i < 40; ++i) if (g_stat_dead_hist[i]) std::fprintf(stderr, " %d:%llu", i, static_cast<unsigned long long>(g_stat_dead_hist[i]));
+        std::fprintf(stderr, "\ncache-stats: latched subtrees live[log2 size:count]:");
+        for (int i = 0; i < 40; ++i) if (g_stat_live_hist[i]) std::fprintf(stderr, " %d:%llu", i, static_cast<unsigned long long>(g_stat_live_hist[i]));
         std::fprintf(stderr, "\n");
+        if (g_debug_impl) std::fprintf(stderr, "impl-stats: nodes=%llu nodes-with-forced=%llu forced-cells=%llu dead=%llu edges=%llu\n",
+            static_cast<unsigned long long>(g_stat_impl_nodes), static_cast<unsigned long long>(g_stat_impl_nodes_forced),
+            static_cast<unsigned long long>(g_stat_impl_forced), static_cast<unsigned long long>(g_stat_impl_dead),
+            static_cast<unsigned long long>(g_stat_impl_edges));
     }
 
     if (out_strategy != nullptr) {
