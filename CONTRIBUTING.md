@@ -143,10 +143,10 @@ bench/nodes.py --compare bench/results/a-nodes.jsonl bench/results/b-nodes.jsonl
 ```
 
 Two things to know when reading those numbers. The corpus's two largest
-trees (`hard/6689`, `medium/3929`) run with probing shut off after the
+trees (`easy_large/6689`, `easy_large/3929`) run with probing shut off after the
 first few nodes, so the branch heuristic barely touches them; the unique-
-solution puzzles that do exercise it are `extreme/6574`, `easy_large/5281`
-and, outside the corpus, `in_progress/8098` (9-Dom). And the survey puzzles
+solution puzzles that do exercise it are `easy_large/6574`, `easy_large/5281`
+and `easy_medium/8098` (9-Dom). And the survey puzzles
 in `bench/survey/` have many solutions, so a `--max 2` run there measures
 how soon the branch order finds a second solution, not the tree size.
 `bench/nodes.py --env NAME=value` passes the stats build's experiment

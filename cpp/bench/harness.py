@@ -25,12 +25,12 @@ GATE = [
     "easy_large/3250", "easy_large/3162", "easy_large/3094", "easy_large/2606",
     "easy_large/2040", "easy_large/2403", "easy_large/3371", "easy_large/1837",
     "easy_large/3379", "easy_large/4758", "easy_large/803", "easy_large/6727",
-    "medium/108", "medium/3163",
+    "easy_medium/108", "easy_large/3163",
 ]
 # Bench: timing targets. (path, extra_args)
 BENCH = [
-    ("medium/108", []),       # enumeration, 564k solutions
-    ("medium/3163", []),      # single-solution deep backtrack
+    ("easy_medium/108", []),       # enumeration, 564k solutions
+    ("easy_large/3163", []),      # single-solution deep backtrack
     ("easy_large/6727", []),  # small enumeration
     ("easy_large/803", []),   # contra-heavy single solution
 ]

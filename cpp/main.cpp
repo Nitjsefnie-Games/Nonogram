@@ -291,7 +291,9 @@ int main(int argc, char** argv) {
                     print_count = 0;
                 }
             }
-        } else if (solution_count % print_count_threshold == 0) {
+        } else if (solution_count == 1 || solution_count % print_count_threshold == 0) {
+            // The first solution is always announced, so a run cut off by a
+            // timeout still shows whether any solution was found.
             stamp();
             std::printf("%s (%s/s, %.1fs%s) ",
                         fmt_int_commas(solution_count).c_str(),
