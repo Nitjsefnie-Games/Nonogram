@@ -1,6 +1,7 @@
 #include "lines.hpp"
 #include "types.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstddef>
 #include <vector>
@@ -105,7 +106,6 @@ void solve_line_batch_1w(const std::int8_t* line, std::size_t n,
 
     g_scratch.ensure(n + 1, 1);
     std::uint64_t* fwd = g_scratch.forward.data();
-    std::uint64_t* bwd = g_scratch.backward.data();
 
     // Per-cell-value mask tables make both DP sweeps branch-free: the cell
     // values along a line are data-dependent and mispredict badly otherwise.
@@ -129,32 +129,34 @@ void solve_line_batch_1w(const std::int8_t* line, std::size_t n,
         return;  // unsat
     }
 
-    bwd[n] = accept;
-    for (std::size_t pi = n; pi-- > 0; ) {
-        const std::uint64_t cur = bwd[pi + 1];
-        const int v = line[pi];
-        bwd[pi] = (cur & stay[v]) | ((cur & step[v]) >> 1);
-    }
-
-    // Branch-free collection: every cell writes a candidate into the next
-    // output slot and the cursor advances only for an UNKNOWN cell that is
-    // determined (exactly one of can_empty / can_full). Whether a cell is
-    // unknown or determined is data-dependent noise to the branch predictor.
+    // Backward sweep fused with the deduction pass: at position p the sweep
+    // holds bwd[p+1] (cur) and fwd[p] is already stored, which is all a
+    // deduction needs, so the third pass over the line goes away. The
+    // backward state itself only needs to be kept in a register.
+    //
+    // Deductions are collected branch-free: every cell writes a candidate
+    // into the next output slot and the cursor advances only for an UNKNOWN
+    // cell that is determined (exactly one of can_empty / can_full). The
+    // sweep runs high-to-low, so they land in descending position order and
+    // are reversed at the end to keep the ascending order consumers expect.
     result.deductions.resize(n);
     int* out = result.deductions.data();
     std::size_t k = 0;
-    for (std::size_t p = 0; p < n; ++p) {
-        const std::uint64_t bw = bwd[p + 1];
-        const std::uint64_t f = fwd[p];
-        const std::uint64_t bw_empty = bw & em;
-        const std::uint64_t bw_full = bw & fm;
+    std::uint64_t cur = accept;
+    for (std::size_t pi = n; pi-- > 0; ) {
+        const int v = line[pi];
+        const std::uint64_t f = fwd[pi];
+        const std::uint64_t bw_empty = cur & em;
+        const std::uint64_t bw_full = cur & fm;
         const int can_empty = (f & (bw_empty | (bw_empty >> 1))) != 0;
         const int can_full = (f & (bw_full >> 1)) != 0;
         // FULL iff can_full (when determined, exactly one is set).
-        out[k] = deduce_pack(static_cast<int>(p), static_cast<std::int8_t>(can_full));
-        k += static_cast<std::size_t>((line[p] == UNKNOWN) & (can_empty ^ can_full));
+        out[k] = deduce_pack(static_cast<int>(pi), static_cast<std::int8_t>(can_full));
+        k += static_cast<std::size_t>((v == UNKNOWN) & (can_empty ^ can_full));
+        cur = (cur & stay[v]) | ((cur & step[v]) >> 1);
     }
     result.deductions.resize(k);
+    std::reverse(result.deductions.begin(), result.deductions.end());
     result.total = 1;
 }
 }  // namespace
