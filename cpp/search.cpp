@@ -191,10 +191,14 @@ struct SlotBuf {
     void allocate(std::size_t n) {
         release();
         void* mem = nullptr;
-        if (posix_memalign(&mem, kHugePage, n) != 0) throw std::bad_alloc();
+        // Hugepage alignment only once the table is hugepage-sized: a 2 MB
+        // alignment on a small table faults in a whole zeroed hugepage, which
+        // showed up as ~0.3 ms of startup on puzzles that solve in 0.1 ms.
+        const std::size_t align = (n >= kHugePage) ? kHugePage : 64;
+        if (posix_memalign(&mem, align, n) != 0) throw std::bad_alloc();
         p = static_cast<unsigned char*>(mem);
         bytes = n;
-        madvise(p, n, MADV_HUGEPAGE);  // advisory; failure is harmless
+        if (n >= kHugePage) madvise(p, n, MADV_HUGEPAGE);  // advisory; failure is harmless
     }
     void swap(SlotBuf& o) { std::swap(p, o.p); std::swap(bytes, o.bytes); }
 };
@@ -307,7 +311,7 @@ public:
     }
 
 private:
-    static constexpr std::size_t kMinSlots = 1u << 14;  // 1 MB
+    static constexpr std::size_t kMinSlots = 1u << 12;  // 128 KB at 32-byte slots
 
     std::uint64_t hash(const std::uint64_t* key, std::uint16_t tag) const {
         namespace wy = ankerl::unordered_dense::detail::wyhash;
