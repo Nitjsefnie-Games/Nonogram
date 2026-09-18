@@ -239,6 +239,8 @@ public:
         return static_cast<std::uint16_t>(tag | ((h >> 58) << 10));
     }
 
+    // On a miss, remembers the empty slot it stopped at so the insert that
+    // follows need not hash and walk the probe sequence a second time.
     unsigned char* find(const std::uint64_t* key, std::uint16_t tag) {
         const std::uint64_t h = hash(key, tag);
         std::size_t idx = h & mask_;
@@ -246,7 +248,7 @@ public:
         for (;;) {
             unsigned char* s = slot(idx);
             const std::uint16_t t = load_u16(s + hdr_);
-            if (t == kEmptyTag) return nullptr;
+            if (t == kEmptyTag) { miss_slot_ = s; miss_tag_ = tag; return nullptr; }
             if (t == tag && keys_equal(s, key)) return s;
             idx = (idx + 1) & mask_;
         }
@@ -255,17 +257,23 @@ public:
     // Inserts a fresh entry (precondition: find() returned nullptr) and returns
     // its slot. May grow or generationally clear the table.
     unsigned char* insert(const std::uint64_t* key, std::uint16_t tag, const LineSolveResult& res) {
+        unsigned char* s;
+        std::uint16_t ftag;
         if ((count_ + 1) * 3 > nslots_) {  // load factor <= 1/3
             if (nslots_ >= max_slots_) {
                 clear_slots();  // OOM-safe generational eviction (cold path)
             } else {
                 grow();
             }
+            const std::uint64_t h = hash(key, tag);
+            s = free_slot(h);
+            ftag = full_tag(tag, h);
+        } else {
+            s = miss_slot_;  // precondition: find(key, tag) just missed
+            ftag = miss_tag_;
         }
-        const std::uint64_t h = hash(key, tag);
-        unsigned char* s = free_slot(h);
         std::memcpy(s, key, hdr_);
-        store_u16(s + hdr_, full_tag(tag, h));
+        store_u16(s + hdr_, ftag);
         const std::size_t n = res.deductions.size();
         if (g_debug_stats) ++g_stat_ded_hist[n];
         s[hdr_ + 2] = static_cast<std::uint8_t>(n);
@@ -354,6 +362,8 @@ private:
         }
     }
 
+    unsigned char* miss_slot_ = nullptr;
+    std::uint16_t miss_tag_ = 0;
     int kw_ = 1;
     std::size_t hdr_ = 8;
     unsigned slot_shift_ = 5;
@@ -698,6 +708,7 @@ bool solve_lines(const std::vector<const LineSpec*>& mapped,
             write_intersection(r, index, pic, is_row, trail);
         }
     }
+    queue.reset();
     return true;
 }
 
@@ -756,11 +767,13 @@ struct ProbeGuard {
             pic.row_queue.pop_front();
             pic.row_dirty[i] = 0;
         }
+        pic.row_queue.reset();
         while (!pic.col_queue.empty()) {
             int j = pic.col_queue.front();
             pic.col_queue.pop_front();
             pic.col_dirty[j] = 0;
         }
+        pic.col_queue.reset();
     }
 };
 
@@ -830,11 +843,13 @@ void revert_branch(Picture& pic,
         pic.row_queue.pop_front();
         pic.row_dirty[i] = 0;
     }
+    pic.row_queue.reset();
     while (!pic.col_queue.empty()) {
         int j = pic.col_queue.front();
         pic.col_queue.pop_front();
         pic.col_dirty[j] = 0;
     }
+    pic.col_queue.reset();
 }
 
 bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
