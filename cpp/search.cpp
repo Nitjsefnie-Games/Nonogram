@@ -281,6 +281,42 @@ constexpr std::size_t g_probe_window = 100;
 constexpr double g_probe_thresh = 0.01;
 #endif
 std::uint64_t g_stat_probe_pairs = 0, g_stat_probe_hits = 0;  // probe pairs, and those with a contradiction
+// Clues of the puzzle being solved (stats build: search-area report).
+const std::vector<std::vector<int>>* g_row_clues = nullptr;
+const std::vector<std::vector<int>>* g_col_clues = nullptr;
+
+// Number of placements of `clue` on a line of n cells read at stride
+// `step` from `cells`, consistent with its known cells. Plain DP over
+// (position, next block); double because the count can exceed 2^63.
+double count_line_completions(const std::int8_t* cells, std::size_t step, int n, const std::vector<int>& clue) {
+    const int k = static_cast<int>(clue.size());
+    auto at = [&](int i) { return cells[static_cast<std::size_t>(i) * step]; };
+    // no_full[i] = no FULL cell in i..n-1
+    std::vector<char> no_full(static_cast<std::size_t>(n) + 1, 1);
+    for (int i = n - 1; i >= 0; --i) no_full[i] = no_full[i + 1] && at(i) != FULL;
+    // f[i][j]: ways to fill cells i..n-1 with blocks j..k-1
+    std::vector<double> f(static_cast<std::size_t>(n + 2) * (k + 1), 0.0);
+    auto F = [&](int i, int j) -> double& { return f[static_cast<std::size_t>(i) * (k + 1) + j]; };
+    for (int i = n; i >= 0; --i) {
+        for (int j = k; j >= 0; --j) {
+            if (j == k) { F(i, j) = no_full[i] ? 1.0 : 0.0; continue; }
+            if (i >= n) { F(i, j) = 0.0; continue; }
+            double v = 0.0;
+            if (at(i) != FULL) v += F(i + 1, j);
+            const int b = clue[j], end = i + b;
+            if (end <= n) {
+                bool ok = true;
+                for (int t = i; t < end && ok; ++t) ok = at(t) != EMPTY;
+                if (ok) {
+                    if (end == n) v += (j + 1 == k) ? 1.0 : 0.0;
+                    else if (at(end) != FULL) v += F(end + 1, j + 1);
+                }
+            }
+            F(i, j) = v;
+        }
+    }
+    return F(0, 0);
+}
 // Dead-subtree histogram for latched (no-probing) branch nodes: bucket i
 // holds subtrees of 2^i .. 2^(i+1)-1 nodes that found no solution.
 std::uint64_t g_stat_dead_hist[40] = {};
@@ -1430,6 +1466,22 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         }
     }
 
+    if (g_debug_stats && !state.used_backtrack) {
+        // Search area at the first branch, after root propagation and
+        // probing settled all they can: unknown cells, and the number of
+        // clue placements still consistent with each line, as log2 of the
+        // product over rows and over columns (min of the two bounds the
+        // number of grids the search can visit).
+        double lr = 0.0, lc = 0.0;
+        for (int r = 0; r < H; ++r) lr += std::log2(count_line_completions(pic.pixels.data() + static_cast<std::size_t>(r) * W, 1, W, (*g_row_clues)[r]));
+        std::vector<std::int8_t> col(static_cast<std::size_t>(H));
+        for (int c = 0; c < W; ++c) {
+            for (int r = 0; r < H; ++r) col[r] = pic.pixels[static_cast<std::size_t>(r) * W + c];
+            lc += std::log2(count_line_completions(col.data(), 1, H, (*g_col_clues)[c]));
+        }
+        std::fprintf(stderr, "cache-stats: search-area=%d of %d cells; log2 placements rows=%.1f cols=%.1f min=%.1f\n",
+                     pic.unknown_count, H * W, lr, lc, std::min(lr, lc));
+    }
     state.mark_backtrack();
     if (g_debug_stats) ++g_stat_nodes;
     const std::uint64_t nodes_before = g_stat_all_nodes;
@@ -1623,6 +1675,8 @@ void solve(const std::vector<std::vector<int>>& rows,
 
     SolveState state;
     state.keep_probing = anytime;
+    g_row_clues = &rows;
+    g_col_clues = &cols;
     // The stats build's BRANCH_K knob is the same switch, for bench/nodes.py.
     state.balance_k = g_branch_k_set ? g_branch_k : balance_k;
     Trail trail;
