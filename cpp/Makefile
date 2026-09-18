@@ -47,6 +47,8 @@ pgo: pgo-clean
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -fprofile-generate=$(PGO_DIR) $(SRCS) -o solver
 	@echo "=== PGO Stage 2: train on representative puzzles ==="
 	./solver ../nonograms/easy_medium/108 --max 200000 > /dev/null
+	./solver ../nonograms/easy_medium/108 > /dev/null
+	MAX_NODES=300000 ./solver ../nonograms/partially_solved/3867 > /dev/null
 	./solver ../nonograms/partially_solved/pikachu --anytime --max 30000 > /dev/null
 	./solver ../nonograms/easy_large/4 > /dev/null
 	./solver ../nonograms/easy_medium/63 > /dev/null
