@@ -198,6 +198,22 @@ class ExternalSolverTimeout(Exception):
     found_solution = False  # set from the solver's partial output
 
 
+def _has_a_solution(cmd, puzzle_path, timeout_s):
+    """True if `cmd --anytime --max 1` prints a Found line within timeout_s."""
+    try:
+        proc = subprocess.run(
+            [cmd, puzzle_path, "--anytime", "--max", "1"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    return re.search(r"^Found\s+[1-9]", proc.stdout, re.MULTILINE) is not None
+
+
 def _solve_via_external(cmd, puzzle_path, timeout_s=None):
     """Run an external solver binary on `puzzle_path` and parse its stdout.
 
@@ -226,10 +242,14 @@ def _solve_via_external(cmd, puzzle_path, timeout_s=None):
         err = ExternalSolverTimeout(
             f"external solver {cmd!r} exceeded {timeout_s}s on {puzzle_path!r}"
         )
-        # The solver announces the first solution and then progress
+        # An enumerating run announces the first solution and then progress
         # batches as "<count> (<rate>/s, ...)"; any such entry means at
-        # least one solution was found before the cut-off.
+        # least one solution was found before the cut-off. A count-mode run
+        # (the default) prints no solutions, so ask for one directly: a
+        # short --anytime --max 1 run that finds one settles it.
         err.found_solution = re.search(r"(^|\s)[\d,]+ \(", partial) is not None
+        if not err.found_solution:
+            err.found_solution = _has_a_solution(cmd, puzzle_path, min(60.0, timeout_s or 60.0))
         raise err
     if proc.returncode != 0:
         raise RuntimeError(
