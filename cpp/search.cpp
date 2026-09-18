@@ -158,7 +158,11 @@ LineCache g_legacy_cache;
 //
 // Slot layout (byte offsets, kw = key words, S = slot bytes):
 //   [0, 8kw)        key words
-//   [8kw, 8kw+2)    tag (uint16; kEmptyTag marks a free slot)
+//   [8kw, 8kw+2)    tag: bits 0-9 spec id * 2 + orientation, bits 10-15 a
+//                   hash fingerprint (kEmptyTag marks a free slot). Many
+//                   entries share a spec, so the id alone let most same-spec
+//                   probe neighbours through to the key compare; the
+//                   fingerprint rejects 63/64 of them on the tag word.
 //   [8kw+2]         deduction count
 //   [8kw+3]         flags: bit0 = line satisfiable, bit1 = deductions spilled
 //   [8kw+4, S)      deductions inline, or (spilled) uint32 offset into arena_
@@ -231,8 +235,14 @@ public:
     const std::uint8_t* arena() const { return arena_.data(); }
 
     // Returns the slot holding (key, tag), or nullptr.
+    static std::uint16_t full_tag(std::uint16_t tag, std::uint64_t h) {
+        return static_cast<std::uint16_t>(tag | ((h >> 58) << 10));
+    }
+
     unsigned char* find(const std::uint64_t* key, std::uint16_t tag) {
-        std::size_t idx = hash(key, tag) & mask_;
+        const std::uint64_t h = hash(key, tag);
+        std::size_t idx = h & mask_;
+        tag = full_tag(tag, h);
         for (;;) {
             unsigned char* s = slot(idx);
             const std::uint16_t t = load_u16(s + hdr_);
@@ -245,16 +255,17 @@ public:
     // Inserts a fresh entry (precondition: find() returned nullptr) and returns
     // its slot. May grow or generationally clear the table.
     unsigned char* insert(const std::uint64_t* key, std::uint16_t tag, const LineSolveResult& res) {
-        if ((count_ + 1) * 2 > nslots_) {
+        if ((count_ + 1) * 3 > nslots_) {  // load factor <= 1/3
             if (nslots_ >= max_slots_) {
                 clear_slots();  // OOM-safe generational eviction (cold path)
             } else {
                 grow();
             }
         }
-        unsigned char* s = free_slot(key, tag);
+        const std::uint64_t h = hash(key, tag);
+        unsigned char* s = free_slot(h);
         std::memcpy(s, key, hdr_);
-        store_u16(s + hdr_, tag);
+        store_u16(s + hdr_, full_tag(tag, h));
         const std::size_t n = res.deductions.size();
         if (g_debug_stats) ++g_stat_ded_hist[n];
         s[hdr_ + 2] = static_cast<std::uint8_t>(n);
@@ -306,8 +317,8 @@ private:
 
     unsigned char* slot(std::size_t idx) const { return buf_.p + (idx << slot_shift_); }
 
-    unsigned char* free_slot(const std::uint64_t* key, std::uint16_t tag) {
-        std::size_t idx = hash(key, tag) & mask_;
+    unsigned char* free_slot(std::uint64_t h) {
+        std::size_t idx = h & mask_;
         while (load_u16(slot(idx) + hdr_) != kEmptyTag) idx = (idx + 1) & mask_;
         return slot(idx);
     }
@@ -338,7 +349,7 @@ private:
             if (t == kEmptyTag) continue;
             std::uint64_t key[kMaxFastCells / 32];
             std::memcpy(key, s, hdr_);
-            std::memcpy(free_slot(key, t), s, slot_bytes);
+            std::memcpy(free_slot(hash(key, static_cast<std::uint16_t>(t & 0x3FF))), s, slot_bytes);
             ++count_;
         }
     }
@@ -841,16 +852,21 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
 
     // Per-row / per-col UNKNOWN counts, used as the "most constrained line"
     // signal in the composite sort key (lower => more constrained line).
+    // Branch-free counting: the unknown/known pattern along a row is data-
+    // dependent and mispredicts if tested per cell.
     int n_unknown = 0;
+    int* uir = unknowns_in_row.data();
+    int* uic = unknowns_in_col.data();
     for (int r = 0; r < H; ++r) {
         const std::int8_t* row_px = px + static_cast<std::size_t>(r) * W;
+        int row_n = 0;
         for (int c = 0; c < W; ++c) {
-            if (row_px[c] == UNKNOWN) {
-                unknowns_in_row[r] += 1;
-                unknowns_in_col[c] += 1;
-                ++n_unknown;
-            }
+            const int u = row_px[c] == UNKNOWN;
+            row_n += u;
+            uic[c] += u;
         }
+        uir[r] = row_n;
+        n_unknown += row_n;
     }
 
     if (n_unknown == 0) {
@@ -918,14 +934,14 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             for (int c = 0; c < W; ++c) {
                 if (row_px[c] != UNKNOWN) continue;
                 unknown_coords.emplace_back(r, c);
-                int lc = unknowns_in_row[r] + unknowns_in_col[c];
+                int lc = uir[r] + uic[c];
                 int e = lc * 5 + (4 - neighbor_score(r, c));
                 enc.push_back(e);
                 if (e > max_enc) max_enc = e;
             }
         }
 
-        const std::size_t nu = unknown_coords.size();
+        const std::size_t nu = static_cast<std::size_t>(n_unknown);
         static thread_local std::vector<int> order;
         static thread_local std::vector<int> bucket;
         order.resize(nu);
