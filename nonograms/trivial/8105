@@ -1,0 +1,26 @@
+# solver=cpp-b35e477
+# cpu=AMD EPYC Processor (with IBPB)
+# strategy=contra
+# n_solutions=1
+# solve_time=0.00010
+4
+4
+4
+4
+4
+4
+4
+4
+4
+4
+---
+1 1
+1 1 1 1
+1 1 1 1
+1 1 1 2
+1 1 1 1 1
+2 1 2
+2 2 2
+2 2 1
+1 1 1
+1
