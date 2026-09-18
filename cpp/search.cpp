@@ -201,7 +201,14 @@ struct SlotBuf {
 // DEBUG_CACHE_STATS=1: count line-cache lookups / misses and histogram the
 // deduction count of inserted entries, printed to stderr when solve() returns.
 // Inert when unset.
+// (Needs a `make stats` build, -DNONOGRAM_STATS. In the default build the
+// flag is a constexpr false so every counter folds away: the run-time checks
+// alone measured 3% of instructions on the anytime hot path.)
+#ifdef NONOGRAM_STATS
 const bool g_debug_stats = std::getenv("DEBUG_CACHE_STATS") != nullptr;
+#else
+constexpr bool g_debug_stats = false;
+#endif
 std::uint64_t g_stat_lookups = 0;
 std::uint64_t g_stat_misses = 0;
 std::uint64_t g_stat_probes = 0;
@@ -384,6 +391,11 @@ bool g_fast_mode = false;
 // their lengths differ. On square puzzles they can, so the bit is dropped
 // there to keep the legacy cache's sharing.
 std::uint16_t g_tag_col_bit = 1;
+// Tag per row / per column (spec id * 2 + orientation bit), precomputed in
+// solve() so the hit path reads one uint16 instead of dereferencing the
+// LineSpec for its id -- a dependent load ahead of the hash.
+std::vector<std::uint16_t> g_row_tags;
+std::vector<std::uint16_t> g_col_tags;
 
 // LINE_CACHE_LEGACY=1 forces the string-keyed cache (the fallback for lines
 // longer than kMaxFastCells) on every puzzle; used to differential-test the two.
@@ -608,7 +620,7 @@ inline BatchResult solve_one_batch(const LineSpec& spec,
     const int kw = pic.key_words;
     const std::uint64_t* key =
         (is_col ? pic.col_keys.data() : pic.row_keys.data()) + static_cast<std::size_t>(index) * kw;
-    const std::uint16_t tag = static_cast<std::uint16_t>(spec.id * 2 + (is_col ? g_tag_col_bit : 0));
+    const std::uint16_t tag = (is_col ? g_col_tags : g_row_tags)[static_cast<std::size_t>(index)];
 
     if (g_debug_stats) ++g_stat_lookups;
     unsigned char* s = g_fast_cache.find(key, tag);
@@ -1194,6 +1206,12 @@ void solve(const std::vector<std::vector<int>>& rows,
     std::vector<const LineSpec*> mapped_cols;
     mapped_cols.reserve(cols.size());
     for (const auto& clue : cols) mapped_cols.push_back(get_spec(clue));
+    g_row_tags.resize(mapped_rows.size());
+    for (std::size_t i = 0; i < mapped_rows.size(); ++i)
+        g_row_tags[i] = static_cast<std::uint16_t>(mapped_rows[i]->id * 2);
+    g_col_tags.resize(mapped_cols.size());
+    for (std::size_t i = 0; i < mapped_cols.size(); ++i)
+        g_col_tags[i] = static_cast<std::uint16_t>(mapped_cols[i]->id * 2 + g_tag_col_bit);
 
     SolveState state;
     state.keep_probing = anytime;
@@ -1266,6 +1284,12 @@ double estimate_solutions(const std::vector<std::vector<int>>& rows,
     std::vector<const LineSpec*> mapped_cols;
     mapped_cols.reserve(cols.size());
     for (const auto& clue : cols) mapped_cols.push_back(get_spec(clue));
+    g_row_tags.resize(mapped_rows.size());
+    for (std::size_t i = 0; i < mapped_rows.size(); ++i)
+        g_row_tags[i] = static_cast<std::uint16_t>(mapped_rows[i]->id * 2);
+    g_col_tags.resize(mapped_cols.size());
+    for (std::size_t i = 0; i < mapped_cols.size(); ++i)
+        g_col_tags[i] = static_cast<std::uint16_t>(mapped_cols[i]->id * 2 + g_tag_col_bit);
 
     std::mt19937_64 rng(seed);
     double sum = 0.0;

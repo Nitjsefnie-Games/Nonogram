@@ -22,7 +22,14 @@ solver: $(OBJS)
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) solver
+	rm -f $(OBJS) solver solver-stats
+
+# Diagnostic build: DEBUG_CACHE_STATS=1 prints line-cache and probe
+# statistics to stderr. Separate binary because the counters cost ~3% of
+# instructions on the hot path when compiled in.
+stats: solver-stats
+solver-stats: $(SRCS) $(wildcard *.hpp)
+	$(CXX) $(CXXFLAGS) -DNONOGRAM_STATS $(SRCS) -o $@
 
 # Both stages link to the SAME output name: gcc derives the .gcda file names
 # from it (<output>-<source>.gcda), so an instrumented "solver-instrumented"
@@ -45,4 +52,4 @@ pgo: pgo-clean
 pgo-clean:
 	rm -rf $(PGO_DIR) solver-instrumented
 
-.PHONY: all clean pgo pgo-clean
+.PHONY: all clean pgo pgo-clean stats
