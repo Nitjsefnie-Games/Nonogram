@@ -9,6 +9,8 @@
 // Used for the line-batch memoization cache in this file.
 #include "external/ankerl/unordered_dense.h"
 
+#include <sys/mman.h>
+
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
@@ -141,26 +143,65 @@ LineCache g_legacy_cache;
 // Keyed on Picture's incrementally-maintained 2-bit packed line keys plus a
 // 16-bit tag (spec id, row/col), so a lookup hashes key_words machine words
 // instead of the line's bytes and never gathers a column. Open addressing
-// with linear probing over 64-byte slots that hold the key, the tag and the
+// with linear probing over fixed-size slots that hold the key, the tag and the
 // deductions INLINE (one byte each: pos | val << 7), so a hit touches exactly
 // one cache line. The previous map paid three to four dependent misses per
 // lookup (bucket, value entry, heap key string, deductions vector).
 //
-// Slot layout (byte offsets, kw = key words):
+// Slots are 32 bytes for keys of up to 2 words (lines <= 64 cells), 64 bytes
+// beyond. On a deep enumeration the hot table is far larger than L3, so the
+// slot size sets the working set: with 32-byte slots pikachu's ~1.8M-entry
+// table is ~58 MB instead of ~115 MB. Measured on pikachu, 97% of entries
+// carry <= 12 deductions, the inline room a 32-byte slot leaves for a 2-word
+// key; the rest spill to an arena and pay one extra miss on a hit.
+// The table is mapped with MADV_HUGEPAGE so lookups do not also miss the TLB.
+//
+// Slot layout (byte offsets, kw = key words, S = slot bytes):
 //   [0, 8kw)        key words
 //   [8kw, 8kw+2)    tag (uint16; kEmptyTag marks a free slot)
 //   [8kw+2]         deduction count
 //   [8kw+3]         flags: bit0 = line satisfiable, bit1 = deductions spilled
-//   [8kw+4, 64)     deductions inline, or (spilled) uint32 offset into arena_
+//   [8kw+4, S)      deductions inline, or (spilled) uint32 offset into arena_
 // ---------------------------------------------------------------------------
 
 constexpr int kMaxFastCells = 128;   // 7-bit positions in the deduction bytes
-constexpr std::size_t kSlotBytes = 64;
 constexpr std::uint16_t kEmptyTag = 0xFFFF;
 constexpr std::uint8_t kFlagSat = 1;
 constexpr std::uint8_t kFlagSpilled = 2;
+constexpr std::size_t kHugePage = 2u << 20;
 
-struct alignas(64) Slot { unsigned char b[kSlotBytes]; };
+// Page-aligned, hugepage-advised byte buffer for the slot table.
+struct SlotBuf {
+    unsigned char* p = nullptr;
+    std::size_t bytes = 0;
+    SlotBuf() = default;
+    SlotBuf(const SlotBuf&) = delete;
+    SlotBuf& operator=(const SlotBuf&) = delete;
+    ~SlotBuf() { release(); }
+    void release() {
+        if (p != nullptr) std::free(p);
+        p = nullptr;
+        bytes = 0;
+    }
+    void allocate(std::size_t n) {
+        release();
+        void* mem = nullptr;
+        if (posix_memalign(&mem, kHugePage, n) != 0) throw std::bad_alloc();
+        p = static_cast<unsigned char*>(mem);
+        bytes = n;
+        madvise(p, n, MADV_HUGEPAGE);  // advisory; failure is harmless
+    }
+    void swap(SlotBuf& o) { std::swap(p, o.p); std::swap(bytes, o.bytes); }
+};
+
+// DEBUG_CACHE_STATS=1: count line-cache lookups / misses and histogram the
+// deduction count of inserted entries, printed to stderr when solve() returns.
+// Inert when unset.
+const bool g_debug_stats = std::getenv("DEBUG_CACHE_STATS") != nullptr;
+std::uint64_t g_stat_lookups = 0;
+std::uint64_t g_stat_misses = 0;
+std::uint64_t g_stat_probes = 0;
+std::uint64_t g_stat_ded_hist[kMaxFastCells + 1] = {};
 
 inline std::uint16_t load_u16(const unsigned char* p) { std::uint16_t v; std::memcpy(&v, p, 2); return v; }
 inline std::uint32_t load_u32(const unsigned char* p) { std::uint32_t v; std::memcpy(&v, p, 4); return v; }
@@ -172,8 +213,9 @@ public:
     void init(int key_words, std::size_t budget_bytes) {
         kw_ = key_words;
         hdr_ = 8 * static_cast<std::size_t>(kw_);
-        inline_cap_ = kSlotBytes - hdr_ - 4;
-        std::size_t want = std::max<std::size_t>(budget_bytes / kSlotBytes, kMinSlots);
+        slot_shift_ = (kw_ <= 2) ? 5 : 6;
+        inline_cap_ = (std::size_t{1} << slot_shift_) - hdr_ - 4;
+        std::size_t want = std::max<std::size_t>(budget_bytes >> slot_shift_, kMinSlots);
         max_slots_ = kMinSlots;
         while (max_slots_ * 2 <= want) max_slots_ *= 2;
         alloc(kMinSlots);
@@ -188,7 +230,7 @@ public:
     unsigned char* find(const std::uint64_t* key, std::uint16_t tag) {
         std::size_t idx = hash(key, tag) & mask_;
         for (;;) {
-            unsigned char* s = slots_[idx].b;
+            unsigned char* s = slot(idx);
             const std::uint16_t t = load_u16(s + hdr_);
             if (t == kEmptyTag) return nullptr;
             if (t == tag && keys_equal(s, key)) return s;
@@ -210,6 +252,7 @@ public:
         std::memcpy(s, key, hdr_);
         store_u16(s + hdr_, tag);
         const std::size_t n = res.deductions.size();
+        if (g_debug_stats) ++g_stat_ded_hist[n];
         s[hdr_ + 2] = static_cast<std::uint8_t>(n);
         std::uint8_t flags = res.total ? kFlagSat : 0;
         std::uint8_t* out;
@@ -235,8 +278,14 @@ private:
 
     std::uint64_t hash(const std::uint64_t* key, std::uint16_t tag) const {
         namespace wy = ankerl::unordered_dense::detail::wyhash;
-        std::uint64_t h = wy::mix(static_cast<std::uint64_t>(tag) + 0x9E3779B97F4A7C15ULL,
-                                  0xA0761D6478BD642FULL);
+        // One 64x64->128 multiply-fold covers the common <= 2-word key; the
+        // tag is folded in by a cheap multiply so it perturbs every bit.
+        const std::uint64_t t = static_cast<std::uint64_t>(tag) * 0x9E3779B97F4A7C15ULL;
+        if (kw_ <= 2) {
+            const std::uint64_t k1 = (kw_ == 2) ? key[1] : 0;
+            return wy::mix(key[0] ^ t, k1 ^ 0xE7037ED1A0B428DBULL);
+        }
+        std::uint64_t h = wy::mix(t, 0xA0761D6478BD642FULL);
         for (int w = 0; w < kw_; ++w) h = wy::mix(h ^ key[w], 0xE7037ED1A0B428DBULL);
         return h;
     }
@@ -251,50 +300,54 @@ private:
         return diff == 0;
     }
 
+    unsigned char* slot(std::size_t idx) const { return buf_.p + (idx << slot_shift_); }
+
     unsigned char* free_slot(const std::uint64_t* key, std::uint16_t tag) {
         std::size_t idx = hash(key, tag) & mask_;
-        while (load_u16(slots_[idx].b + hdr_) != kEmptyTag) idx = (idx + 1) & mask_;
-        return slots_[idx].b;
+        while (load_u16(slot(idx) + hdr_) != kEmptyTag) idx = (idx + 1) & mask_;
+        return slot(idx);
     }
 
     void alloc(std::size_t n) {
-        slots_.assign(n, Slot{});
-        std::memset(slots_.data(), 0xFF, n * kSlotBytes);
+        buf_.allocate(n << slot_shift_);
+        std::memset(buf_.p, 0xFF, buf_.bytes);
         nslots_ = n;
         mask_ = n - 1;
         count_ = 0;
     }
 
     void clear_slots() {
-        std::memset(slots_.data(), 0xFF, nslots_ * kSlotBytes);
+        std::memset(buf_.p, 0xFF, buf_.bytes);
         count_ = 0;
         arena_.clear();
     }
 
     void grow() {
-        std::vector<Slot> old;
-        old.swap(slots_);
+        SlotBuf old;
+        old.swap(buf_);
         const std::size_t old_n = nslots_;
+        const std::size_t slot_bytes = std::size_t{1} << slot_shift_;
         alloc(old_n * 2);
         for (std::size_t i = 0; i < old_n; ++i) {
-            const unsigned char* s = old[i].b;
+            const unsigned char* s = old.p + (i << slot_shift_);
             const std::uint16_t t = load_u16(s + hdr_);
             if (t == kEmptyTag) continue;
             std::uint64_t key[kMaxFastCells / 32];
             std::memcpy(key, s, hdr_);
-            std::memcpy(free_slot(key, t), s, kSlotBytes);
+            std::memcpy(free_slot(key, t), s, slot_bytes);
             ++count_;
         }
     }
 
     int kw_ = 1;
     std::size_t hdr_ = 8;
-    std::size_t inline_cap_ = kSlotBytes - 12;
+    unsigned slot_shift_ = 5;
+    std::size_t inline_cap_ = 20;
     std::size_t nslots_ = 0;
     std::size_t mask_ = 0;
     std::size_t count_ = 0;
     std::size_t max_slots_ = kMinSlots;
-    std::vector<Slot> slots_;
+    SlotBuf buf_;
     std::vector<std::uint8_t> arena_;
 };
 
@@ -482,7 +535,8 @@ BatchResult solve_one_batch_legacy(const LineSpec& spec,
     auto& cache = g_legacy_cache;
     const LineSolveResult* result_ptr = cache.find_and_promote(vkey);
     if (result_ptr == nullptr) {
-        LineSolveResult res = solve_line_batch(line, line_n, spec);
+        LineSolveResult res;
+        solve_line_batch(line, line_n, spec, res);
         LineKey okey{std::string(view_bytes), &spec};
         result_ptr = cache.insert(std::move(okey), std::move(res));
     }
@@ -511,11 +565,14 @@ BatchResult solve_one_batch(const LineSpec& spec,
         (is_col ? pic.col_keys.data() : pic.row_keys.data()) + static_cast<std::size_t>(index) * kw;
     const std::uint16_t tag = static_cast<std::uint16_t>(spec.id * 2 + (is_col ? g_tag_col_bit : 0));
 
+    if (g_debug_stats) ++g_stat_lookups;
     unsigned char* s = g_fast_cache.find(key, tag);
     if (s == nullptr) {
+        if (g_debug_stats) ++g_stat_misses;
         std::size_t line_n;
         const std::int8_t* line = line_cells(index, is_col, pic, line_n);
-        LineSolveResult res = solve_line_batch(line, line_n, spec);
+        static thread_local LineSolveResult res;  // capacity reused across misses
+        solve_line_batch(line, line_n, spec, res);
         s = g_fast_cache.insert(key, tag, res);
     }
 
@@ -687,6 +744,7 @@ ProbeResult probe_cell(int row,
     // and reuse its capacity — no per-probe heap allocation.
     static thread_local Trail trail;
     trail.changed_cell_indices.clear();
+    if (g_debug_stats) ++g_stat_probes;
 
     ProbeGuard guard(pic, trail);
 
@@ -1093,6 +1151,17 @@ void solve(const std::vector<std::vector<int>>& rows,
     // Reserve enough headroom that the trail rarely reallocates.
     trail.changed_cell_indices.reserve(static_cast<std::size_t>(H) * static_cast<std::size_t>(W));
     (void)solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
+
+    if (g_debug_stats) {
+        std::fprintf(stderr, "cache-stats: lookups=%llu misses=%llu probes=%llu\ncache-stats: deductions-per-entry histogram:",
+                     static_cast<unsigned long long>(g_stat_lookups),
+                     static_cast<unsigned long long>(g_stat_misses),
+                     static_cast<unsigned long long>(g_stat_probes));
+        for (int i = 0; i <= kMaxFastCells; ++i) {
+            if (g_stat_ded_hist[i]) std::fprintf(stderr, " %d:%llu", i, static_cast<unsigned long long>(g_stat_ded_hist[i]));
+        }
+        std::fprintf(stderr, "\n");
+    }
 
     if (out_strategy != nullptr) {
         // Priority: BACKTRACK > CONTRA > BASIC. Mirrors SolveState.get_strategy()

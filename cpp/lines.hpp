@@ -31,5 +31,7 @@ struct LineSpec {
 
 LineSpec make_line_spec(const std::vector<int>& clue);
 
-LineSolveResult solve_line_batch(const std::int8_t* line, std::size_t n,
-                                 const LineSpec& spec);
+// Solves one line into `out` (cleared first; its capacity is reused across
+// calls so a miss performs no heap allocation).
+void solve_line_batch(const std::int8_t* line, std::size_t n,
+                      const LineSpec& spec, LineSolveResult& out);
