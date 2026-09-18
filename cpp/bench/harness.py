@@ -72,7 +72,7 @@ def do_gate():
     return ok
 
 def do_bench(reps=3):
-    print(f"=== BENCH (timing, reps={reps}, shielded core 5) ===")
+    print(f"=== BENCH (timing, reps={reps}, shielded core via bench/run.sh) ===")
     results = {}
     for p, extra in BENCH:
         ts = []
