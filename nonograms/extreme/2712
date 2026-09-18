@@ -1,3 +1,8 @@
+# solver=cpp-913caba
+# cpu=AMD EPYC Processor (with IBPB)
+# strategy=backtrack
+# n_solutions=11587557534
+# solve_time=4585.75020
 10
 4 5
 3 3
