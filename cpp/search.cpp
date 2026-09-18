@@ -226,6 +226,8 @@ inline void store_u32(unsigned char* p, std::uint32_t v) { std::memcpy(p, &v, 4)
 
 class FastLineCache {
 public:
+    void set_grow_ahead(bool e) { grow_ahead_ = e; }
+
     void init(int key_words, std::size_t budget_bytes) {
         kw_ = key_words;
         hdr_ = 8 * static_cast<std::size_t>(kw_);
@@ -364,7 +366,13 @@ private:
         old.swap(buf_);
         const std::size_t old_n = nslots_;
         const std::size_t slot_bytes = std::size_t{1} << slot_shift_;
-        alloc(old_n * 2);
+        // Every doubling re-walks every entry (a DRAM miss each), so once a
+        // workload has proven large -- and in anytime mode, where it will
+        // keep growing -- jump 8x and skip two of the three intermediate
+        // rehashes. Capped by the budget-derived max_slots_.
+        std::size_t factor = (grow_ahead_ && old_n >= kGrowAheadFrom) ? 8 : 2;
+        while (factor > 2 && old_n * factor > max_slots_) factor /= 2;
+        alloc(old_n * factor);
         for (std::size_t i = 0; i < old_n; ++i) {
             const unsigned char* s = old.p + (i << slot_shift_);
             const std::uint16_t t = load_u16(s + hdr_);
@@ -376,6 +384,8 @@ private:
         }
     }
 
+    static constexpr std::size_t kGrowAheadFrom = 1u << 20;  // slots
+    bool grow_ahead_ = false;
     unsigned char* miss_slot_ = nullptr;
     std::uint16_t miss_tag_ = 0;
     int kw_ = 1;
@@ -411,6 +421,7 @@ void reset_line_cache(int height, int width, std::size_t budget_bytes, bool rese
     g_fast_mode = max_line_len <= kMaxFastCells && std::getenv("LINE_CACHE_LEGACY") == nullptr;
     if (g_fast_mode) {
         g_fast_cache.init((max_line_len + 31) / 32, budget_bytes);
+        g_fast_cache.set_grow_ahead(reserve_enabled);
         g_tag_col_bit = (height != width) ? 1 : 0;
     }
     auto& c = g_legacy_cache;
@@ -584,7 +595,7 @@ BatchResult solve_one_batch_legacy(const LineSpec& spec,
     const LineSolveResult* result_ptr = cache.find_and_promote(vkey);
     if (result_ptr == nullptr) {
         LineSolveResult res;
-        solve_line_batch(line, line_n, spec, res);
+        solve_line_batch(line, line_n, spec, res, true);
         LineKey okey{std::string(view_bytes), &spec};
         result_ptr = cache.insert(std::move(okey), std::move(res));
     }
@@ -612,7 +623,13 @@ BatchResult solve_one_batch_legacy(const LineSpec& spec,
     std::size_t line_n;
     const std::int8_t* line = line_cells(index, is_col, pic, line_n);
     static thread_local LineSolveResult res;  // capacity reused across misses
-    solve_line_batch(line, line_n, spec, res);
+    // UNKNOWN is digit 2 (0b10) in the packed key, so the line has an
+    // unknown cell iff some cell's high bit is set. A fully known line only
+    // needs the forward validity check, not the backward sweep.
+    std::uint64_t any = 0;
+    for (int w = 0; w < pic.key_words; ++w) any |= key[w];
+    const bool has_unknown = (any & 0xAAAAAAAAAAAAAAAAULL) != 0;
+    solve_line_batch(line, line_n, spec, res, has_unknown);
     return g_fast_cache.insert(key, tag, res);
 }
 
