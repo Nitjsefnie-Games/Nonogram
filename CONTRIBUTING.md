@@ -168,13 +168,15 @@ with the numbers that kept it out of the shipped build:
 | `STATE_CACHE_YIELD=<x>` | the state cache's per-node-size gate: a size bucket stops using the cache while the cycles its hits save fall below x times the cycles its lookups cost (default 1) |
 | `DEBUG_CACHE_STATS=1` | the counters themselves, including the latched dead/live subtree histogram and the state cache's lookups, hits and evictions |
 
-Two things hold in every build. `STATE_CACHE_MB` sets the state cache's
-budget (default 512; it starts small and doubles up to that). And SIGTERM
-or SIGINT stops the search at its next branch node instead of killing the
-process: the run then prints `Stopped by signal after Xs; explored Y% of
-the search space` and no `Found` line, so a `timeout 300 ./solver puzzle`
-still says how far it got, and two binaries can be compared on a puzzle
-that neither finishes by the fraction each reaches in the same time.
+Three things hold in every build. `STATE_CACHE_MB` sets the state cache's
+budget (default 512; it starts small and doubles up to that). A count-mode
+run prints `progress: explored X% after Ys` once a minute, so a service's
+journal shows where a long run is. And SIGTERM or SIGINT stops the search
+at its next branch node instead of killing the process: the run then
+prints `Stopped by signal after Xs; explored Y% of the search space` and
+no `Found` line, so a `timeout 300 ./solver puzzle` still says how far it
+got, and two binaries can be compared on a puzzle that neither finishes by
+the fraction each reaches in the same time.
 
 ## House style
 

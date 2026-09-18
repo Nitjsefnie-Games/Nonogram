@@ -354,6 +354,7 @@ int main(int argc, char** argv) {
     // --anytime) enumerate.
     const bool count_mode = !print_progress && !have_max && !anytime;
     std::string count_str;
+    if (count_mode) set_progress_interval(60.0);
     solve(clues.rows, clues.cols, callback, &strategy, anytime, balance_k, count_mode, &count_str);
 
     auto end = std::chrono::steady_clock::now();
