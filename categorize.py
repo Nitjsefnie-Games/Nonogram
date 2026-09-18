@@ -17,6 +17,7 @@ print = partial(print, flush=True)
 
 PROGRESS_FILE = "webpbn_progress.txt"
 IN_PROGRESS_DIR = "nonograms/in_progress"
+PARTIALLY_SOLVED_DIR = "nonograms/partially_solved"
 SOLVER_CGROUP = "/sys/fs/cgroup/nonogram-solver"
 CPU_MODEL = get_cpu_info().get("brand_raw", "unknown")
 ISOLATED_CORE = None
@@ -194,7 +195,7 @@ _STRATEGY_NAME_TO_ENUM = {
 
 class ExternalSolverTimeout(Exception):
     """Raised when the external solver exceeds the configured timeout."""
-    pass
+    found_solution = False  # set from the solver's partial output
 
 
 def _solve_via_external(cmd, puzzle_path, timeout_s=None):
@@ -218,10 +219,18 @@ def _solve_via_external(cmd, puzzle_path, timeout_s=None):
             text=True,
             timeout=timeout_s,
         )
-    except subprocess.TimeoutExpired:
-        raise ExternalSolverTimeout(
+    except subprocess.TimeoutExpired as exc:
+        partial = exc.stdout or b""
+        if isinstance(partial, bytes):
+            partial = partial.decode(errors="replace")
+        err = ExternalSolverTimeout(
             f"external solver {cmd!r} exceeded {timeout_s}s on {puzzle_path!r}"
         )
+        # The solver announces the first solution and then progress
+        # batches as "<count> (<rate>/s, ...)"; any such entry means at
+        # least one solution was found before the cut-off.
+        err.found_solution = re.search(r"(^|\s)[\d,]+ \(", partial) is not None
+        raise err
     if proc.returncode != 0:
         raise RuntimeError(
             f"external solver {cmd!r} failed on {puzzle_path!r} "
@@ -453,9 +462,16 @@ def main():
                         clue_text, current_id, args.solver_cmd, timeout_s=args.timeout
                     )
                 )
-            except ExternalSolverTimeout:
-                print(f"timeout (>{args.timeout}s)")
-                # Leave the in_progress file in place — represents an unfinishable puzzle.
+            except ExternalSolverTimeout as exc:
+                if getattr(exc, "found_solution", False):
+                    # Solutions exist but the enumeration did not finish:
+                    # a partially solved puzzle, kept without a header.
+                    os.makedirs(PARTIALLY_SOLVED_DIR, exist_ok=True)
+                    os.replace(f"{IN_PROGRESS_DIR}/{current_id}", f"{PARTIALLY_SOLVED_DIR}/{current_id}")
+                    print(f"timeout (>{args.timeout}s) with solutions -> partially_solved")
+                else:
+                    # No solution within the timeout: left in in_progress.
+                    print(f"timeout (>{args.timeout}s), no solution yet -> in_progress")
                 current_id += 1
                 save_progress(current_id - 1)
                 puzzles_processed += 1
