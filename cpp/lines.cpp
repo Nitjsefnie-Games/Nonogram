@@ -93,50 +93,49 @@ LineSpec make_line_spec(const std::vector<int>& clue) {
 // and carry-propagating shifts of the general routine; shifts are plain <<1/>>1.
 // Behavior is identical to the general path for n_words == 1.
 namespace {
-LineSolveResult solve_line_batch_1w(const std::int8_t* line, std::size_t n,
-                                    const LineSpec& spec) {
+void solve_line_batch_1w(const std::int8_t* line, std::size_t n,
+                         const LineSpec& spec, LineSolveResult& result) {
     const std::size_t len_states = spec.len_states;
     const std::uint64_t sv = spec.state_valid[0];
     const std::uint64_t em = spec.empty_mask[0];
     const std::uint64_t fm = spec.full_mask[0];
 
-    LineSolveResult result;
+    result.deductions.clear();
     result.total = 0;
 
     g_scratch.ensure(n + 1, 1);
     std::uint64_t* fwd = g_scratch.forward.data();
     std::uint64_t* bwd = g_scratch.backward.data();
 
+    // Per-cell-value mask tables make both DP sweeps branch-free: the cell
+    // values along a line are data-dependent and mispredict badly otherwise.
+    //   forward:  next = (cur & stay[v]) | ((cur << 1) & step[v])
+    //   backward: prev = (cur & stay[v]) | ((cur & bstep[v]) >> 1)
+    // with stay = {em, 0, em}, step = {em, fm, sv}, bstep = {em, fm, sv}
+    // for v = EMPTY, FULL, UNKNOWN (UNKNOWN steps into any valid state).
+    const std::uint64_t stay[3] = {em, 0, em};
+    const std::uint64_t step[3] = {em, fm, sv};
+
     fwd[0] = 1ULL;
     for (std::size_t p = 0; p < n; ++p) {
         const std::uint64_t cur = fwd[p];
-        const std::uint64_t sh = cur << 1;
-        const std::int8_t cell = line[p];
-        std::uint64_t nxt;
-        if (cell == UNKNOWN)      nxt = (cur & em) | (sh & sv);
-        else if (cell == EMPTY)   nxt = (cur & em) | (sh & em);
-        else                      nxt = sh & fm;
-        fwd[p + 1] = nxt;
+        const int v = line[p];
+        fwd[p + 1] = (cur & stay[v]) | ((cur << 1) & step[v]);
     }
 
     std::uint64_t accept = 1ULL << (len_states - 1);
     if (len_states >= 2) accept |= 1ULL << (len_states - 2);
     if ((fwd[n] & accept) == 0) {
-        return result;  // unsat
+        return;  // unsat
     }
 
     bwd[n] = accept;
     for (std::size_t pi = n; pi-- > 0; ) {
         const std::uint64_t cur = bwd[pi + 1];
-        const std::int8_t cell = line[pi];
-        std::uint64_t bp;
-        if (cell == UNKNOWN)      { bp = (cur & em) | (cur >> 1); }
-        else if (cell == EMPTY)   { const std::uint64_t m = cur & em; bp = m | (m >> 1); }
-        else                      { bp = (cur & fm) >> 1; }
-        bwd[pi] = bp;
+        const int v = line[pi];
+        bwd[pi] = (cur & stay[v]) | ((cur & step[v]) >> 1);
     }
 
-    result.deductions.reserve(n);
     for (std::size_t p = 0; p < n; ++p) {
         if (line[p] != UNKNOWN) continue;
         const std::uint64_t bw = bwd[p + 1];
@@ -152,25 +151,25 @@ LineSolveResult solve_line_batch_1w(const std::int8_t* line, std::size_t n,
         }
     }
     result.total = 1;
-    return result;
 }
 }  // namespace
 
-LineSolveResult solve_line_batch(const std::int8_t* line, std::size_t n,
-                                 const LineSpec& spec) {
+void solve_line_batch(const std::int8_t* line, std::size_t n,
+                      const LineSpec& spec, LineSolveResult& result) {
     const std::size_t len_states = spec.len_states;
     const std::size_t n_words = spec.n_words;
 
-    LineSolveResult result;
+    result.deductions.clear();
     result.total = 0;
 
     if (len_states == 0 || n_words == 0) {
         // Degenerate: no states means no clue at all (empty puzzle line).
-        return result;
+        return;
     }
 
     if (n_words == 1) {
-        return solve_line_batch_1w(line, n, spec);
+        solve_line_batch_1w(line, n, spec, result);
+        return;
     }
 
     const std::uint64_t* state_valid = spec.state_valid.data();
@@ -225,7 +224,7 @@ LineSolveResult solve_line_batch(const std::int8_t* line, std::size_t n,
     }
 
     if (!reachable) {
-        return result; // total=0, fully_solved=false, empty diff
+        return; // total=0, empty deductions
     }
 
     // Backward DP. Initial state (row n): bits len_states-1 and len_states-2 set.
@@ -274,7 +273,6 @@ LineSolveResult solve_line_batch(const std::int8_t* line, std::size_t n,
     }
 
     // Determine each unknown cell.
-    result.deductions.reserve(n);
 
     std::uint64_t* bw_empty = g_scratch.bw_empty.data();
     std::uint64_t* bw_full = g_scratch.bw_full.data();
@@ -314,6 +312,5 @@ LineSolveResult solve_line_batch(const std::int8_t* line, std::size_t n,
     }
 
     result.total = 1;
-    return result;
 }
 
