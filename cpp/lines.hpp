@@ -26,6 +26,7 @@ struct LineSpec {
     std::vector<std::uint64_t> full_mask;
     std::size_t len_states = 0;
     std::size_t n_words = 0;
+    int id = -1;  // index in the solve()'s spec pool; identifies the clue in cache keys
 };
 
 LineSpec make_line_spec(const std::vector<int>& clue);

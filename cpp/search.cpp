@@ -130,13 +130,193 @@ private:
     ankerl::unordered_dense::map<LineKey, LineSolveResult, LineKeyHash, LineKeyEq> map_;
 };
 
-LineCache& line_cache() {
-    static LineCache cache;
-    return cache;
-}
+// Namespace-scope instance (not a function-local static): the hot path calls
+// into it on every line solve and a function-local static costs an init-guard
+// check per call.
+LineCache g_legacy_cache;
 
-void reset_line_cache(int max_line_len, std::size_t budget_bytes, bool reserve_enabled) {
-    auto& c = line_cache();
+// ---------------------------------------------------------------------------
+// Fast line cache: lines of at most kMaxFastCells cells.
+//
+// Keyed on Picture's incrementally-maintained 2-bit packed line keys plus a
+// 16-bit tag (spec id, row/col), so a lookup hashes key_words machine words
+// instead of the line's bytes and never gathers a column. Open addressing
+// with linear probing over 64-byte slots that hold the key, the tag and the
+// deductions INLINE (one byte each: pos | val << 7), so a hit touches exactly
+// one cache line. The previous map paid three to four dependent misses per
+// lookup (bucket, value entry, heap key string, deductions vector).
+//
+// Slot layout (byte offsets, kw = key words):
+//   [0, 8kw)        key words
+//   [8kw, 8kw+2)    tag (uint16; kEmptyTag marks a free slot)
+//   [8kw+2]         deduction count
+//   [8kw+3]         flags: bit0 = line satisfiable, bit1 = deductions spilled
+//   [8kw+4, 64)     deductions inline, or (spilled) uint32 offset into arena_
+// ---------------------------------------------------------------------------
+
+constexpr int kMaxFastCells = 128;   // 7-bit positions in the deduction bytes
+constexpr std::size_t kSlotBytes = 64;
+constexpr std::uint16_t kEmptyTag = 0xFFFF;
+constexpr std::uint8_t kFlagSat = 1;
+constexpr std::uint8_t kFlagSpilled = 2;
+
+struct alignas(64) Slot { unsigned char b[kSlotBytes]; };
+
+inline std::uint16_t load_u16(const unsigned char* p) { std::uint16_t v; std::memcpy(&v, p, 2); return v; }
+inline std::uint32_t load_u32(const unsigned char* p) { std::uint32_t v; std::memcpy(&v, p, 4); return v; }
+inline void store_u16(unsigned char* p, std::uint16_t v) { std::memcpy(p, &v, 2); }
+inline void store_u32(unsigned char* p, std::uint32_t v) { std::memcpy(p, &v, 4); }
+
+class FastLineCache {
+public:
+    void init(int key_words, std::size_t budget_bytes) {
+        kw_ = key_words;
+        hdr_ = 8 * static_cast<std::size_t>(kw_);
+        inline_cap_ = kSlotBytes - hdr_ - 4;
+        std::size_t want = std::max<std::size_t>(budget_bytes / kSlotBytes, kMinSlots);
+        max_slots_ = kMinSlots;
+        while (max_slots_ * 2 <= want) max_slots_ *= 2;
+        alloc(kMinSlots);
+        arena_.clear();
+    }
+
+    int key_words() const { return kw_; }
+    std::size_t header_offset() const { return hdr_; }
+    const std::uint8_t* arena() const { return arena_.data(); }
+
+    // Returns the slot holding (key, tag), or nullptr.
+    unsigned char* find(const std::uint64_t* key, std::uint16_t tag) {
+        std::size_t idx = hash(key, tag) & mask_;
+        for (;;) {
+            unsigned char* s = slots_[idx].b;
+            const std::uint16_t t = load_u16(s + hdr_);
+            if (t == kEmptyTag) return nullptr;
+            if (t == tag && keys_equal(s, key)) return s;
+            idx = (idx + 1) & mask_;
+        }
+    }
+
+    // Inserts a fresh entry (precondition: find() returned nullptr) and returns
+    // its slot. May grow or generationally clear the table.
+    unsigned char* insert(const std::uint64_t* key, std::uint16_t tag, const LineSolveResult& res) {
+        if ((count_ + 1) * 2 > nslots_) {
+            if (nslots_ >= max_slots_) {
+                clear_slots();  // OOM-safe generational eviction (cold path)
+            } else {
+                grow();
+            }
+        }
+        unsigned char* s = free_slot(key, tag);
+        std::memcpy(s, key, hdr_);
+        store_u16(s + hdr_, tag);
+        const std::size_t n = res.deductions.size();
+        s[hdr_ + 2] = static_cast<std::uint8_t>(n);
+        std::uint8_t flags = res.total ? kFlagSat : 0;
+        std::uint8_t* out;
+        if (n <= inline_cap_) {
+            out = s + hdr_ + 4;
+        } else {
+            flags |= kFlagSpilled;
+            store_u32(s + hdr_ + 4, static_cast<std::uint32_t>(arena_.size()));
+            arena_.resize(arena_.size() + n);
+            out = arena_.data() + (arena_.size() - n);
+        }
+        s[hdr_ + 3] = flags;
+        for (std::size_t i = 0; i < n; ++i) {
+            const int enc = res.deductions[i];
+            out[i] = static_cast<std::uint8_t>(deduce_pos(enc) | (deduce_val(enc) << 7));
+        }
+        ++count_;
+        return s;
+    }
+
+private:
+    static constexpr std::size_t kMinSlots = 1u << 14;  // 1 MB
+
+    std::uint64_t hash(const std::uint64_t* key, std::uint16_t tag) const {
+        namespace wy = ankerl::unordered_dense::detail::wyhash;
+        std::uint64_t h = wy::mix(static_cast<std::uint64_t>(tag) + 0x9E3779B97F4A7C15ULL,
+                                  0xA0761D6478BD642FULL);
+        for (int w = 0; w < kw_; ++w) h = wy::mix(h ^ key[w], 0xE7037ED1A0B428DBULL);
+        return h;
+    }
+
+    bool keys_equal(const unsigned char* s, const std::uint64_t* key) const {
+        std::uint64_t diff = 0;
+        for (int w = 0; w < kw_; ++w) {
+            std::uint64_t v;
+            std::memcpy(&v, s + 8 * static_cast<std::size_t>(w), 8);
+            diff |= v ^ key[w];
+        }
+        return diff == 0;
+    }
+
+    unsigned char* free_slot(const std::uint64_t* key, std::uint16_t tag) {
+        std::size_t idx = hash(key, tag) & mask_;
+        while (load_u16(slots_[idx].b + hdr_) != kEmptyTag) idx = (idx + 1) & mask_;
+        return slots_[idx].b;
+    }
+
+    void alloc(std::size_t n) {
+        slots_.assign(n, Slot{});
+        std::memset(slots_.data(), 0xFF, n * kSlotBytes);
+        nslots_ = n;
+        mask_ = n - 1;
+        count_ = 0;
+    }
+
+    void clear_slots() {
+        std::memset(slots_.data(), 0xFF, nslots_ * kSlotBytes);
+        count_ = 0;
+        arena_.clear();
+    }
+
+    void grow() {
+        std::vector<Slot> old;
+        old.swap(slots_);
+        const std::size_t old_n = nslots_;
+        alloc(old_n * 2);
+        for (std::size_t i = 0; i < old_n; ++i) {
+            const unsigned char* s = old[i].b;
+            const std::uint16_t t = load_u16(s + hdr_);
+            if (t == kEmptyTag) continue;
+            std::uint64_t key[kMaxFastCells / 32];
+            std::memcpy(key, s, hdr_);
+            std::memcpy(free_slot(key, t), s, kSlotBytes);
+            ++count_;
+        }
+    }
+
+    int kw_ = 1;
+    std::size_t hdr_ = 8;
+    std::size_t inline_cap_ = kSlotBytes - 12;
+    std::size_t nslots_ = 0;
+    std::size_t mask_ = 0;
+    std::size_t count_ = 0;
+    std::size_t max_slots_ = kMinSlots;
+    std::vector<Slot> slots_;
+    std::vector<std::uint8_t> arena_;
+};
+
+FastLineCache g_fast_cache;
+bool g_fast_mode = false;
+// Orientation bit folded into the tag. A line solve depends only on (cells,
+// clue, length); the packed key cannot tell trailing EMPTY cells from cells
+// beyond the line's end, so rows and columns must not share entries when
+// their lengths differ. On square puzzles they can, so the bit is dropped
+// there to keep the legacy cache's sharing.
+std::uint16_t g_tag_col_bit = 1;
+
+// LINE_CACHE_LEGACY=1 forces the string-keyed cache (the fallback for lines
+// longer than kMaxFastCells) on every puzzle; used to differential-test the two.
+void reset_line_cache(int height, int width, std::size_t budget_bytes, bool reserve_enabled) {
+    const int max_line_len = std::max(height, width);
+    g_fast_mode = max_line_len <= kMaxFastCells && std::getenv("LINE_CACHE_LEGACY") == nullptr;
+    if (g_fast_mode) {
+        g_fast_cache.init((max_line_len + 31) / 32, budget_bytes);
+        g_tag_col_bit = (height != width) ? 1 : 0;
+    }
+    auto& c = g_legacy_cache;
     c.clear();
     std::size_t per_entry = 295 + 2 * static_cast<std::size_t>(max_line_len);
     c.set_max_entries(std::max<std::size_t>(1, budget_bytes / per_entry));
@@ -156,8 +336,14 @@ void reset_line_cache(int max_line_len, std::size_t budget_bytes, bool reserve_e
 // ---------------------------------------------------------------------------
 
 struct Trail {
-    std::vector<int> changed_cell_indices;
+    std::vector<int> changed_cell_indices;  // packed (row, col); see trail_pack
 };
+
+// Trail entries carry (row, col) rather than a linear index so a revert can
+// update the packed line keys without a division to recover the row.
+inline int trail_pack(int row, int col) { return (row << 16) | col; }
+inline int trail_row(int e) { return e >> 16; }
+inline int trail_col(int e) { return e & 0xFFFF; }
 
 // ---------------------------------------------------------------------------
 // SolveState — mirrors picture.py SolveState (without print_state).
@@ -256,20 +442,16 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
 
 struct BatchResult {
     bool success;
-    const std::vector<int>* deductions; // packed (pos,val); points into cache entry
+    const std::uint8_t* deductions8;    // fast path: n8 bytes of pos | val << 7
+    int n8;
+    const std::vector<int>* deductions; // legacy path: packed (pos,val) ints
 };
 
-BatchResult solve_one_batch(const LineSpec& spec,
-                            int index,
-                            bool is_col,
-                            Picture& pic) {
-    // Obtain the line cells. Rows are contiguous in pic.pixels, so we point
-    // straight at them (no copy). Columns are strided, so gather into a
-    // reusable thread_local buffer.
+// Materialize the line's cells: rows are contiguous in pic.pixels (no copy);
+// columns are strided, so gather into a reusable thread_local buffer.
+inline const std::int8_t* line_cells(int index, bool is_col, const Picture& pic, std::size_t& n) {
     const int W = pic.width();
     const std::int8_t* px = pic.pixels.data();
-    const std::int8_t* line;
-    std::size_t line_n;
     if (is_col) {
         static thread_local std::vector<std::int8_t> col_buf;
         const int H = pic.height();
@@ -281,16 +463,23 @@ BatchResult solve_one_batch(const LineSpec& spec,
         for (int r = 0; r < H; ++r) {
             cb[r] = src[static_cast<std::size_t>(r) * W];
         }
-        line = cb;
-        line_n = static_cast<std::size_t>(H);
-    } else {
-        line = px + static_cast<std::size_t>(index) * W;
-        line_n = static_cast<std::size_t>(W);
+        n = static_cast<std::size_t>(H);
+        return cb;
     }
+    n = static_cast<std::size_t>(W);
+    return px + static_cast<std::size_t>(index) * W;
+}
+
+BatchResult solve_one_batch_legacy(const LineSpec& spec,
+                                   int index,
+                                   bool is_col,
+                                   Picture& pic) {
+    std::size_t line_n;
+    const std::int8_t* line = line_cells(index, is_col, pic, line_n);
 
     std::string_view view_bytes(reinterpret_cast<const char*>(line), line_n);
     LineKeyView vkey{view_bytes, &spec};
-    auto& cache = line_cache();
+    auto& cache = g_legacy_cache;
     const LineSolveResult* result_ptr = cache.find_and_promote(vkey);
     if (result_ptr == nullptr) {
         LineSolveResult res = solve_line_batch(line, line_n, spec);
@@ -299,14 +488,50 @@ BatchResult solve_one_batch(const LineSpec& spec,
     }
 
     if (result_ptr->total == 0) {
-        return BatchResult{false, nullptr};
+        return BatchResult{false, nullptr, 0, nullptr};
     }
 
     if (result_ptr->deductions.empty()) {
-        return BatchResult{true, nullptr};
+        return BatchResult{true, nullptr, 0, nullptr};
     }
 
-    return BatchResult{true, &result_ptr->deductions};
+    return BatchResult{true, nullptr, 0, &result_ptr->deductions};
+}
+
+BatchResult solve_one_batch(const LineSpec& spec,
+                            int index,
+                            bool is_col,
+                            Picture& pic) {
+    if (!g_fast_mode) {
+        return solve_one_batch_legacy(spec, index, is_col, pic);
+    }
+
+    const int kw = pic.key_words;
+    const std::uint64_t* key =
+        (is_col ? pic.col_keys.data() : pic.row_keys.data()) + static_cast<std::size_t>(index) * kw;
+    const std::uint16_t tag = static_cast<std::uint16_t>(spec.id * 2 + (is_col ? g_tag_col_bit : 0));
+
+    unsigned char* s = g_fast_cache.find(key, tag);
+    if (s == nullptr) {
+        std::size_t line_n;
+        const std::int8_t* line = line_cells(index, is_col, pic, line_n);
+        LineSolveResult res = solve_line_batch(line, line_n, spec);
+        s = g_fast_cache.insert(key, tag, res);
+    }
+
+    const std::size_t hdr = g_fast_cache.header_offset();
+    const std::uint8_t flags = s[hdr + 3];
+    if (!(flags & kFlagSat)) {
+        return BatchResult{false, nullptr, 0, nullptr};
+    }
+    const int n = s[hdr + 2];
+    if (n == 0) {
+        return BatchResult{true, nullptr, 0, nullptr};
+    }
+    const std::uint8_t* ded = (flags & kFlagSpilled)
+        ? g_fast_cache.arena() + load_u32(s + hdr + 4)
+        : s + hdr + 4;
+    return BatchResult{true, ded, n, nullptr};
 }
 
 // ---------------------------------------------------------------------------
@@ -318,37 +543,46 @@ BatchResult solve_one_batch(const LineSpec& spec,
 // recorded index back to UNKNOWN.
 // ---------------------------------------------------------------------------
 
-void write_intersection(const std::vector<int>& deductions,
-                        int line_index,
-                        Picture& pic,
-                        bool is_row,
-                        Trail& trail) {
+template <typename Iter, typename Pos, typename Val>
+inline void write_intersection_impl(Iter first, Iter last, Pos pos_of, Val val_of,
+                                    int line_index, Picture& pic, bool is_row, Trail& trail) {
+    const int W = pic.width();
     if (is_row) {
         const int row = line_index;
-        const int W = pic.width();
-        std::int8_t* px = pic.pixels.data() + static_cast<std::size_t>(row) * static_cast<std::size_t>(W);
-        for (int enc : deductions) {
-            const int col = deduce_pos(enc);
+        const std::int8_t* px = pic.pixels.data() + static_cast<std::size_t>(row) * static_cast<std::size_t>(W);
+        for (; first != last; ++first) {
+            const int col = pos_of(*first);
             if (px[col] == UNKNOWN) {
-                px[col] = deduce_val(enc);
-                pic.unknown_count -= 1;
+                pic.set_known(row, col, val_of(*first));
                 pic.mark_col_dirty(col);
-                trail.changed_cell_indices.push_back(row * W + col);
+                trail.changed_cell_indices.push_back(trail_pack(row, col));
             }
         }
     } else {
         const int col = line_index;
-        const int W = pic.width();
-        for (int enc : deductions) {
-            const int row = deduce_pos(enc);
-            std::int8_t& cell = pic.pixels[static_cast<std::size_t>(row) * static_cast<std::size_t>(W) + static_cast<std::size_t>(col)];
-            if (cell == UNKNOWN) {
-                cell = deduce_val(enc);
-                pic.unknown_count -= 1;
+        const std::int8_t* px = pic.pixels.data();
+        for (; first != last; ++first) {
+            const int row = pos_of(*first);
+            if (px[static_cast<std::size_t>(row) * static_cast<std::size_t>(W) + static_cast<std::size_t>(col)] == UNKNOWN) {
+                pic.set_known(row, col, val_of(*first));
                 pic.mark_row_dirty(row);
-                trail.changed_cell_indices.push_back(row * W + col);
+                trail.changed_cell_indices.push_back(trail_pack(row, col));
             }
         }
+    }
+}
+
+void write_intersection(const BatchResult& r, int line_index, Picture& pic, bool is_row, Trail& trail) {
+    if (r.deductions8 != nullptr) {
+        write_intersection_impl(r.deductions8, r.deductions8 + r.n8,
+                                [](std::uint8_t b) { return static_cast<int>(b & 0x7F); },
+                                [](std::uint8_t b) { return static_cast<std::int8_t>(b >> 7); },
+                                line_index, pic, is_row, trail);
+    } else {
+        write_intersection_impl(r.deductions->begin(), r.deductions->end(),
+                                [](int enc) { return deduce_pos(enc); },
+                                [](int enc) { return deduce_val(enc); },
+                                line_index, pic, is_row, trail);
     }
 }
 
@@ -371,8 +605,8 @@ bool solve_lines(const std::vector<const LineSpec*>& mapped,
         if (!r.success) {
             return false;
         }
-        if (r.deductions != nullptr) {
-            write_intersection(*r.deductions, index, pic, is_row, trail);
+        if (r.deductions8 != nullptr || r.deductions != nullptr) {
+            write_intersection(r, index, pic, is_row, trail);
         }
     }
     return true;
@@ -419,10 +653,9 @@ struct ProbeGuard {
         // Walk trail in reverse and restore each cell to UNKNOWN. We bypass
         // Picture::set_pixel because it only adjusts unknown_count for the
         // UNKNOWN -> value direction.
-        std::int8_t* px = pic.pixels.data();
         for (auto it = trail.changed_cell_indices.rbegin();
              it != trail.changed_cell_indices.rend(); ++it) {
-            px[*it] = UNKNOWN;
+            pic.unset(trail_row(*it), trail_col(*it));
         }
         pic.unknown_count = saved_unknown_count;
 
@@ -457,12 +690,9 @@ ProbeResult probe_cell(int row,
 
     ProbeGuard guard(pic, trail);
 
-    // Apply the probe pixel directly (bypass set_pixel; record on trail).
-    const int W = pic.width();
-    const int idx = row * W + col;
-    pic.pixels[idx] = val;
-    pic.unknown_count -= 1;
-    trail.changed_cell_indices.push_back(idx);
+    // Apply the probe pixel (record on trail).
+    pic.set_known(row, col, val);
+    trail.changed_cell_indices.push_back(trail_pack(row, col));
 
     pic.mark_row_dirty(row);
     pic.mark_col_dirty(col);
@@ -497,11 +727,10 @@ void revert_branch(Picture& pic,
                    Trail& trail,
                    std::size_t mark,
                    int saved_unknown_count) {
-    std::int8_t* px = pic.pixels.data();
     while (trail.changed_cell_indices.size() > mark) {
-        int idx = trail.changed_cell_indices.back();
+        const int e = trail.changed_cell_indices.back();
         trail.changed_cell_indices.pop_back();
-        px[idx] = UNKNOWN;
+        pic.unset(trail_row(e), trail_col(e));
     }
     pic.unknown_count = saved_unknown_count;
     while (!pic.row_queue.empty()) {
@@ -657,10 +886,8 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 state.mark_contradiction();
                 // Forced commit: record the pixel on the trail so a parent
                 // backtrack frame can revert it if its own branch fails.
-                const int idx_f = row * W + col;
-                pic.pixels[idx_f] = FULL;
-                pic.unknown_count -= 1;
-                trail.changed_cell_indices.push_back(idx_f);
+                pic.set_known(row, col, FULL);
+                trail.changed_cell_indices.push_back(trail_pack(row, col));
                 pic.mark_row_dirty(row);
                 pic.mark_col_dirty(col);
                 return solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
@@ -668,10 +895,8 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
 
             if (empty_res.ok && !full_res.ok) {
                 state.mark_contradiction();
-                const int idx_e = row * W + col;
-                pic.pixels[idx_e] = EMPTY;
-                pic.unknown_count -= 1;
-                trail.changed_cell_indices.push_back(idx_e);
+                pic.set_known(row, col, EMPTY);
+                trail.changed_cell_indices.push_back(trail_pack(row, col));
                 pic.mark_row_dirty(row);
                 pic.mark_col_dirty(col);
                 return solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
@@ -711,11 +936,9 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         const std::size_t mark = trail.changed_cell_indices.size();
         const int saved_unknown_count = pic.unknown_count;
 
-        // Apply the branch pixel directly (bypass set_pixel; record on trail).
-        const int br_idx = row * W + col;
-        pic.pixels[br_idx] = val;
-        pic.unknown_count -= 1;
-        trail.changed_cell_indices.push_back(br_idx);
+        // Apply the branch pixel (record on trail).
+        pic.set_known(row, col, val);
+        trail.changed_cell_indices.push_back(trail_pack(row, col));
         pic.mark_row_dirty(row);
         pic.mark_col_dirty(col);
 
@@ -830,9 +1053,8 @@ void solve(const std::vector<std::vector<int>>& rows,
             budget = static_cast<std::size_t>(std::stoull(env)) * 1024ULL * 1024ULL;
         } catch (...) {}
     }
-    int max_line = static_cast<int>(std::max(rows.size(), cols.size()));
     const bool anytime = keep_probing || (std::getenv("ANYTIME") != nullptr);
-    reset_line_cache(max_line, budget, anytime);
+    reset_line_cache(static_cast<int>(rows.size()), static_cast<int>(cols.size()), budget, anytime);
 
     const int H = static_cast<int>(rows.size());
     const int W = static_cast<int>(cols.size());
@@ -851,6 +1073,7 @@ void solve(const std::vector<std::vector<int>>& rows,
         auto it = clue_to_spec.find(clue);
         if (it != clue_to_spec.end()) return it->second;
         spec_pool.push_back(make_line_spec(clue));
+        spec_pool.back().id = static_cast<int>(spec_pool.size()) - 1;
         const LineSpec* p = &spec_pool.back();
         clue_to_spec.emplace(clue, p);
         return p;
@@ -894,8 +1117,7 @@ double estimate_solutions(const std::vector<std::vector<int>>& rows,
         try { budget = static_cast<std::size_t>(std::stoull(env)) * 1024ULL * 1024ULL; }
         catch (...) {}
     }
-    int max_line = static_cast<int>(std::max(rows.size(), cols.size()));
-    reset_line_cache(max_line, budget, false);
+    reset_line_cache(static_cast<int>(rows.size()), static_cast<int>(cols.size()), budget, false);
 
     const int H = static_cast<int>(rows.size());
     const int W = static_cast<int>(cols.size());
@@ -908,6 +1130,7 @@ double estimate_solutions(const std::vector<std::vector<int>>& rows,
         auto it = clue_to_spec.find(clue);
         if (it != clue_to_spec.end()) return it->second;
         spec_pool.push_back(make_line_spec(clue));
+        spec_pool.back().id = static_cast<int>(spec_pool.size()) - 1;
         const LineSpec* p = &spec_pool.back();
         clue_to_spec.emplace(clue, p);
         return p;
