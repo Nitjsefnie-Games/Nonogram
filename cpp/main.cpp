@@ -243,6 +243,29 @@ int main(int argc, char** argv) {
         p_rate = (p_elapsed > 0.0) ? (static_cast<double>(solution_count) / p_elapsed) : 0.0;
     };
 
+    // Running estimate of the total: solutions found / fraction of the
+    // search space completed (see explored_fraction()).
+    auto fmt_duration = [](double s) -> std::string {
+        char buf[32];
+        if (s < 120.0) std::snprintf(buf, sizeof buf, "%.0fs", s);
+        else if (s < 7200.0) std::snprintf(buf, sizeof buf, "%.1fmin", s / 60.0);
+        else if (s < 2.0 * 86400.0) std::snprintf(buf, sizeof buf, "%.1fh", s / 3600.0);
+        else if (s < 2.0 * 365.25 * 86400.0) std::snprintf(buf, sizeof buf, "%.1fd", s / 86400.0);
+        else std::snprintf(buf, sizeof buf, "%.3gy", s / (365.25 * 86400.0));
+        return std::string(buf);
+    };
+    // Running estimate of the total and of the time to finish: solutions
+    // found / fraction of the search space completed, and elapsed scaled
+    // the same way (see explored_fraction()).
+    auto est_suffix = [&]() -> std::string {
+        const double frac = explored_fraction();
+        if (!(frac > 0.0)) return std::string();
+        char buf[96];
+        std::snprintf(buf, sizeof buf, " est~%.2e %.3g%% eta~%s", static_cast<double>(solution_count) / frac,
+                      frac * 100.0, fmt_duration(p_elapsed / frac - p_elapsed).c_str());
+        return std::string(buf);
+    };
+
     auto callback = [&](const Picture& pic) -> bool {
         ++solution_count;
 
@@ -257,10 +280,10 @@ int main(int argc, char** argv) {
         } else if (print_every > 0) {
             if (solution_count % print_every == 0) {
                 stamp();
-                std::printf("%s (%s/s, %.1fs) ",
+                std::printf("%s (%s/s, %.1fs%s) ",
                             fmt_int_commas(solution_count).c_str(),
                             fmt_rate(p_rate).c_str(),
-                            p_elapsed);
+                            p_elapsed, est_suffix().c_str());
                 std::fflush(stdout);
                 ++print_count;
                 if (print_count == 10) {
@@ -270,10 +293,10 @@ int main(int argc, char** argv) {
             }
         } else if (solution_count % print_count_threshold == 0) {
             stamp();
-            std::printf("%s (%s/s, %.1fs) ",
+            std::printf("%s (%s/s, %.1fs%s) ",
                         fmt_int_commas(solution_count).c_str(),
                         fmt_rate(p_rate).c_str(),
-                        p_elapsed);
+                        p_elapsed, est_suffix().c_str());
             std::fflush(stdout);
             print_count_threshold = static_cast<long long>(print_count_threshold * 1.1);
             if (print_count_threshold <= 0) print_count_threshold = 1;
@@ -302,6 +325,10 @@ int main(int argc, char** argv) {
     std::printf("Found %s solution(s) (%s/s)\n",
                 fmt_int_commas(solution_count).c_str(),
                 fmt_rate(rate).c_str());
+    if (explored_fraction() < 1.0 - 1e-12 && solution_count > 0)
+        std::printf("Explored %.3g%% of the search space; estimated total ~%.3e solutions, ~%s to finish\n",
+                    explored_fraction() * 100.0, static_cast<double>(solution_count) / explored_fraction(),
+                    fmt_duration(elapsed / explored_fraction() - elapsed).c_str());
     std::printf("Strategy: %s\n", strategy_name(strategy));
 
     return 0;

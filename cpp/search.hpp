@@ -36,6 +36,14 @@ void solve(const std::vector<std::vector<int>>& rows,
 // stops at a different point of a different tree, sooner or later.
 // 0 keeps the default order. Anytime mode ignores it.
 
+// Fraction (0..1) of the search space the running or finished solve() has
+// completed: every branch node halves the space, and completed subtrees are
+// summed. solutions_so_far / explored_fraction() is a running estimate of
+// the total count, exact in the fraction and extrapolating a uniform
+// solution density over the rest. Valid from inside the on_solution
+// callback and after solve() returns.
+double explored_fraction();
+
 // Knuth-style estimate of the TOTAL number of solutions, without enumerating.
 // Performs n_dives random weighted root-to-leaf dives (Knuth 1975): at each
 // branching node it counts the viable child values, multiplies a running weight
