@@ -891,13 +891,7 @@ struct SolveState {
     bool count_mode = false;
     u128 result = 0;
     std::vector<char> region_row;   // empty = whole grid
-    std::uint64_t regions_split = 0, region_calls = 0, region_cache_hits = 0;
-    // Region counts by state. A region that a branch split off from the
-    // branch cell's lines has the same state under both branch values, so
-    // without this it is counted once per branch, compounding at every
-    // split below. Key: the region's row and column indices with their
-    // packed line keys (index identifies the clue, key the cells).
-    std::unordered_map<std::string, u128> region_cache;
+    std::uint64_t regions_split = 0, region_calls = 0;
     // Count of the whole current region by state, consulted at every
     // count-mode branch node: the state is the region's rows with unknowns
     // (their packed keys) and the columns those rows have unknowns in, so
@@ -1720,38 +1714,16 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             std::vector<char> saved_region = state.region_row;
             std::vector<int> roots_copy = root_list;
             std::vector<int> row_root(root_of_row.begin(), root_of_row.end());
-            // Column membership, resolved now: the union-find scratch is
-            // shared with the recursive calls below.
-            std::vector<int> col_root(static_cast<std::size_t>(W), -1);
-            for (int c = 0; c < W; ++c) if (uic[c] > 0) col_root[c] = find(H + c);
-            const std::uint64_t* ck = pic.col_keys.data();
             const double scale_at_split = g_mass_scale;
             g_mass_scale = scale_at_split / static_cast<double>(roots_copy.size());
             u128 total = 1;
             int region_index = 0;
             for (int root : roots_copy) {
                 const char region_char = static_cast<char>('a' + (region_index++ & 15));
-                std::string key;
-                key.reserve(static_cast<std::size_t>(H + W) * (kw * 8 + 2));
-                for (int r = 0; r < H; ++r) {
-                    if (row_root[r] != root) continue;
-                    key.push_back(static_cast<char>(r & 0xFF)); key.push_back(static_cast<char>((r >> 8) & 0xFF));
-                    key.append(reinterpret_cast<const char*>(rk + static_cast<std::size_t>(r) * kw), static_cast<std::size_t>(kw) * 8);
-                }
-                key.push_back('|');
-                for (int c = 0; c < W; ++c) {
-                    if (col_root[c] != root) continue;
-                    key.push_back(static_cast<char>(c & 0xFF)); key.push_back(static_cast<char>((c >> 8) & 0xFF));
-                    key.append(reinterpret_cast<const char*>(ck + static_cast<std::size_t>(c) * kw), static_cast<std::size_t>(kw) * 8);
-                }
-                auto hit = state.region_cache.find(key);
-                if (hit != state.region_cache.end()) {
-                    ++state.region_cache_hits;
-                    g_explored_mass += g_half_pow[static_cast<std::size_t>(state.branch_depth)] * g_mass_scale;
-                    total *= hit->second;
-                    if (total == 0) break;
-                    continue;
-                }
+                // A region seen before (the branch cell's lines split it
+                // off, so it is the same under both branch values) is a
+                // state-cache hit at the region search's root node: the
+                // key there is the region's lines, exactly this region.
                 state.region_row.assign(static_cast<std::size_t>(H), 0);
                 for (int r = 0; r < H; ++r) if (row_root[r] == root) state.region_row[r] = 1;
                 ++state.region_calls;
@@ -1760,7 +1732,6 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 state.branch_path.push_back(region_char);
                 if (!solve_backtrack(mapped_rows, mapped_cols, pic, state, on_solution, trail)) return false;
                 state.branch_path.pop_back();
-                state.region_cache.emplace(std::move(key), state.result);
                 total *= state.result;
                 revert_branch(pic, trail, mark, saved_unknown_count);
                 if (total == 0) break;
@@ -2306,8 +2277,8 @@ void solve(const std::vector<std::vector<int>>& rows,
         *out_count = s;
     }
     if (g_debug_stats && count_mode)
-        std::fprintf(stderr, "cache-stats: region splits=%llu region searches=%llu cache hits=%llu\n",
-                     static_cast<unsigned long long>(state.regions_split), static_cast<unsigned long long>(state.region_calls), static_cast<unsigned long long>(state.region_cache_hits));
+        std::fprintf(stderr, "cache-stats: region splits=%llu region searches=%llu\n",
+                     static_cast<unsigned long long>(state.regions_split), static_cast<unsigned long long>(state.region_calls));
     if (g_debug_stats && count_mode && !g_no_state_cache)
     {
         std::fprintf(stderr, "cache-stats: state lookups=%llu hits=%llu evictions=%llu entries=%zu of %zu slots\n",
