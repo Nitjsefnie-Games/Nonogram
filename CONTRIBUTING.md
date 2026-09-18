@@ -122,9 +122,28 @@ anything under ~5% on the PGO build.
 
 `make stats` builds `solver-stats`, which with `DEBUG_CACHE_STATS=1` prints
 line-cache and probe statistics to stderr (lookups, misses, deductions per
-entry, lookups per probe). `LINE_CACHE_LEGACY=1` forces the string-keyed
-cache used for lines longer than 128 cells, for differential testing of
-the packed-key one. Neither affects results.
+entry, lookups per probe, branch nodes). `LINE_CACHE_LEGACY=1` forces the
+string-keyed cache used for lines longer than 128 cells, for differential
+testing of the packed-key one. Neither affects results.
+
+A change to the search itself (branch heuristic, probing policy) is judged
+on branch-node counts, which are deterministic, rather than on wall time:
+
+```
+make stats
+bench/nodes.py ./solver-stats -o bench/results/<tag>-nodes.jsonl
+bench/nodes.py --compare bench/results/a-nodes.jsonl bench/results/b-nodes.jsonl
+```
+
+Two things to know when reading those numbers. The corpus's two largest
+trees (`hard/6689`, `medium/3929`) run with probing shut off after the
+first few nodes, so the branch heuristic barely touches them; the unique-
+solution puzzles that do exercise it are `extreme/6574`, `easy_large/5281`
+and, outside the corpus, `in_progress/8098` (9-Dom). And the survey puzzles
+in `bench/survey/` have many solutions, so a `--max 2` run there measures
+how soon the branch order finds a second solution, not the tree size.
+`bench/nodes.py --env BRANCH_K=<k>` passes the stats build's experimental
+branch-score knob (see the comment in `search.cpp`).
 
 ## House style
 
