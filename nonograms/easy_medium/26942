@@ -1,0 +1,46 @@
+# solver=cpp-041dbf2
+# cpu=AMD EPYC Processor (with IBPB)
+# strategy=basic
+# n_solutions=1
+# solve_time=0.00040
+2
+4
+6
+8
+10
+12
+14
+16
+18
+20
+20
+20
+8 8
+6 6
+2
+4
+4
+6
+6
+0
+---
+3
+5
+7
+8
+9
+10
+11
+12 2
+12 4
+12 5
+12 5
+12 4
+12 2
+11
+10
+9
+8
+7
+5
+3
