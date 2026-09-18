@@ -54,6 +54,17 @@ void solve(const std::vector<std::vector<int>>& rows,
 // callback and after solve() returns.
 double explored_fraction();
 
+// Asks the running solve() to stop at its next branch node (async-signal-
+// safe: sets a flag). solve() then returns as it does for a --max stop, with
+// explored_fraction() valid; stop_requested() tells the caller it happened.
+void request_stop();
+bool stop_requested();
+// After a stop: the path from the root to the node the search was at, one
+// character per level ('0' / '1' first / second branch value, 'a' + i the
+// i-th region of a split). Two stopped runs of the same tree compare by it
+// lexicographically (a prefix ranks below its extensions).
+const std::string& stop_position();
+
 // Knuth-style estimate of the TOTAL number of solutions, without enumerating.
 // Performs n_dives random weighted root-to-leaf dives (Knuth 1975): at each
 // branching node it counts the viable child values, multiplies a running weight
