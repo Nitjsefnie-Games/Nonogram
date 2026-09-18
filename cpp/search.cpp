@@ -609,6 +609,7 @@ struct SolveState {
         latched_dead = latched_live = 0;
     }
     bool keep_probing = false;  // anytime mode: never latch skip_probing
+    double balance_k = 0.0;     // see solve(): K*min - max branch score when > 0
     std::deque<int> probe_outcomes;
 
     // Benchmark hook: if MAX_NODES is set (>0), abort the search after that many
@@ -1366,8 +1367,8 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 better = hi > best_pixels;
                 if (g_anytime_tb == 1) better = better || (hi == best_pixels && lo > best_lo);
                 if (g_anytime_tb == 2) better = better || (hi == best_pixels && lo < best_lo);
-            } else if (g_branch_k_set) {
-                const double sc = g_branch_k * lo - hi;
+            } else if (state.balance_k > 0.0) {
+                const double sc = state.balance_k * lo - hi;
                 better = sc > best_score;
                 if (better) best_score = sc;
             } else {
@@ -1571,7 +1572,8 @@ void solve(const std::vector<std::vector<int>>& rows,
            const std::vector<std::vector<int>>& cols,
            std::function<bool(const Picture&)> on_solution,
            Strategy* out_strategy,
-           bool keep_probing) {
+           bool keep_probing,
+           double balance_k) {
     std::size_t budget = 1024ULL * 1024ULL * 1024ULL;  // 1 GB default
     const char* env = std::getenv("LINE_CACHE_BUDGET_MB");
     if (env != nullptr) {
@@ -1621,6 +1623,8 @@ void solve(const std::vector<std::vector<int>>& rows,
 
     SolveState state;
     state.keep_probing = anytime;
+    // The stats build's BRANCH_K knob is the same switch, for bench/nodes.py.
+    state.balance_k = g_branch_k_set ? g_branch_k : balance_k;
     Trail trail;
     // Reserve enough headroom that the trail rarely reallocates.
     trail.changed_cell_indices.reserve(static_cast<std::size_t>(H) * static_cast<std::size_t>(W));

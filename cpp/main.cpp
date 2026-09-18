@@ -26,6 +26,10 @@ void print_usage(std::FILE* stream) {
     std::fprintf(stream, "                   (far more solutions/sec on deep enumerations that\n");
     std::fprintf(stream, "                    otherwise stall; slower on easy puzzles)\n");
     std::fprintf(stream, "  --max N          Stop after finding N solutions\n");
+    std::fprintf(stream, "  --balance K      Score branch cells by K*min - max of the two probe\n");
+    std::fprintf(stream, "                   fills (K=6 suggested): much smaller trees on hard\n");
+    std::fprintf(stream, "                   unique puzzles; --max N runs on many-solution\n");
+    std::fprintf(stream, "                   puzzles stop at a different point. Ignored by --anytime\n");
     std::fprintf(stream, "  --print-every N  Log count + rate + elapsed every N solutions\n");
     std::fprintf(stream, "                   (default: progressive batches starting at 10, x1.1)\n");
 }
@@ -108,6 +112,7 @@ int main(int argc, char** argv) {
     bool have_max = false;
     long long print_every = 0;     // 0 = use progressive default
     bool anytime = false;          // keep lookahead probing on for whole search
+    double balance_k = 0.0;        // --balance K: K*min - max branch score
     long long estimate_dives = 0;  // >0: Knuth-estimate solution count, don't solve
 
     for (int i = 1; i < argc; ++i) {
@@ -125,6 +130,21 @@ int main(int argc, char** argv) {
                 estimate_dives = std::stoll(argv[++i]);
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "--estimate: invalid integer: %s\n", e.what());
+                return 1;
+            }
+        } else if (std::strcmp(a, "--balance") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "--balance requires a value\n");
+                return 1;
+            }
+            try {
+                balance_k = std::stod(argv[++i]);
+                if (!(balance_k > 0.0)) {
+                    std::fprintf(stderr, "--balance: value must be > 0\n");
+                    return 1;
+                }
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "--balance: invalid number: %s\n", e.what());
                 return 1;
             }
         } else if (std::strcmp(a, "--max") == 0) {
@@ -271,7 +291,7 @@ int main(int argc, char** argv) {
     };
 
     Strategy strategy = Strategy::BASIC;
-    solve(clues.rows, clues.cols, callback, &strategy, anytime);
+    solve(clues.rows, clues.cols, callback, &strategy, anytime, balance_k);
 
     auto end = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(end - start).count();

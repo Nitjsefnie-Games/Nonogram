@@ -26,7 +26,15 @@ void solve(const std::vector<std::vector<int>>& rows,
            const std::vector<std::vector<int>>& cols,
            std::function<bool(const Picture&)> on_solution,
            Strategy* out_strategy = nullptr,
-           bool keep_probing = false);
+           bool keep_probing = false,
+           double balance_k = 0.0);
+// balance_k > 0 scores a branch cell by balance_k * min(f, e) - max(f, e)
+// (f, e = cells settled by probing it FULL / EMPTY) instead of min(f, e)
+// with ties toward the smaller max. Exhaustive searches on hard unique
+// puzzles get much smaller trees (K=6: 11-Dom 217k -> 28k nodes, 12-Dom
+// from over 15 minutes to 115s); on many-solution puzzles a --max N run
+// stops at a different point of a different tree, sooner or later.
+// 0 keeps the default order. Anytime mode ignores it.
 
 // Knuth-style estimate of the TOTAL number of solutions, without enumerating.
 // Performs n_dives random weighted root-to-leaf dives (Knuth 1975): at each
