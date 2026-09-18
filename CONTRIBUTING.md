@@ -138,9 +138,13 @@ on branch-node counts, which are deterministic, rather than on wall time:
 
 ```
 make stats
-bench/nodes.py ./solver-stats -o bench/results/<tag>-nodes.jsonl
+bench/nodes.py ./solver-stats --exclude extreme -o bench/results/<tag>-nodes.jsonl
 bench/nodes.py --compare bench/results/a-nodes.jsonl bench/results/b-nodes.jsonl
 ```
+
+`extreme/` holds fully counted puzzles that take minutes each (3867:
+63,502,007,481 solutions in ten minutes), so a routine node-count run
+excludes it; include it when the change targets that class.
 
 Two things to know when reading those numbers. The corpus's two largest
 trees (`easy_large/6689`, `easy_large/3929`) run with probing shut off after the
@@ -159,7 +163,7 @@ with the numbers that kept it out of the shipped build:
 | `ANYTIME_TB=1/2` | anytime-mode tie-break on the max toward larger / smaller min |
 | `FIRST_VAL=1` | explore the branch value whose probe settled fewer cells first |
 | `NO_SKIP=1` | never latch the probing shut-off |
-| `SMALL_NOPROBE=n` | branch without probing at non-root nodes with at most n unknown cells (shipped: 31; 0 disables) |
+| `SMALL_NOPROBE=n` | branch without probing at non-root nodes with at most n unknown cells (shipped: 47; 0 disables) |
 | `PROBE_WINDOW`, `PROBE_THRESH` | the shut-off's yield window and threshold |
 | `DEAD_WINDOW`, `DEAD_FRAC` | the dead-work watchdog's window and fraction |
 | `EARLY_SOLVE=1` | anytime: stop the probe pass at a probe that completes the grid |
