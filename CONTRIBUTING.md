@@ -102,7 +102,12 @@ bench/run.sh ./solver ../nonograms/partially_solved/pikachu --anytime --max 3000
 ```
 
 The last line is the headline anytime benchmark (time to 300k solutions
-on a puzzle that never finishes). Compare binaries **interleaved** on the
+on a puzzle that never finishes). `./solver <puzzle> --balance 6` switches
+the branch score to `6*min - max` of the two probe fills, which shrinks
+exhaustive trees on hard unique puzzles several-fold (11-Dom 217k -> 28k
+nodes) but changes where a `--max N` run on a many-solution puzzle stops;
+it is off by default, and `bench/survey/` holds the puzzles that show
+both effects. Compare binaries **interleaved** on the
 shielded core, several rounds each, and read best-of-N and medians; on a
 shared machine a single pair of runs is noise. For a behavior-preserving
 change, `bench/diff_test.py <old> <new>` runs the whole corpus through
