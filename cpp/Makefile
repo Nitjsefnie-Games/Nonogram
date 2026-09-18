@@ -24,18 +24,23 @@ solver: $(OBJS)
 clean:
 	rm -f $(OBJS) solver
 
+# Both stages link to the SAME output name: gcc derives the .gcda file names
+# from it (<output>-<source>.gcda), so an instrumented "solver-instrumented"
+# produced profiles the "solver" build never found -- and -Wmissing-profile
+# is only a warning, so the PGO build silently became a plain build.
+# -Werror=missing-profile makes that mismatch fail the build instead.
 pgo: pgo-clean
 	@echo "=== PGO Stage 1: build instrumented binary ==="
 	mkdir -p $(PGO_DIR)
-	$(CXX) $(CXXFLAGS) -fprofile-generate=$(PGO_DIR) $(SRCS) -o solver-instrumented
+	$(CXX) $(CXXFLAGS) -fprofile-generate=$(PGO_DIR) $(SRCS) -o solver
 	@echo "=== PGO Stage 2: train on representative puzzles ==="
-	./solver-instrumented ../nonograms/medium/108 --max 200000 > /dev/null
-	./solver-instrumented ../nonograms/easy_large/4 > /dev/null
-	./solver-instrumented ../nonograms/easy_medium/63 > /dev/null
-	./solver-instrumented ../nonograms/trivial/1 > /dev/null
+	./solver ../nonograms/medium/108 --max 200000 > /dev/null
+	./solver ../nonograms/partially_solved/pikachu --anytime --max 30000 > /dev/null
+	./solver ../nonograms/easy_large/4 > /dev/null
+	./solver ../nonograms/easy_medium/63 > /dev/null
+	./solver ../nonograms/trivial/1 > /dev/null
 	@echo "=== PGO Stage 3: build optimized binary ==="
-	$(CXX) $(CXXFLAGS) -fprofile-use=$(PGO_DIR) $(SRCS) -o solver
-	rm -f solver-instrumented
+	$(CXX) $(CXXFLAGS) -fprofile-use=$(PGO_DIR) -Werror=missing-profile $(SRCS) -o solver
 
 pgo-clean:
 	rm -rf $(PGO_DIR) solver-instrumented
