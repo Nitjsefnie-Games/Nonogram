@@ -508,11 +508,15 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
 // fully_solved bookkeeping: insert into pic.solved_{rows,cols} on the fly.
 // ---------------------------------------------------------------------------
 
+// 16 bytes so it comes back in two registers instead of through memory.
+// n8 >= 0: fast path, `ded` points at n8 bytes of pos | val << 7 (n8 may be
+// 0 with ded null). n8 == kLegacy: `ded` is a const std::vector<int>* of
+// packed (pos,val) ints (null when empty).
 struct BatchResult {
-    bool success;
-    const std::uint8_t* deductions8;    // fast path: n8 bytes of pos | val << 7
+    static constexpr int kLegacy = -1;
+    const void* ded;
     int n8;
-    const std::vector<int>* deductions; // legacy path: packed (pos,val) ints
+    bool success;
 };
 
 // Materialize the line's cells: rows are contiguous in pic.pixels (no copy);
@@ -557,20 +561,36 @@ BatchResult solve_one_batch_legacy(const LineSpec& spec,
     }
 
     if (result_ptr->total == 0) {
-        return BatchResult{false, nullptr, 0, nullptr};
+        return BatchResult{nullptr, BatchResult::kLegacy, false};
     }
 
     if (result_ptr->deductions.empty()) {
-        return BatchResult{true, nullptr, 0, nullptr};
+        return BatchResult{nullptr, BatchResult::kLegacy, true};
     }
 
-    return BatchResult{true, nullptr, 0, &result_ptr->deductions};
+    return BatchResult{&result_ptr->deductions, BatchResult::kLegacy, true};
 }
 
-BatchResult solve_one_batch(const LineSpec& spec,
-                            int index,
-                            bool is_col,
-                            Picture& pic) {
+// Miss path, kept out of line so the hit path below stays small enough to
+// inline into solve_lines' drain loop.
+[[gnu::noinline]] unsigned char* solve_one_batch_miss(const LineSpec& spec,
+                                                      int index,
+                                                      bool is_col,
+                                                      Picture& pic,
+                                                      const std::uint64_t* key,
+                                                      std::uint16_t tag) {
+    if (g_debug_stats) ++g_stat_misses;
+    std::size_t line_n;
+    const std::int8_t* line = line_cells(index, is_col, pic, line_n);
+    static thread_local LineSolveResult res;  // capacity reused across misses
+    solve_line_batch(line, line_n, spec, res);
+    return g_fast_cache.insert(key, tag, res);
+}
+
+inline BatchResult solve_one_batch(const LineSpec& spec,
+                                   int index,
+                                   bool is_col,
+                                   Picture& pic) {
     if (!g_fast_mode) {
         return solve_one_batch_legacy(spec, index, is_col, pic);
     }
@@ -583,12 +603,7 @@ BatchResult solve_one_batch(const LineSpec& spec,
     if (g_debug_stats) ++g_stat_lookups;
     unsigned char* s = g_fast_cache.find(key, tag);
     if (s == nullptr) {
-        if (g_debug_stats) ++g_stat_misses;
-        std::size_t line_n;
-        const std::int8_t* line = line_cells(index, is_col, pic, line_n);
-        static thread_local LineSolveResult res;  // capacity reused across misses
-        solve_line_batch(line, line_n, spec, res);
-        s = g_fast_cache.insert(key, tag, res);
+        s = solve_one_batch_miss(spec, index, is_col, pic, key, tag);
     }
 
     const std::size_t hdr = g_fast_cache.header_offset();
@@ -596,18 +611,14 @@ BatchResult solve_one_batch(const LineSpec& spec,
     if (g_debug_stats) ++g_stat_probe_cur;
     if (!(flags & kFlagSat)) {
         if (g_debug_stats) ++g_stat_unsat;
-        return BatchResult{false, nullptr, 0, nullptr};
+        return BatchResult{nullptr, 0, false};
     }
     const int n = s[hdr + 2];
-    if (n == 0) {
-        if (g_debug_stats) ++g_stat_noded;
-        return BatchResult{true, nullptr, 0, nullptr};
-    }
-    if (g_debug_stats) ++g_stat_ded;
+    if (g_debug_stats) { if (n == 0) ++g_stat_noded; else ++g_stat_ded; }
     const std::uint8_t* ded = (flags & kFlagSpilled)
         ? g_fast_cache.arena() + load_u32(s + hdr + 4)
         : s + hdr + 4;
-    return BatchResult{true, ded, n, nullptr};
+    return BatchResult{ded, n, true};
 }
 
 // ---------------------------------------------------------------------------
@@ -649,13 +660,15 @@ inline void write_intersection_impl(Iter first, Iter last, Pos pos_of, Val val_o
 }
 
 void write_intersection(const BatchResult& r, int line_index, Picture& pic, bool is_row, Trail& trail) {
-    if (r.deductions8 != nullptr) {
-        write_intersection_impl(r.deductions8, r.deductions8 + r.n8,
+    if (r.n8 != BatchResult::kLegacy) {
+        const std::uint8_t* d = static_cast<const std::uint8_t*>(r.ded);
+        write_intersection_impl(d, d + r.n8,
                                 [](std::uint8_t b) { return static_cast<int>(b & 0x7F); },
                                 [](std::uint8_t b) { return static_cast<std::int8_t>(b >> 7); },
                                 line_index, pic, is_row, trail);
     } else {
-        write_intersection_impl(r.deductions->begin(), r.deductions->end(),
+        const auto* v = static_cast<const std::vector<int>*>(r.ded);
+        write_intersection_impl(v->begin(), v->end(),
                                 [](int enc) { return deduce_pos(enc); },
                                 [](int enc) { return deduce_val(enc); },
                                 line_index, pic, is_row, trail);
@@ -681,7 +694,7 @@ bool solve_lines(const std::vector<const LineSpec*>& mapped,
         if (!r.success) {
             return false;
         }
-        if (r.deductions8 != nullptr || r.deductions != nullptr) {
+        if (r.n8 > 0 || (r.n8 == BatchResult::kLegacy && r.ded != nullptr)) {
             write_intersection(r, index, pic, is_row, trail);
         }
     }
