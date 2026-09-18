@@ -527,6 +527,34 @@ struct Trail {
     std::vector<int> row_unknown;
     std::vector<int> col_unknown;
     std::size_t counted = 0;
+    // Rows bucketed by their unknown count as bitsets (bucket k = rows with
+    // exactly k unknowns, row_words words each), and a histogram of column
+    // counts, so the latched branch-cell scan visits only rows that can
+    // hold the minimum key instead of testing every row.
+    std::vector<std::uint64_t> row_bucket;
+    std::vector<int> col_hist;
+    int row_words = 0;
+
+    void settle(int r, int c) {
+        const int old = row_unknown[r]--;
+        std::uint64_t* b = row_bucket.data() + static_cast<std::size_t>(r >> 6);
+        const std::uint64_t bit = 1ULL << (r & 63);
+        b[static_cast<std::size_t>(old) * row_words] &= ~bit;
+        b[static_cast<std::size_t>(old - 1) * row_words] |= bit;
+        const int oc = col_unknown[c]--;
+        --col_hist[oc];
+        ++col_hist[oc - 1];
+    }
+    void unsettle(int r, int c) {
+        const int old = row_unknown[r]++;
+        std::uint64_t* b = row_bucket.data() + static_cast<std::size_t>(r >> 6);
+        const std::uint64_t bit = 1ULL << (r & 63);
+        b[static_cast<std::size_t>(old) * row_words] &= ~bit;
+        b[static_cast<std::size_t>(old + 1) * row_words] |= bit;
+        const int oc = col_unknown[c]++;
+        --col_hist[oc];
+        ++col_hist[oc + 1];
+    }
 };
 
 // Trail entries carry (row, col) rather than a linear index so a revert can
@@ -1097,10 +1125,7 @@ void revert_branch(Picture& pic,
         const int e = trail.changed_cell_indices.back();
         // Entries below `counted` were subtracted from the per-line counts
         // at a branch node; add them back. Entries above it never were.
-        if (trail.changed_cell_indices.size() <= trail.counted) {
-            ++trail.row_unknown[trail_row(e)];
-            ++trail.col_unknown[trail_col(e)];
-        }
+        if (trail.changed_cell_indices.size() <= trail.counted) trail.unsettle(trail_row(e), trail_col(e));
         trail.changed_cell_indices.pop_back();
         pic.unset(trail_row(e), trail_col(e));
     }
@@ -1147,12 +1172,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
     {
         const int* tr = trail.changed_cell_indices.data();
         const std::size_t n = trail.changed_cell_indices.size();
-        int* ru = trail.row_unknown.data();
-        int* cu = trail.col_unknown.data();
-        for (std::size_t i = trail.counted; i < n; ++i) {
-            --ru[trail_row(tr[i])];
-            --cu[trail_col(tr[i])];
-        }
+        for (std::size_t i = trail.counted; i < n; ++i) trail.settle(trail_row(tr[i]), trail_col(tr[i]));
         trail.counted = n;
     }
     const int* uir = trail.row_unknown.data();
@@ -1190,28 +1210,41 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         // Pick the unknown cell with the smallest composite key (most-
         // constrained line; tie-broken by highest neighbor score). Single
         // row-major scan, no coords/scores arrays materialized.
+        // The winner is the row-major-first cell with the minimum key, and a
+        // cell in a row with k unknowns has line_constraint >= k + min_uic
+        // (min_uic = smallest unknown count of any column that still has
+        // unknowns). So rows are visited by increasing k from the trail's
+        // buckets, each row scanned once for its best cell, and the walk
+        // stops at the first k whose bound exceeds the best key found. Rows
+        // the old full scan would have picked from all have bound <= that
+        // key, so they are all visited; ties on the key go to the smaller
+        // row, then the smaller column, which is the row-major-first cell.
         std::pair<int, int> best_key;
         bool have = false;
-        // Lower bound on any cell's line_constraint in row r is
-        // uir[r] + min_uic, so once a best key is known, rows whose bound
-        // exceeds its line_constraint cannot beat OR tie it and are skipped
-        // without touching their cells; rows that could tie are scanned in
-        // the same row-major order as before, so the choice is identical.
-        int min_uic = INT_MAX;
-        for (int c = 0; c < W; ++c) if (uic[c] > 0 && uic[c] < min_uic) min_uic = uic[c];
-        for (int r = 0; r < H; ++r) {
-            if (uir[r] == 0 || (have && uir[r] + min_uic > best_key.first)) continue;
-            for (int w = 0; w < kw; ++w) {
-                std::uint64_t m = rk[r * kw + w] & kUnknownBits;
-                while (m != 0) {
-                    const int c = 32 * w + (__builtin_ctzll(m) >> 1);
-                    m &= m - 1;
-                    std::pair<int, int> k = composite_key(r, c);
-                    if (!have || k < best_key) {
-                        best_key = k;
-                        best_row = r;
-                        best_col = c;
-                        have = true;
+        int min_uic = 1;
+        while (trail.col_hist[static_cast<std::size_t>(min_uic)] == 0) ++min_uic;
+        const int words = trail.row_words;
+        for (int k = 1; k <= W; ++k) {
+            if (have && k + min_uic > best_key.first) break;
+            const std::uint64_t* bucket = trail.row_bucket.data() + static_cast<std::size_t>(k) * words;
+            for (int wd = 0; wd < words; ++wd) {
+                std::uint64_t rows = bucket[wd];
+                while (rows != 0) {
+                    const int r = 64 * wd + __builtin_ctzll(rows);
+                    rows &= rows - 1;
+                    for (int w = 0; w < kw; ++w) {
+                        std::uint64_t m = rk[r * kw + w] & kUnknownBits;
+                        while (m != 0) {
+                            const int c = 32 * w + (__builtin_ctzll(m) >> 1);
+                            m &= m - 1;
+                            std::pair<int, int> key = composite_key(r, c);
+                            if (!have || key < best_key || (key == best_key && r < best_row)) {
+                                best_key = key;
+                                best_row = r;
+                                best_col = c;
+                                have = true;
+                            }
+                        }
                     }
                 }
             }
@@ -1587,6 +1620,12 @@ void solve(const std::vector<std::vector<int>>& rows,
     trail.row_unknown.assign(static_cast<std::size_t>(H), W);
     trail.col_unknown.assign(static_cast<std::size_t>(W), H);
     trail.counted = 0;
+    trail.row_words = (H + 63) / 64;
+    trail.row_bucket.assign(static_cast<std::size_t>(W + 1) * trail.row_words, 0);
+    for (int r = 0; r < H; ++r)
+        trail.row_bucket[static_cast<std::size_t>(W) * trail.row_words + (r >> 6)] |= 1ULL << (r & 63);
+    trail.col_hist.assign(static_cast<std::size_t>(H + 1), 0);
+    trail.col_hist[static_cast<std::size_t>(H)] = W;
     (void)solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
 
     if (g_debug_stats) {

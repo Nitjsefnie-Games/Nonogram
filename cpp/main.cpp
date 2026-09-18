@@ -213,25 +213,34 @@ int main(int argc, char** argv) {
     long long print_count_threshold = 10;
     int print_count = 0;
 
+    // The clock is read only when a progress line is printed: reading it on
+    // every solution was 2-4% of a solution-dense enumeration (hard/6689,
+    // 2.2M solutions in 0.9s).
+    double p_elapsed = 0.0, p_rate = 0.0;
+    auto stamp = [&]() {
+        auto now = std::chrono::steady_clock::now();
+        p_elapsed = std::chrono::duration<double>(now - start).count();
+        p_rate = (p_elapsed > 0.0) ? (static_cast<double>(solution_count) / p_elapsed) : 0.0;
+    };
+
     auto callback = [&](const Picture& pic) -> bool {
         ++solution_count;
-        auto now = std::chrono::steady_clock::now();
-        double elapsed = std::chrono::duration<double>(now - start).count();
-        double rate = (elapsed > 0.0) ? (static_cast<double>(solution_count) / elapsed) : 0.0;
 
         if (print_progress) {
+            stamp();
             std::printf("\n=== Solution %s found (%s/s, elapsed %.1fs) ===\n",
                         fmt_int_commas(solution_count).c_str(),
-                        fmt_rate(rate).c_str(),
-                        elapsed);
+                        fmt_rate(p_rate).c_str(),
+                        p_elapsed);
             print_grid(pic);
             std::fflush(stdout);
         } else if (print_every > 0) {
             if (solution_count % print_every == 0) {
+                stamp();
                 std::printf("%s (%s/s, %.1fs) ",
                             fmt_int_commas(solution_count).c_str(),
-                            fmt_rate(rate).c_str(),
-                            elapsed);
+                            fmt_rate(p_rate).c_str(),
+                            p_elapsed);
                 std::fflush(stdout);
                 ++print_count;
                 if (print_count == 10) {
@@ -240,10 +249,11 @@ int main(int argc, char** argv) {
                 }
             }
         } else if (solution_count % print_count_threshold == 0) {
+            stamp();
             std::printf("%s (%s/s, %.1fs) ",
                         fmt_int_commas(solution_count).c_str(),
-                        fmt_rate(rate).c_str(),
-                        elapsed);
+                        fmt_rate(p_rate).c_str(),
+                        p_elapsed);
             std::fflush(stdout);
             print_count_threshold = static_cast<long long>(print_count_threshold * 1.1);
             if (print_count_threshold <= 0) print_count_threshold = 1;
