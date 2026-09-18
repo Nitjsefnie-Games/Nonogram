@@ -219,6 +219,7 @@ std::uint64_t g_stat_misses = 0;
 std::uint64_t g_stat_probes = 0;
 std::uint64_t g_stat_ded_hist[kMaxFastCells + 1] = {};
 std::uint64_t g_stat_unsat = 0, g_stat_noded = 0, g_stat_ded = 0;  // lookup outcomes
+std::uint64_t g_stat_nodes = 0;  // solve_backtrack entries that branched
 std::uint64_t g_stat_probe_lookups_hist[64] = {};  // lookups per probe (capped)
 std::uint64_t g_stat_probe_cur = 0;
 std::uint64_t g_stat_probe_ok = 0;
@@ -1051,6 +1052,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 return true; // dead branch
             }
 
+
             if (full_res.ok && !empty_res.ok) {
                 state.mark_contradiction();
                 // Forced commit: record the pixel on the trail so a parent
@@ -1071,7 +1073,18 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 return solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
             }
 
-            int max_pixels = std::max(full_res.pixels_filled, empty_res.pixels_filled);
+            // Branch-cell score. The search is exhaustive, so what matters is
+            // the size of BOTH subtrees: scoring a cell by the smaller of its
+            // two propagations (a balanced split) shrinks the tree far more
+            // than scoring by the larger one -- 9-Dom (webpbn 8098) 116k ->
+            // 5.3k nodes, extreme/6574 102k -> 2.5k, the corpus -63%. Sum,
+            // product and min-with-tie-breaks were all measured worse.
+            // Anytime mode is the exception: on an enumeration that never
+            // finishes the objective is solutions per second, and the
+            // greedy max (deepest dive first) delivers them 11% faster on
+            // pikachu, so it keeps max.
+            const int f = full_res.pixels_filled, e = empty_res.pixels_filled;
+            const int max_pixels = state.keep_probing ? std::max(f, e) : std::min(f, e);
             if (max_pixels > best_pixels) {
                 best_pixels = max_pixels;
                 best_row = row;
@@ -1087,6 +1100,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
     }
 
     state.mark_backtrack();
+    if (g_debug_stats) ++g_stat_nodes;
 
     const int row = best_row;
     const int col = best_col;
@@ -1277,9 +1291,10 @@ void solve(const std::vector<std::vector<int>>& rows,
         for (int i = 0; i <= kMaxFastCells; ++i) {
             if (g_stat_ded_hist[i]) std::fprintf(stderr, " %d:%llu", i, static_cast<unsigned long long>(g_stat_ded_hist[i]));
         }
-        std::fprintf(stderr, "\ncache-stats: lookup outcomes unsat=%llu no-deductions=%llu deductions=%llu; probes ok=%llu\ncache-stats: lookups-per-probe histogram:",
+        std::fprintf(stderr, "\ncache-stats: lookup outcomes unsat=%llu no-deductions=%llu deductions=%llu; probes ok=%llu; branch-nodes=%llu\ncache-stats: lookups-per-probe histogram:",
                      static_cast<unsigned long long>(g_stat_unsat), static_cast<unsigned long long>(g_stat_noded),
-                     static_cast<unsigned long long>(g_stat_ded), static_cast<unsigned long long>(g_stat_probe_ok));
+                     static_cast<unsigned long long>(g_stat_ded), static_cast<unsigned long long>(g_stat_probe_ok),
+                     static_cast<unsigned long long>(g_stat_nodes));
         for (int i = 0; i < 64; ++i) {
             if (g_stat_probe_lookups_hist[i]) std::fprintf(stderr, " %d:%llu", i, static_cast<unsigned long long>(g_stat_probe_lookups_hist[i]));
         }
