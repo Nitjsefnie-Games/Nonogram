@@ -281,6 +281,10 @@ constexpr std::size_t g_probe_window = 100;
 constexpr double g_probe_thresh = 0.01;
 #endif
 std::uint64_t g_stat_probe_pairs = 0, g_stat_probe_hits = 0;  // probe pairs, and those with a contradiction
+// Fraction of the search space completed so far; see SolveState::branch_depth.
+double g_explored_mass = 0.0;
+std::vector<double> g_half_pow;  // g_half_pow[d] = 2^-d, d up to the cell count + 1
+
 // Clues of the puzzle being solved (stats build: search-area report).
 const std::vector<std::vector<int>>* g_row_clues = nullptr;
 const std::vector<std::vector<int>>* g_col_clues = nullptr;
@@ -616,6 +620,11 @@ struct SolveState {
     int solutions_found = 0;
     bool used_contradiction = false;
     bool used_backtrack = false;
+    // Progress: the search space is split in half at every branch node, so
+    // a subtree at branch depth d holds 2^-d of it; explored_mass sums the
+    // completed subtrees. solutions / explored_mass is a running estimate
+    // of the total count (exact fraction, uniform-density extrapolation).
+    int branch_depth = 0;
     bool skip_probing = false;
     // Dead-work watchdog for the latched (no-probing) mode. The yield window
     // shuts probing off when few probes find contradictions, but that is
@@ -1512,9 +1521,16 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         pic.mark_row_dirty(row);
         pic.mark_col_dirty(col);
 
-        if (!solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail)) {
+        const double mass_before = g_explored_mass;
+        ++state.branch_depth;
+        const bool go_on = solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
+        --state.branch_depth;
+        if (!go_on) {
             return false;
         }
+        // A child that branched has already accounted for its own subtree
+        // through its children; only a leaf child is added here.
+        if (g_explored_mass == mass_before) g_explored_mass += g_half_pow[static_cast<std::size_t>(state.branch_depth) + 1];
         revert_branch(pic, trail, mark, saved_unknown_count);
     }
 
@@ -1675,6 +1691,11 @@ void solve(const std::vector<std::vector<int>>& rows,
 
     SolveState state;
     state.keep_probing = anytime;
+    g_explored_mass = 0.0;
+    // Branch depth cannot exceed the cell count; 2^-d underflows to 0 past
+    // ~1074, which only drops mass that could never register anyway.
+    g_half_pow.resize(static_cast<std::size_t>(H) * W + 2);
+    for (std::size_t d = 0; d < g_half_pow.size(); ++d) g_half_pow[d] = std::ldexp(1.0, -static_cast<int>(d));
     g_row_clues = &rows;
     g_col_clues = &cols;
     // The stats build's BRANCH_K knob is the same switch, for bench/nodes.py.
@@ -1734,6 +1755,8 @@ void solve(const std::vector<std::vector<int>>& rows,
         }
     }
 }
+
+double explored_fraction() { return g_explored_mass; }
 
 double estimate_solutions(const std::vector<std::vector<int>>& rows,
                           const std::vector<std::vector<int>>& cols,
