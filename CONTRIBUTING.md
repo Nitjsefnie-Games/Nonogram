@@ -107,7 +107,9 @@ the branch score to `6*min - max` of the two probe fills, which shrinks
 exhaustive trees on hard unique puzzles several-fold (11-Dom 217k -> 28k
 nodes) but changes where a `--max N` run on a many-solution puzzle stops;
 it is off by default, and `bench/survey/` holds the puzzles that show
-both effects. Compare binaries **interleaved** on the
+both effects. With it, `bench/survey/22336 --max 2` (Gettys, 99x59, which
+no probing solver in the webpbn survey finishes) reaches a second solution
+in 11 minutes on a loaded core; the default order was stopped at 15. Compare binaries **interleaved** on the
 shielded core, several rounds each, and read best-of-N and medians; on a
 shared machine a single pair of runs is noise. For a behavior-preserving
 change, `bench/diff_test.py <old> <new>` runs the whole corpus through
