@@ -95,7 +95,8 @@ LineSpec make_line_spec(const std::vector<int>& clue) {
 // Behavior is identical to the general path for n_words == 1.
 namespace {
 void solve_line_batch_1w(const std::int8_t* line, std::size_t n,
-                         const LineSpec& spec, LineSolveResult& result) {
+                         const LineSpec& spec, LineSolveResult& result,
+                         bool has_unknown) {
     const std::size_t len_states = spec.len_states;
     const std::uint64_t sv = spec.state_valid[0];
     const std::uint64_t em = spec.empty_mask[0];
@@ -127,6 +128,10 @@ void solve_line_batch_1w(const std::int8_t* line, std::size_t n,
     if (len_states >= 2) accept |= 1ULL << (len_states - 2);
     if ((fwd[n] & accept) == 0) {
         return;  // unsat
+    }
+    if (!has_unknown) {
+        result.total = 1;  // nothing to deduce
+        return;
     }
 
     // Backward sweep fused with the deduction pass: at position p the sweep
@@ -162,7 +167,8 @@ void solve_line_batch_1w(const std::int8_t* line, std::size_t n,
 }  // namespace
 
 void solve_line_batch(const std::int8_t* line, std::size_t n,
-                      const LineSpec& spec, LineSolveResult& result) {
+                      const LineSpec& spec, LineSolveResult& result,
+                      bool has_unknown) {
     const std::size_t len_states = spec.len_states;
     const std::size_t n_words = spec.n_words;
 
@@ -175,7 +181,7 @@ void solve_line_batch(const std::int8_t* line, std::size_t n,
     }
 
     if (n_words == 1) {
-        solve_line_batch_1w(line, n, spec, result);
+        solve_line_batch_1w(line, n, spec, result, has_unknown);
         return;
     }
 
@@ -232,6 +238,10 @@ void solve_line_batch(const std::int8_t* line, std::size_t n,
 
     if (!reachable) {
         return; // total=0, empty deductions
+    }
+    if (!has_unknown) {
+        result.total = 1;  // nothing to deduce
+        return;
     }
 
     // Backward DP. Initial state (row n): bits len_states-1 and len_states-2 set.

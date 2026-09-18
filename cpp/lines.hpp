@@ -33,5 +33,8 @@ LineSpec make_line_spec(const std::vector<int>& clue);
 
 // Solves one line into `out` (cleared first; its capacity is reused across
 // calls so a miss performs no heap allocation).
+// has_unknown = false promises the line has no UNKNOWN cell; then only the
+// forward validity check runs (there can be no deductions).
 void solve_line_batch(const std::int8_t* line, std::size_t n,
-                      const LineSpec& spec, LineSolveResult& out);
+                      const LineSpec& spec, LineSolveResult& out,
+                      bool has_unknown = true);
