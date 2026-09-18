@@ -258,6 +258,11 @@ const int g_anytime_tb = std::getenv("ANYTIME_TB") ? std::atoi(std::getenv("ANYT
 const bool g_first_val_low = std::getenv("FIRST_VAL") != nullptr;
 // NO_SKIP=1 never latches the adaptive probing shut-off in default mode.
 const bool g_no_skip = std::getenv("NO_SKIP") != nullptr;
+// EARLY_SOLVE=1 (anytime mode): stop the probe pass at the first probe that
+// completes the grid and branch on that cell. Measured on pikachu --anytime
+// --max 300000: probes 23.1M -> 21.7M, wall within noise (7.10/7.54/7.01s
+// vs 7.11/6.75/6.85s), so not shipped.
+const bool g_early_solve = std::getenv("EARLY_SOLVE") != nullptr;
 // PROBE_WINDOW / PROBE_THRESH override the shut-off window and yield threshold.
 const std::size_t g_probe_window = std::getenv("PROBE_WINDOW") ? std::strtoull(std::getenv("PROBE_WINDOW"), nullptr, 10) : 100;
 const double g_probe_thresh = std::getenv("PROBE_THRESH") ? std::atof(std::getenv("PROBE_THRESH")) : 0.01;
@@ -271,6 +276,7 @@ constexpr int g_debug_impl = 0;
 constexpr int g_anytime_tb = 0;
 constexpr bool g_first_val_low = false;
 constexpr bool g_no_skip = false;
+constexpr bool g_early_solve = false;
 constexpr std::size_t g_probe_window = 100;
 constexpr double g_probe_thresh = 0.01;
 #endif
@@ -1375,6 +1381,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 best_col = col;
                 best_first_val = ((f >= e) != g_first_val_low) ? FULL : EMPTY;
                 have_best = true;
+                if (g_early_solve && state.keep_probing && hi == H * W) break;
             }
         }
 
