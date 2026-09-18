@@ -170,6 +170,9 @@ LineCache g_legacy_cache;
 //   [8kw+4, S)      deductions inline, or (spilled) uint32 offset into arena_
 // ---------------------------------------------------------------------------
 
+// Solution counts: products of region counts pass 2^64 on real puzzles.
+__extension__ typedef unsigned __int128 u128;
+
 constexpr int kMaxFastCells = 128;   // 7-bit positions in the deduction bytes
 constexpr std::uint16_t kEmptyTag = 0xFFFF;
 constexpr std::uint8_t kFlagSat = 1;
@@ -625,6 +628,17 @@ struct SolveState {
     // completed subtrees. solutions / explored_mass is a running estimate
     // of the total count (exact fraction, uniform-density extrapolation).
     int branch_depth = 0;
+    // Count mode (solve(..., count_mode=true)): no solution callbacks; every
+    // solve_real / solve_backtrack call leaves the number of solutions of
+    // the subtree it just searched in `result`. After propagation the
+    // unknown cells are split into independent regions (rows and columns
+    // joined by an unknown cell), each region is counted with the search
+    // restricted to its rows via `region_row`, and the counts multiply:
+    // every full solution is one choice per region, so this is exact.
+    bool count_mode = false;
+    u128 result = 0;
+    std::vector<char> region_row;   // empty = whole grid
+    std::uint64_t regions_split = 0, region_calls = 0;
     bool skip_probing = false;
     // Dead-work watchdog for the latched (no-probing) mode. The yield window
     // shuts probing off when few probes find contradictions, but that is
@@ -1220,7 +1234,6 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
     // line key was 27% of the latched node on hard/6689.
     const int kw = pic.key_words;
     const std::uint64_t* rk = pic.row_keys.data();
-    const int n_unknown = pic.unknown_count;
     {
         const int* tr = trail.changed_cell_indices.data();
         const std::size_t n = trail.changed_cell_indices.size();
@@ -1230,8 +1243,76 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
     const int* uir = trail.row_unknown.data();
     const int* uic = trail.col_unknown.data();
 
+    state.result = 0;  // every early return below is a dead branch
+    const char* region = state.region_row.empty() ? nullptr : state.region_row.data();
+    int n_unknown = pic.unknown_count;
+    if (region) {
+        n_unknown = 0;
+        for (int r = 0; r < H; ++r) if (region[r]) n_unknown += uir[r];
+    }
     if (n_unknown == 0) {
+        state.result = 1;
         return true;
+    }
+
+    if (state.count_mode) {
+        // Split the region's unknown cells into independent regions: rows
+        // and columns joined by an unknown cell. More than one means the
+        // count is the product of the regions' counts, each found by the
+        // same search restricted to that region's rows.
+        static thread_local std::vector<int> parent;
+        parent.resize(static_cast<std::size_t>(H + W));
+        for (int i = 0; i < H + W; ++i) parent[i] = i;
+        auto find = [&](int x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+        int lines_with_unknowns = 0;
+        for (int r = 0; r < H; ++r) {
+            if (uir[r] == 0 || (region && !region[r])) continue;
+            ++lines_with_unknowns;
+            for (int w = 0; w < kw; ++w) {
+                std::uint64_t m = rk[r * kw + w] & kUnknownBits;
+                while (m != 0) {
+                    const int c = 32 * w + (__builtin_ctzll(m) >> 1);
+                    m &= m - 1;
+                    const int a = find(r), b = find(H + c);
+                    if (a != b) parent[a] = b;
+                }
+            }
+        }
+        (void)lines_with_unknowns;
+        int roots = 0;
+        static thread_local std::vector<int> root_of_row;
+        root_of_row.assign(static_cast<std::size_t>(H), -1);
+        static thread_local std::vector<int> root_list;
+        root_list.clear();
+        for (int r = 0; r < H; ++r) {
+            if (uir[r] == 0 || (region && !region[r])) continue;
+            const int root = find(r);
+            root_of_row[r] = root;
+            bool seen = false;
+            for (int x : root_list) if (x == root) { seen = true; break; }
+            if (!seen) { root_list.push_back(root); ++roots; }
+        }
+        if (roots > 1) {
+            ++state.regions_split;
+            std::vector<char> saved_region = state.region_row;
+            std::vector<int> roots_copy = root_list;
+            std::vector<int> row_root(root_of_row.begin(), root_of_row.end());
+            u128 total = 1;
+            for (int root : roots_copy) {
+                state.region_row.assign(static_cast<std::size_t>(H), 0);
+                for (int r = 0; r < H; ++r) if (row_root[r] == root) state.region_row[r] = 1;
+                ++state.region_calls;
+                const std::size_t mark = trail.changed_cell_indices.size();
+                const int saved_unknown_count = pic.unknown_count;
+                if (!solve_backtrack(mapped_rows, mapped_cols, pic, state, on_solution, trail)) return false;
+                total *= state.result;
+                revert_branch(pic, trail, mark, saved_unknown_count);
+                if (total == 0) break;
+            }
+            state.region_row = saved_region;
+            state.result = total;
+            return true;
+        }
     }
 
     int best_row = -1;
@@ -1284,6 +1365,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 while (rows != 0) {
                     const int r = 64 * wd + __builtin_ctzll(rows);
                     rows &= rows - 1;
+                    if (region && !region[r]) continue;
                     for (int w = 0; w < kw; ++w) {
                         std::uint64_t m = rk[r * kw + w] & kUnknownBits;
                         while (m != 0) {
@@ -1318,6 +1400,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         enc.clear();
         int max_enc = 0;
         for (int r = 0; r < H; ++r) {
+            if (region && !region[r]) continue;
             for (int w = 0; w < kw; ++w) {
                 std::uint64_t m = rk[r * kw + w] & kUnknownBits;
                 while (m != 0) {
@@ -1509,6 +1592,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
     // On stop signal (solve_real returns false) we propagate immediately
     // without reverting — the caller is aborting, pic state is no longer
     // observed.
+    u128 subtree_total = 0;
     for (int branch = 0; branch < 2; ++branch) {
         const std::int8_t val = (branch == 0) ? first_val : second_val;
 
@@ -1528,11 +1612,13 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         if (!go_on) {
             return false;
         }
+        subtree_total += state.result;
         // A child that branched has already accounted for its own subtree
         // through its children; only a leaf child is added here.
         if (g_explored_mass == mass_before) g_explored_mass += g_half_pow[static_cast<std::size_t>(state.branch_depth) + 1];
         revert_branch(pic, trail, mark, saved_unknown_count);
     }
+    state.result = subtree_total;
 
     if (latched_here) {
         const bool dead = state.solutions_found == sols_before;
@@ -1564,15 +1650,19 @@ bool solve_real(const std::vector<const LineSpec*>& mapped_rows,
     // assignment is rejected (solve_lines returns false) rather than accepted.
     while (pic.has_dirty()) {
         if (!solve_lines(mapped_rows, pic, true, trail)) {
+            state.result = 0;
             return true;
         }
         if (!solve_lines(mapped_cols, pic, false, trail)) {
+            state.result = 0;
             return true;
         }
     }
 
     if (pic.is_solved()) {
         state.solution_found();
+        state.result = 1;
+        if (state.count_mode) return true;
         return on_solution(pic);
     }
 
@@ -1641,7 +1731,9 @@ void solve(const std::vector<std::vector<int>>& rows,
            std::function<bool(const Picture&)> on_solution,
            Strategy* out_strategy,
            bool keep_probing,
-           double balance_k) {
+           double balance_k,
+           bool count_mode,
+           std::string* out_count) {
     std::size_t budget = 1024ULL * 1024ULL * 1024ULL;  // 1 GB default
     const char* env = std::getenv("LINE_CACHE_BUDGET_MB");
     if (env != nullptr) {
@@ -1712,7 +1804,17 @@ void solve(const std::vector<std::vector<int>>& rows,
         trail.row_bucket[static_cast<std::size_t>(W) * trail.row_words + (r >> 6)] |= 1ULL << (r & 63);
     trail.col_hist.assign(static_cast<std::size_t>(H + 1), 0);
     trail.col_hist[static_cast<std::size_t>(H)] = W;
+    state.count_mode = count_mode;
     (void)solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
+    if (out_count != nullptr) {
+        u128 v = state.result;
+        std::string s;
+        do { s.insert(s.begin(), static_cast<char>('0' + static_cast<int>(v % 10))); v /= 10; } while (v != 0);
+        *out_count = s;
+    }
+    if (g_debug_stats && count_mode)
+        std::fprintf(stderr, "cache-stats: region splits=%llu region searches=%llu\n",
+                     static_cast<unsigned long long>(state.regions_split), static_cast<unsigned long long>(state.region_calls));
 
     if (g_debug_stats) {
         std::fprintf(stderr, "cache-stats: lookups=%llu misses=%llu probes=%llu\ncache-stats: deductions-per-entry histogram:",
