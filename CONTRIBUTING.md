@@ -94,7 +94,7 @@ the C++ solver should come with these numbers, measured this way:
 ```
 cd cpp
 bench/shield.sh                      # reserve one core (undo: bench/unshield.sh)
-make pgo                             # the binary that ships: profile-guided
+make                                 # the binary that ships: plain -O3 (see below on PGO)
 python3 bench/harness.py gate        # solution count + strategy vs golden
 python3 bench/harness.py gate-anytime   # same puzzles with --anytime (count only)
 python3 bench/harness.py bench 3     # default-mode timing suite, best of 3
@@ -102,7 +102,12 @@ bench/run.sh ./solver ../nonograms/partially_solved/pikachu --anytime --max 3000
 ```
 
 The last line is the headline anytime benchmark (time to 300k solutions
-on a puzzle that never finishes). `./solver <puzzle> --balance 6` switches
+on a puzzle that never finishes). `make pgo` still builds a
+profile-guided binary, but since count mode became the default it
+measures slower than the plain build on that mode (medium/7382 15.1 s
+against 10.3 s, easy_medium/12130 2.8 against 1.9, 10810 explores 2.6x
+less in 60 s; 2026-09-18), whichever training set was tried, so the
+plain build ships; re-measure before shipping PGO again. `./solver <puzzle> --balance 6` switches
 the branch score to `6*min - max` of the two probe fills, which shrinks
 exhaustive trees on hard unique puzzles several-fold (11-Dom 217k -> 28k
 nodes) but changes where a `--max N` run on a many-solution puzzle stops;
@@ -124,8 +129,9 @@ perf stat -e instructions:u,branch-misses:u ./solver <puzzle> --anytime --max 10
 Instructions retired repeat to well under 0.1% run to run. Cycles and
 wall time still have the last word, because most of the anytime hot path
 is memory latency that no instruction count sees. Small changes also move
-code layout enough to swing plain `-O3` builds by a few percent, so judge
-anything under ~5% on the PGO build.
+code layout enough to swing plain `-O3` builds by a few percent, so treat
+a wall difference under ~5% as noise unless instructions or node counts
+move with it.
 
 `make stats` builds `solver-stats`, which with `DEBUG_CACHE_STATS=1` prints
 line-cache and probe statistics to stderr (lookups, misses, deductions per
