@@ -159,6 +159,7 @@ with the numbers that kept it out of the shipped build:
 | `ANYTIME_TB=1/2` | anytime-mode tie-break on the max toward larger / smaller min |
 | `FIRST_VAL=1` | explore the branch value whose probe settled fewer cells first |
 | `NO_SKIP=1` | never latch the probing shut-off |
+| `SMALL_NOPROBE=n` | branch without probing at non-root nodes with at most n unknown cells (shipped: 31; 0 disables) |
 | `PROBE_WINDOW`, `PROBE_THRESH` | the shut-off's yield window and threshold |
 | `DEAD_WINDOW`, `DEAD_FRAC` | the dead-work watchdog's window and fraction |
 | `EARLY_SOLVE=1` | anytime: stop the probe pass at a probe that completes the grid |
