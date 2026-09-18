@@ -19,9 +19,23 @@ def parse(out):
     if m: strat = m.group(1)
     return n, strat
 
+def shielded_core():
+    # Read the core back from the cgroup so this tracks whatever shield.sh
+    # reserved (same as bench/run.sh) instead of assuming a fixed core.
+    try:
+        with open(os.path.join(CG, "cpuset.cpus")) as f:
+            return f.read().strip()
+    except OSError:
+        sys.exit(f"{CG} missing -- run bench/shield.sh first")
+
+CORE = None
+
 def run(binary, path, timeout):
+    global CORE
+    if CORE is None:
+        CORE = shielded_core()
     cmd = ["bash", "-c",
-           f'echo $BASHPID > {CG}/cgroup.procs 2>/dev/null; exec taskset -c 5 "$0" "$1"',
+           f'echo $BASHPID > {CG}/cgroup.procs 2>/dev/null; exec taskset -c {CORE} "$0" "$1"',
            binary, path]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
