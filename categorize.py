@@ -384,8 +384,13 @@ def place_with_header(path, rows, cols, n_solutions, strategy, elapsed):
 
     if moved:
         os.makedirs(os.path.dirname(new_path), exist_ok=True)
-    with open(new_path, "w") as f:
+    # Written to a temp file and renamed into place: a run killed between
+    # open() and write() left easy_large/2955 empty (2026-09-21), and the
+    # next rebench filed the empty clue set under trivial.
+    tmp_path = new_path + ".tmp"
+    with open(tmp_path, "w") as f:
         f.write(new_content)
+    os.replace(tmp_path, new_path)
     if moved and os.path.exists(path):
         os.remove(path)
     return True, new_path, elapsed
