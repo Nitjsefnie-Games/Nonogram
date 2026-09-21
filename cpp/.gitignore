@@ -1,6 +1,0 @@
-*.o
-solver
-solver-instrumented
-pgo-data/
-
-solver-prof

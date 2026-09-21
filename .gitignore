@@ -1,2 +1,55 @@
-**/__pycache__
-.idea
+# Deny by default: everything is ignored, then exactly what the repository
+# ships is named back, directory by directory (a directory must be
+# re-opened before anything inside it can be named back, because git
+# never looks inside an ignored directory).
+*
+
+# repository root
+!/.gitignore
+!/CONTRIBUTING.md
+!/LICENSE
+!/README.md
+!/requirements.txt
+!/baseline.jsonl
+!/webpbn_progress.txt
+!/*.py
+!/514331-hw6-hw6.py-by-485181-63381.html
+
+# the C++ solver
+!/cpp/
+/cpp/*
+!/cpp/Makefile
+!/cpp/*.cpp
+!/cpp/*.hpp
+!/cpp/bench/
+/cpp/bench/*
+!/cpp/bench/*.py
+!/cpp/bench/*.sh
+!/cpp/bench/*.md
+!/cpp/bench/results/
+/cpp/bench/results/*
+!/cpp/bench/results/*.jsonl
+!/cpp/bench/results/*.csv
+!/cpp/bench/survey/
+/cpp/bench/survey/*
+!/cpp/bench/survey/[0-9]*
+!/cpp/external/
+/cpp/external/*
+!/cpp/external/ankerl/
+/cpp/external/ankerl/*
+!/cpp/external/ankerl/*.h
+
+# the puzzle corpus: one file per puzzle, no extension, under a category
+# directory (categories come and go, so the directory name is a glob)
+!/nonograms/
+/nonograms/*
+!/nonograms/*/
+/nonograms/*/*
+!/nonograms/*/[0-9]*
+!/nonograms/*/pikachu
+
+# helper scripts
+!/scripts/
+/scripts/*
+!/scripts/*.py
+!/scripts/*.sh
