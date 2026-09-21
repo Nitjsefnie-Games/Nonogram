@@ -501,8 +501,9 @@ def main():
                              'the puzzle path passed to the solver.')
     parser.add_argument('--solver-version', metavar='LABEL', default=None,
                         help='Label written as "# solver=" in the header blocks. Defaults to '
-                             'the Python solver version, or "cpp-<git short sha>" when '
-                             '--solver-cmd is given, so blocks from the two solvers never '
+                             'the Python solver version, or "cpp-<short sha of the last commit '
+                             'that touched cpp/*.cpp, cpp/*.hpp, cpp/Makefile or cpp/external>" '
+                             'when --solver-cmd is given, so blocks from the two solvers never '
                              'replace each other.')
     args = parser.parse_args()
 
@@ -510,7 +511,11 @@ def main():
     if args.solver_version:
         SOLVER_VERSION = args.solver_version
     elif args.solver_cmd:
-        sha = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True).stdout.strip()
+        # The last commit that touched what the binary is built from, not
+        # HEAD: a corpus, docs, bench or ignore-file commit does not change
+        # what the solver does.
+        sha = subprocess.run(['git', 'log', '-1', '--format=%h', '--', 'cpp/*.cpp', 'cpp/*.hpp', 'cpp/Makefile', 'cpp/external'],
+                             capture_output=True, text=True).stdout.strip()
         SOLVER_VERSION = f"cpp-{sha or 'unknown'}"
     print(f"Header solver label: {SOLVER_VERSION}")
 
