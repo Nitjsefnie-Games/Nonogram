@@ -1795,37 +1795,82 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         // and columns joined by an unknown cell. More than one means the
         // count is the product of the regions' counts, each found by the
         // same search restricted to that region's rows.
-        static thread_local std::vector<int> parent;
-        parent.resize(static_cast<std::size_t>(H + W));
-        for (int i = 0; i < H + W; ++i) parent[i] = i;
-        auto find = [&](int x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
-        int lines_with_unknowns = 0;
-        for (int r = 0; r < H; ++r) {
-            if (uir[r] == 0 || (region && !region[r])) continue;
-            ++lines_with_unknowns;
-            for (int w = 0; w < kw; ++w) {
-                std::uint64_t m = rk[r * kw + w] & kUnknownBits;
+        //
+        // Connected components by closure over the packed row keys: a
+        // component grows from its lowest row by OR-ing the unknown bits of
+        // every row it reaches into a column mask and sweeping the remaining
+        // rows for one that shares a column with the mask, until a sweep
+        // adds nothing. Word operations per row per sweep, and the common
+        // single-region node ends after the sweep that empties the row set.
+        // A union-find over every unknown cell (two finds per cell) was 30%
+        // of the branch node on easy_small/4774. The component's root is its
+        // lowest row, and components are found in ascending order of that
+        // row, which is the order the old row scan first met each root.
+        const std::uint64_t* zero_rows = trail.row_bucket.data();  // bucket 0: rows without unknowns
+        const int row_words = trail.row_words;
+        std::uint64_t rows_left[kMaxFastCells / 64 + 1];  // H <= kMaxFastCells in fast mode; wider grids fall back below
+        static thread_local std::vector<std::uint64_t> rows_left_v;
+        std::uint64_t* left = rows_left;
+        if (row_words > static_cast<int>(sizeof rows_left / sizeof rows_left[0])) {
+            rows_left_v.resize(static_cast<std::size_t>(row_words));
+            left = rows_left_v.data();
+        }
+        for (int wd = 0; wd < row_words; ++wd) {
+            const int lo = 64 * wd;
+            std::uint64_t valid = (H - lo >= 64) ? ~0ULL : ((1ULL << (H - lo)) - 1);
+            left[wd] = valid & ~zero_rows[wd];
+        }
+        if (region) {
+            for (int wd = 0; wd < row_words; ++wd) {
+                std::uint64_t m = left[wd];
                 while (m != 0) {
-                    const int c = 32 * w + (__builtin_ctzll(m) >> 1);
+                    const int r = 64 * wd + __builtin_ctzll(m);
                     m &= m - 1;
-                    const int a = find(r), b = find(H + c);
-                    if (a != b) parent[a] = b;
+                    if (!region[r]) left[wd] &= ~(1ULL << (r & 63));
                 }
             }
         }
-        (void)lines_with_unknowns;
         int roots = 0;
         static thread_local std::vector<int> root_of_row;
         root_of_row.assign(static_cast<std::size_t>(H), -1);
         static thread_local std::vector<int> root_list;
         root_list.clear();
-        for (int r = 0; r < H; ++r) {
-            if (uir[r] == 0 || (region && !region[r])) continue;
-            const int root = find(r);
-            root_of_row[r] = root;
-            bool seen = false;
-            for (int x : root_list) if (x == root) { seen = true; break; }
-            if (!seen) { root_list.push_back(root); ++roots; }
+        std::uint64_t col_mask[kMaxFastCells / 32];
+        static thread_local std::vector<std::uint64_t> col_mask_v;
+        std::uint64_t* cm = col_mask;
+        if (kw > static_cast<int>(sizeof col_mask / sizeof col_mask[0])) {
+            col_mask_v.resize(static_cast<std::size_t>(kw));
+            cm = col_mask_v.data();
+        }
+        for (;;) {
+            int wd0 = 0;
+            while (wd0 < row_words && left[wd0] == 0) ++wd0;
+            if (wd0 == row_words) break;
+            const int r0 = 64 * wd0 + __builtin_ctzll(left[wd0]);
+            left[wd0] &= left[wd0] - 1;
+            root_of_row[r0] = r0;
+            root_list.push_back(r0);
+            ++roots;
+            for (int w = 0; w < kw; ++w) cm[w] = rk[r0 * kw + w] & kUnknownBits;
+            bool grew = true;
+            while (grew) {
+                grew = false;
+                for (int wd = wd0; wd < row_words; ++wd) {
+                    std::uint64_t m = left[wd];
+                    while (m != 0) {
+                        const int r = 64 * wd + __builtin_ctzll(m);
+                        m &= m - 1;
+                        const std::uint64_t* k = rk + static_cast<std::size_t>(r) * kw;
+                        std::uint64_t hit = 0;
+                        for (int w = 0; w < kw; ++w) hit |= k[w] & cm[w];
+                        if (hit == 0) continue;
+                        for (int w = 0; w < kw; ++w) cm[w] |= k[w] & kUnknownBits;
+                        left[wd] &= ~(1ULL << (r & 63));
+                        root_of_row[r] = r0;
+                        grew = true;
+                    }
+                }
+            }
         }
         if (g_debug_stats && !state.used_backtrack && !region) {
             std::fprintf(stderr, "cache-stats: regions at first branch=%d, unknown cells per region:", roots);
