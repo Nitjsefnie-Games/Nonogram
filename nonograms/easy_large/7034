@@ -1,9 +1,9 @@
-# solver=cpp-6dc88e3e
+# solver=cpp-d85c7576
 # cpu=AMD EPYC Processor (with IBPB)
 # isolated_core=11
 # strategy=contra
 # n_solutions=1
-# solve_time=0.00240
+# solve_time=0.00210
 17 5 2 19
 20 3 2 3 18
 17 2 1 2 1 2 17

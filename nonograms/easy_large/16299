@@ -1,9 +1,9 @@
-# solver=cpp-6dc88e3e
+# solver=cpp-d85c7576
 # cpu=AMD EPYC Processor (with IBPB)
 # isolated_core=11
 # strategy=basic
 # n_solutions=1
-# solve_time=0.00050
+# solve_time=0.00040
 8 4 6 4 9
 1 7 3 4 4 5 4
 1 5 3 3 4 5 4
