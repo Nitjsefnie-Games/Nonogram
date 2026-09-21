@@ -372,9 +372,18 @@ def record_file(path, log_path):
         return False, path, None
     with open(log_path) as f:
         out = f.read()
-    m_found = re.search(r"^Found\s+([\d,]+)\s+solution\(s\)", out, re.MULTILINE)
-    m_time = re.search(r"^Time:\s+([0-9]*\.?[0-9]+)s", out, re.MULTILINE)
-    m_strat = re.search(r"^Strategy:\s+(\S+)", out, re.MULTILINE)
+    # The journal of a reused unit name holds every run, and a run stopped
+    # by a signal prints Time: and Strategy: without a Found line; so the
+    # record is the LAST Found line and the Time / Strategy lines of that
+    # run (the ones between the Time: line just before it and the next
+    # run's start).
+    founds = list(re.finditer(r"^Found\s+([\d,]+)\s+solution\(s\)", out, re.MULTILINE))
+    m_found = founds[-1] if founds else None
+    m_time = m_strat = None
+    if m_found:
+        times = list(re.finditer(r"^Time:\s+([0-9]*\.?[0-9]+)s", out[:m_found.start()], re.MULTILINE))
+        m_time = times[-1] if times else None
+        m_strat = re.search(r"^Strategy:\s+(\S+)", out[m_found.end():], re.MULTILINE)
     if not (m_found and m_time and m_strat) or m_strat.group(1) not in _STRATEGY_NAME_TO_ENUM:
         print(f"  {log_path}: no complete Found / Time / Strategy lines")
         return False, path, None
