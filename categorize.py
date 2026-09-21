@@ -27,6 +27,21 @@ def join_solver_cgroup():
     """Move this process into the exclusive cpuset cgroup if scripts/cpuset_setup.sh
     has been run. Returns the effective cpu list, or None if unavailable."""
     global ISOLATED_CORE
+    # Already inside an exclusive cpuset partition (cpp/bench/run.sh puts a
+    # command into /sys/fs/cgroup/bench, the core bench/shield.sh
+    # reserved): record that core and leave the process where it is.
+    try:
+        with open("/proc/self/cgroup") as f:
+            own = next((l.split(":", 2)[2].strip() for l in f if l.startswith("0::")), "")
+        own_dir = "/sys/fs/cgroup" + own
+        with open(f"{own_dir}/cpuset.cpus.partition") as f:
+            partition = f.read().strip()
+        if partition in ("root", "isolated"):
+            with open(f"{own_dir}/cpuset.cpus.effective") as f:
+                ISOLATED_CORE = f.read().strip()
+            return ISOLATED_CORE
+    except (OSError, StopIteration):
+        pass
     if not os.path.isdir(SOLVER_CGROUP):
         return None
     try:
