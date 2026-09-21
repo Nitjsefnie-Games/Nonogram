@@ -537,7 +537,13 @@ public:
     // when moved out of line, on every lookup.
     template <int KW>
     unsigned char* find(const std::uint64_t* key, std::uint16_t tag) {
-        const std::uint64_t h = hash<KW>(key, tag);
+        return find<KW>(key, tag, hash<KW>(key, tag));
+    }
+    // With the key's hash already computed (solve_lines hashes the next
+    // queued line ahead of time to prefetch its slot).
+    void prefetch(std::uint64_t h) const { __builtin_prefetch(slot(h & mask_)); }
+    template <int KW>
+    unsigned char* find(const std::uint64_t* key, std::uint16_t tag, std::uint64_t h) {
         std::size_t idx = h & mask_;
         tag = full_tag(tag, h);
         for (;;) {
@@ -591,9 +597,6 @@ public:
         return s;
     }
 
-private:
-    static constexpr std::size_t kMinSlots = 1u << 12;  // 128 KB at 32-byte slots
-
     // KW = 0 reads the word count from kw_ (insert and grow, off the hot
     // path); a positive KW is a compile-time count and the same value.
     template <int KW = 0>
@@ -623,6 +626,9 @@ private:
         }
         return diff == 0;
     }
+
+private:
+    static constexpr std::size_t kMinSlots = 1u << 12;  // 128 KB at 32-byte slots
 
     unsigned char* slot(std::size_t idx) const { return buf_.p + (idx << slot_shift_); }
 
@@ -1276,11 +1282,13 @@ BatchResult solve_one_batch_legacy(const LineSpec& spec,
 }
 
 // KW: the puzzle's key word count when known at compile time (1..4), else 0.
+// h: hash of the line's (key, tag), computed by the caller.
 template <bool FAST, int KW>
 inline BatchResult solve_one_batch(const std::vector<const LineSpec*>& mapped,
                                    int index,
                                    bool is_col,
-                                   Picture& pic) {
+                                   Picture& pic,
+                                   std::uint64_t h) {
     if (!FAST) {
         return solve_one_batch_legacy(*mapped[index], index, is_col, pic);
     }
@@ -1291,7 +1299,7 @@ inline BatchResult solve_one_batch(const std::vector<const LineSpec*>& mapped,
     const std::uint16_t tag = (is_col ? g_col_tags : g_row_tags)[static_cast<std::size_t>(index)];
 
     if (g_debug_stats) ++g_stat_lookups;
-    unsigned char* s = g_fast_cache.find<KW>(key, tag);
+    unsigned char* s = g_fast_cache.find<KW>(key, tag, h);
     if (s == nullptr) {
         s = solve_one_batch_miss(*mapped[index], index, is_col, pic, key, tag);
     }
@@ -1375,11 +1383,28 @@ inline bool solve_lines(const std::vector<const LineSpec*>& mapped,
                         Trail& trail) {
     auto& queue = is_row ? pic.row_queue : pic.col_queue;
     auto& dirty = is_row ? pic.row_dirty : pic.col_dirty;
+    // Draining rows changes only the current row's key and column keys
+    // (and vice versa), so the next queued line's key is already what its
+    // lookup will hash: it is hashed one line ahead, its slot prefetched
+    // under this line's lookup and writes, and the hash handed on. On a
+    // 90 x 69 count run the slot load was the top stall of the drain.
+    const int kw = KW > 0 ? KW : pic.key_words;
+    const std::uint64_t* keys = is_row ? pic.row_keys.data() : pic.col_keys.data();
+    const std::uint16_t* tags = (is_row ? g_row_tags : g_col_tags).data();
+    std::uint64_t h = 0;
+    if (FAST && !queue.empty()) h = g_fast_cache.hash<KW>(keys + static_cast<std::size_t>(queue.front()) * kw, tags[queue.front()]);
     while (!queue.empty()) {
         const int index = queue.front();
         queue.pop_front();
         dirty[index] = 0;
-        BatchResult r = solve_one_batch<FAST, KW>(mapped, index, !is_row, pic);
+        std::uint64_t next_h = 0;
+        if (FAST && !queue.empty()) {
+            const int nx = queue.front();
+            next_h = g_fast_cache.hash<KW>(keys + static_cast<std::size_t>(nx) * kw, tags[nx]);
+            g_fast_cache.prefetch(next_h);
+        }
+        BatchResult r = solve_one_batch<FAST, KW>(mapped, index, !is_row, pic, h);
+        h = next_h;
         if (!r.success) {
             return false;
         }
