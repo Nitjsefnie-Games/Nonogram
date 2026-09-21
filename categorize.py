@@ -396,6 +396,21 @@ def place_with_header(path, rows, cols, n_solutions, strategy, elapsed):
     return True, new_path, elapsed
 
 
+def previous_solve_time(path):
+    """solve_time of the file's newest header block, or None without one."""
+    try:
+        with open(path) as f:
+            for line in f:
+                if not line.startswith("#"):
+                    return None
+                m = re.match(r"# solve_time=([0-9.]+)", line)
+                if m:
+                    return float(m.group(1))
+    except OSError:
+        return None
+    return None
+
+
 def rebench_folder(root, excludes, solver_cmd=None):
     print(f"Rebenching {root}")
     if excludes:
@@ -411,6 +426,9 @@ def rebench_folder(root, excludes, solver_cmd=None):
         dirnames[:] = sorted(d for d in dirnames if d not in excludes)
         for fname in sorted(filenames):
             files.append(os.path.join(dirpath, fname))
+    # Shortest previous solve first, so results land in ascending order and
+    # a run cut short has done the cheap ones; files without a header last.
+    files.sort(key=lambda p: (previous_solve_time(p) is None, previous_solve_time(p) or 0.0, p))
 
     rebenched = moved = 0
     for path in files:
