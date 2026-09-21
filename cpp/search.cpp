@@ -1116,12 +1116,14 @@ struct SolveState {
             skip_probing = false;
             probing_pinned = true;
             probe_outcomes.clear();
+            probe_outcome_sum = 0;
         }
         latched_dead = latched_live = 0;
     }
     bool keep_probing = false;  // anytime mode: never latch skip_probing
     double balance_k = 0.0;     // see solve(): K*min - max branch score when > 0
     std::deque<int> probe_outcomes;
+    int probe_outcome_sum = 0;  // sum of probe_outcomes
 
     // Benchmark hook: if MAX_NODES is set (>0), abort the search after that many
     // backtrack nodes. Lets pikachu-class never-terminating puzzles be timed
@@ -1158,14 +1160,16 @@ struct SolveState {
         // Mirror picture.py: don't let yield-window disable probing until
         // we've already found multiple solutions.
         if (solutions_found < probing_min_solutions) return;
+        // probe_outcome_sum is the window's running sum (re-summing the
+        // window on every probe pair was 100 iterations per pair).
         probe_outcomes.push_back(found_contradiction ? 1 : 0);
+        probe_outcome_sum += found_contradiction ? 1 : 0;
         if (probe_outcomes.size() > g_probe_window) {
+            probe_outcome_sum -= probe_outcomes.front();
             probe_outcomes.pop_front();
         }
         if (probe_outcomes.size() == g_probe_window) {
-            int sum = 0;
-            for (int v : probe_outcomes) sum += v;
-            double yield_rate = static_cast<double>(sum) / static_cast<double>(g_probe_window);
+            double yield_rate = static_cast<double>(probe_outcome_sum) / static_cast<double>(g_probe_window);
             if (yield_rate < g_probe_thresh && !keep_probing) {
                 skip_probing = true;
             }
