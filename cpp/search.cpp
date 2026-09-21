@@ -396,7 +396,7 @@ std::uint64_t g_stat_probe_pairs = 0, g_stat_probe_hits = 0;  // probe pairs, an
 // Fraction of the search space completed so far; see SolveState::branch_depth.
 double g_explored_mass = 0.0;
 volatile std::sig_atomic_t g_stop_requested = 0;
-std::string g_stop_path;  // SolveState::branch_path when the stop was taken
+std::string g_stop_path;  // SolveState::path_string() when the stop was taken
 // Periodic progress line (see set_progress_interval).
 double g_progress_interval = 0.0;
 std::chrono::steady_clock::time_point g_progress_start, g_progress_next;
@@ -1026,8 +1026,15 @@ struct SolveState {
     // Two runs of the same tree (same policy) stopped at different times
     // compare by this string lexicographically, a prefix ranking below its
     // extensions; the explored fraction cannot separate them once both sit
-    // inside one big subtree.
-    std::string branch_path;
+    // inside one big subtree. Kept as a preallocated buffer plus length
+    // (solve() sizes it for the deepest possible path) and read into a
+    // string only at a stop: a std::string push/pop per node was 3.5% of
+    // the branch node on easy_medium/108.
+    std::vector<char> path_buf;
+    std::size_t path_len = 0;
+    void path_push(char c) { path_buf[path_len++] = c; }
+    void path_pop() { --path_len; }
+    std::string path_string() const { return std::string(path_buf.data(), path_len); }
     // Count mode (solve(..., count_mode=true)): no solution callbacks; every
     // solve_real / solve_backtrack call leaves the number of solutions of
     // the subtree it just searched in `result`. After propagation the
@@ -1789,7 +1796,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         return false;
     }
     if (g_stop_requested) {
-        g_stop_path = state.branch_path;
+        g_stop_path = state.path_string();
         return false;
     }
 
@@ -2053,9 +2060,9 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 ++state.region_calls;
                 const std::size_t mark = trail.changed_cell_indices.size();
                 const int saved_unknown_count = pic.unknown_count;
-                state.branch_path.push_back(region_char);
+                state.path_push(region_char);
                 if (!solve_backtrack(mapped_rows, mapped_cols, pic, state, on_solution, trail)) return false;
-                state.branch_path.pop_back();
+                state.path_pop();
                 total *= state.result;
                 revert_branch(pic, trail, mark, saved_unknown_count);
                 if (total == 0) break;
@@ -2399,9 +2406,9 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
 
         const double mass_before = g_explored_mass;
         ++state.branch_depth;
-        state.branch_path.push_back(branch == 0 ? '0' : '1');
+        state.path_push(branch == 0 ? '0' : '1');
         const bool go_on = solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
-        state.branch_path.pop_back();
+        state.path_pop();
         --state.branch_depth;
         if (!go_on) {
             return false;
@@ -2609,6 +2616,11 @@ void solve(const std::vector<std::vector<int>>& rows,
     trail.col_hist.assign(static_cast<std::size_t>(H + 1), 0);
     trail.col_hist[static_cast<std::size_t>(H)] = W;
     state.count_mode = count_mode;
+    // Every branch settles a cell and every region split nests inside a
+    // branch with fewer cells, so the path holds at most one character per
+    // cell of each kind.
+    state.path_buf.assign(2 * static_cast<std::size_t>(H) * static_cast<std::size_t>(W) + 4, 0);
+    state.path_len = 0;
     if (count_mode && !g_no_state_cache) {
         std::size_t state_budget = 512ULL * 1024ULL * 1024ULL;
         if (const char* env = std::getenv("STATE_CACHE_MB")) {
