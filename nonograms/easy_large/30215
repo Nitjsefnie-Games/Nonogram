@@ -1,13 +1,9 @@
 # solver=cpp-1e16a40
 # cpu=AMD EPYC Processor (with IBPB)
+# isolated_core=11
 # strategy=basic
 # n_solutions=1
-# solve_time=0.00190
-# solver=cpp-298d4941
-# cpu=AMD EPYC Processor (with IBPB)
-# strategy=basic
-# n_solutions=1
-# solve_time=0.00140
+# solve_time=0.00070
 17 5 3 8
 9 5 5 2 1 3 2
 6 3 5 4 2 2 2 1

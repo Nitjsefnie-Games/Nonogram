@@ -1,18 +1,9 @@
 # solver=cpp-1e16a40
 # cpu=AMD EPYC Processor (with IBPB)
+# isolated_core=11
 # strategy=backtrack
 # n_solutions=1
-# solve_time=5.13480
-# solver=cpp-eb7e8a1
-# cpu=AMD EPYC Processor (with IBPB)
-# strategy=backtrack
-# n_solutions=1
-# solve_time=4.42020
-# solver=cpp-041dbf2
-# cpu=AMD EPYC Processor (with IBPB)
-# strategy=backtrack
-# n_solutions=1
-# solve_time=4.59630
+# solve_time=4.56240
 2
 2 4
 2 6
