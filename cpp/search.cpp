@@ -912,8 +912,6 @@ private:
         // occupied slots are a prefix, so the first empty one ends the scan.
         std::size_t free_at[2];
         int free_n[2] = {0, 0};
-        std::size_t victim = base[0];
-        std::uint64_t victim_work = ~0ULL;
         for (int w = 0; w < 2; ++w) {
             for (int p = 0; p < kWindow; ++p) {
                 const std::size_t j = base[w] + static_cast<std::size_t>(p);
@@ -923,8 +921,6 @@ private:
                     free_n[w] = kWindow - p;
                     break;
                 }
-                const std::uint64_t wk = s.b >> 56;
-                if (wk < victim_work) { victim_work = wk; victim = j; }
             }
         }
         if (free_n[0] + free_n[1] > 0) {
@@ -933,6 +929,17 @@ private:
             s.a = k.a; s.b = b; s.count = count;
             ++count_;
             return false;
+        }
+        // Both windows full: evict the entry with the least work. Ranked
+        // only here, not on every slot of every insert.
+        std::size_t victim = base[0];
+        std::uint64_t victim_work = ~0ULL;
+        for (int w = 0; w < 2; ++w) {
+            for (int p = 0; p < kWindow; ++p) {
+                const std::size_t j = base[w] + static_cast<std::size_t>(p);
+                const std::uint64_t wk = slots_[j].b >> 56;
+                if (wk < victim_work) { victim_work = wk; victim = j; }
+            }
         }
         Slot& s = slots_[victim];
         s.a = k.a; s.b = b; s.count = count;
@@ -945,10 +952,17 @@ private:
 
 // 128-bit hash of one line for the state cache: its tag (index plus a
 // row/column bit) and its packed key words, two independent wyhash chains.
-inline StateTable::Key hash_line(std::uint64_t tag, const std::uint64_t* words, int kw) {
+// The chains' starts depend on the tag alone, so they are computed once
+// per line (line_seed, kept in SolveState) and the per-node hash of a
+// changed line is one multiply-fold per word per chain.
+inline StateTable::Key line_seed(std::uint64_t tag) {
     namespace wy = ankerl::unordered_dense::detail::wyhash;
-    std::uint64_t ha = wy::mix(0x243F6A8885A308D3ULL ^ tag, 0xE7037ED1A0B428DBULL);
-    std::uint64_t hb = wy::mix(0x13198A2E03707344ULL ^ tag, 0x8EBC6AF09C88C6E3ULL);
+    return StateTable::Key{wy::mix(0x243F6A8885A308D3ULL ^ tag, 0xE7037ED1A0B428DBULL),
+                           wy::mix(0x13198A2E03707344ULL ^ tag, 0x8EBC6AF09C88C6E3ULL)};
+}
+inline StateTable::Key hash_line(StateTable::Key seed, const std::uint64_t* words, int kw) {
+    namespace wy = ankerl::unordered_dense::detail::wyhash;
+    std::uint64_t ha = seed.a, hb = seed.b;
     for (int w = 0; w < kw; ++w) {
         ha = wy::mix(ha ^ words[w], 0xE7037ED1A0B428DBULL);
         hb = wy::mix(hb ^ words[w], 0x8EBC6AF09C88C6E3ULL);
@@ -1015,6 +1029,7 @@ struct SolveState {
     // whole grid, both brought up to date from the trail's dirty lists at
     // every branch node.
     std::vector<StateTable::Key> row_hash, col_hash;
+    std::vector<StateTable::Key> row_seed, col_seed;  // line_seed per row / column
     StateTable::Key grid_key{0, 0};
     std::uint64_t state_lookups = 0, state_hits = 0, state_evictions = 0;
     // Adaptive gate by node size (bucket = log2 of the unknown cells):
@@ -1762,7 +1777,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         StateTable::Key& gk = state.grid_key;
         for (int r : trail.dirty_rows) {
             gk.a ^= rh[r].a; gk.b -= rh[r].b;
-            rh[r] = uir[r] > 0 ? hash_line(static_cast<std::uint64_t>(r) | (1ULL << 40), rk + static_cast<std::size_t>(r) * kw, kw)
+            rh[r] = uir[r] > 0 ? hash_line(state.row_seed[static_cast<std::size_t>(r)], rk + static_cast<std::size_t>(r) * kw, kw)
                                : StateTable::Key{0, 0};
             gk.a ^= rh[r].a; gk.b += rh[r].b;
             trail.row_hash_dirty[static_cast<std::size_t>(r)] = 0;
@@ -1770,7 +1785,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         trail.dirty_rows.clear();
         for (int c : trail.dirty_cols) {
             gk.a ^= ch[c].a; gk.b -= ch[c].b;
-            ch[c] = uic[c] > 0 ? hash_line(static_cast<std::uint64_t>(c) | (1ULL << 41), ck + static_cast<std::size_t>(c) * kw, kw)
+            ch[c] = uic[c] > 0 ? hash_line(state.col_seed[static_cast<std::size_t>(c)], ck + static_cast<std::size_t>(c) * kw, kw)
                                : StateTable::Key{0, 0};
             gk.a ^= ch[c].a; gk.b += ch[c].b;
             trail.col_hash_dirty[static_cast<std::size_t>(c)] = 0;
@@ -1843,11 +1858,11 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 }
             }
         }
+        // Component i's rows as a bitset at comp_rows[i * row_words ..]; a
+        // per-row root array needed an H-wide fill at every node.
         int roots = 0;
-        static thread_local std::vector<int> root_of_row;
-        root_of_row.assign(static_cast<std::size_t>(H), -1);
-        static thread_local std::vector<int> root_list;
-        root_list.clear();
+        static thread_local std::vector<std::uint64_t> comp_rows;
+        comp_rows.clear();
         std::uint64_t col_mask[kMaxFastCells / 32];
         static thread_local std::vector<std::uint64_t> col_mask_v;
         std::uint64_t* cm = col_mask;
@@ -1861,8 +1876,9 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             if (wd0 == row_words) break;
             const int r0 = 64 * wd0 + __builtin_ctzll(left[wd0]);
             left[wd0] &= left[wd0] - 1;
-            root_of_row[r0] = r0;
-            root_list.push_back(r0);
+            comp_rows.resize(comp_rows.size() + static_cast<std::size_t>(row_words), 0);
+            std::uint64_t* comp = comp_rows.data() + static_cast<std::size_t>(roots) * row_words;
+            comp[wd0] |= 1ULL << (r0 & 63);
             ++roots;
             for (int w = 0; w < kw; ++w) cm[w] = rk[r0 * kw + w] & kUnknownBits;
             bool grew = true;
@@ -1879,7 +1895,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                         if (hit == 0) continue;
                         for (int w = 0; w < kw; ++w) cm[w] |= k[w] & kUnknownBits;
                         left[wd] &= ~(1ULL << (r & 63));
-                        root_of_row[r] = r0;
+                        comp[wd] |= 1ULL << (r & 63);
                         grew = true;
                     }
                 }
@@ -1887,9 +1903,10 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         }
         if (g_debug_stats && !state.used_backtrack && !region) {
             std::fprintf(stderr, "cache-stats: regions at first branch=%d, unknown cells per region:", roots);
-            for (int root : root_list) {
+            for (int i = 0; i < roots; ++i) {
                 int cells = 0;
-                for (int r = 0; r < H; ++r) if (root_of_row[r] == root) cells += uir[r];
+                const std::uint64_t* comp = comp_rows.data() + static_cast<std::size_t>(i) * row_words;
+                for (int r = 0; r < H; ++r) if ((comp[r >> 6] >> (r & 63)) & 1) cells += uir[r];
                 std::fprintf(stderr, " %d", cells);
             }
             std::fprintf(stderr, "\n");
@@ -1927,20 +1944,19 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             // the share is restored once when the split completes.
             const double mass_at_split = g_explored_mass;
             std::vector<char> saved_region = state.region_row;
-            std::vector<int> roots_copy = root_list;
-            std::vector<int> row_root(root_of_row.begin(), root_of_row.end());
+            const std::vector<std::uint64_t> comps(comp_rows.begin(), comp_rows.end());
             const double scale_at_split = g_mass_scale;
-            g_mass_scale = scale_at_split / static_cast<double>(roots_copy.size());
+            g_mass_scale = scale_at_split / static_cast<double>(roots);
             u128 total = 1;
-            int region_index = 0;
-            for (int root : roots_copy) {
-                const char region_char = static_cast<char>('a' + (region_index++ & 15));
+            for (int region_index = 0; region_index < roots; ++region_index) {
+                const char region_char = static_cast<char>('a' + (region_index & 15));
                 // A region seen before (the branch cell's lines split it
                 // off, so it is the same under both branch values) is a
                 // state-cache hit at the region search's root node: the
                 // key there is the region's lines, exactly this region.
+                const std::uint64_t* comp = comps.data() + static_cast<std::size_t>(region_index) * row_words;
                 state.region_row.assign(static_cast<std::size_t>(H), 0);
-                for (int r = 0; r < H; ++r) if (row_root[r] == root) state.region_row[r] = 1;
+                for (int r = 0; r < H; ++r) state.region_row[static_cast<std::size_t>(r)] = static_cast<char>((comp[r >> 6] >> (r & 63)) & 1);
                 ++state.region_calls;
                 const std::size_t mark = trail.changed_cell_indices.size();
                 const int saved_unknown_count = pic.unknown_count;
@@ -2522,6 +2538,10 @@ void solve(const std::vector<std::vector<int>>& rows,
         state.state_cache.init(state_budget);
         state.row_hash.assign(static_cast<std::size_t>(H), StateTable::Key{0, 0});
         state.col_hash.assign(static_cast<std::size_t>(W), StateTable::Key{0, 0});
+        state.row_seed.resize(static_cast<std::size_t>(H));
+        state.col_seed.resize(static_cast<std::size_t>(W));
+        for (int r = 0; r < H; ++r) state.row_seed[static_cast<std::size_t>(r)] = line_seed(static_cast<std::uint64_t>(r) | (1ULL << 40));
+        for (int c = 0; c < W; ++c) state.col_seed[static_cast<std::size_t>(c)] = line_seed(static_cast<std::uint64_t>(c) | (1ULL << 41));
         state.grid_key = StateTable::Key{0, 0};
         state.sc_yield = g_state_cache_yield;
         // Every line starts flagged, so the first node computes them all.
