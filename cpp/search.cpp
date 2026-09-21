@@ -1965,13 +1965,9 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         return s;
     };
 
-    // Composite key: ascending line_constraint, then descending neighbor.
-    // Returned via a pair so std::less ordering matches the desired ordering
-    // (we negate neighbor so larger neighbor compares smaller, i.e. wins ties).
-    auto composite_key = [&](int r, int c) {
-        int line_constraint = uir[r] + uic[c];
-        return std::pair<int, int>(line_constraint, -neighbor_score(r, c));
-    };
+    // Composite key: ascending line_constraint (uir[r] + uic[c]), then
+    // descending neighbor, compared as the pair (line_constraint, -neighbor)
+    // so std::less gives the desired order (a larger neighbor wins ties).
 
     if (state.skip_probing || (g_small_noprobe > 0 && n_unknown <= g_small_noprobe && state.branch_depth > 0)) {
         // Pick the unknown cell with the smallest composite key (most-
@@ -2000,12 +1996,19 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                     const int r = 64 * wd + __builtin_ctzll(rows);
                     rows &= rows - 1;
                     if (region && !region[r]) continue;
+                    const int uir_r = uir[r];
                     for (int w = 0; w < kw; ++w) {
                         std::uint64_t m = rk[r * kw + w] & kUnknownBits;
                         while (m != 0) {
                             const int c = 32 * w + (__builtin_ctzll(m) >> 1);
                             m &= m - 1;
-                            std::pair<int, int> key = composite_key(r, c);
+                            // The key is (line constraint, -neighbours) in
+                            // lexicographic order, so a cell whose line
+                            // constraint alone loses needs no neighbour
+                            // count (four pixel loads and branches).
+                            const int lc = uir_r + uic[c];
+                            if (have && lc > best_key.first) continue;
+                            const std::pair<int, int> key(lc, -neighbor_score(r, c));
                             if (!have || key < best_key || (key == best_key && r < best_row)) {
                                 best_key = key;
                                 best_row = r;
@@ -2291,6 +2294,9 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         // A child that branched has already accounted for its own subtree
         // through its children; only a leaf child is added here.
         if (g_explored_mass == mass_before) g_explored_mass += g_half_pow[static_cast<std::size_t>(state.branch_depth) + 1] * g_mass_scale;
+        // The insert below touches the key's two windows, evicted from the
+        // caches by the subtree; start fetching them under the last revert.
+        if (branch == 1 && cache_this_node) state.state_cache.prefetch(state_key);
         revert_branch(pic, trail, mark, saved_unknown_count);
     }
     state.result = subtree_total;
