@@ -21,6 +21,7 @@ PARTIALLY_SOLVED_DIR = "nonograms/partially_solved"
 SOLVER_CGROUP = "/sys/fs/cgroup/nonogram-solver"
 CPU_MODEL = get_cpu_info().get("brand_raw", "unknown")
 ISOLATED_CORE = None
+KEEP_OLD_HEADERS = False  # --keep-old-headers: retain previous header blocks in the file
 
 
 def join_solver_cgroup():
@@ -385,6 +386,21 @@ def record_file(path, log_path):
     return ok, new_path, elapsed
 
 
+def strip_old_headers(path):
+    """Keep only the newest header block of a puzzle file (the history is
+    in git). Returns True when the file changed."""
+    with open(path) as f:
+        full = f.read()
+    blocks, body = parse_header_blocks(full)
+    if len(blocks) <= 1:
+        return False
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
+        f.write(blocks[0] + body)
+    os.replace(tmp_path, path)
+    return True
+
+
 def place_with_header(path, rows, cols, n_solutions, strategy, elapsed):
     """Prepend the current header block and move the file to its time bucket."""
     strat_cat = strategy.value
@@ -393,10 +409,14 @@ def place_with_header(path, rows, cols, n_solutions, strategy, elapsed):
         full = f.read()
     blocks, body = parse_header_blocks(full)
     new_block = make_header_block(strat_cat, n_solutions, elapsed)
-    if blocks and header_matches_current(blocks[0]):
-        blocks[0] = new_block
+    if KEEP_OLD_HEADERS:
+        if blocks and header_matches_current(blocks[0]):
+            blocks[0] = new_block
+        else:
+            blocks.insert(0, new_block)
     else:
-        blocks.insert(0, new_block)
+        # Only the current block: the history is in git, not in the file.
+        blocks = [new_block]
     new_content = "".join(blocks) + body
 
     time_cat = get_time_category(elapsed, rows, cols)
@@ -484,6 +504,10 @@ def main():
                         help='Write the golden header for PUZZLE from LOG, a finished solver run\'s stdout '
                              '(journalctl -o cat dump with the Found / Time / Strategy lines), and move '
                              'the file to its time bucket; no re-solve')
+    parser.add_argument('--keep-old-headers', action='store_true',
+                        help='Retain previous header blocks in a re-headed file (default: only the current block)')
+    parser.add_argument('--strip-old-headers', nargs='+', metavar='PUZZLE',
+                        help='Rewrite the named puzzle files keeping only their newest header block')
     parser.add_argument('--repeat', type=int, default=1, metavar='N',
                         help='--rebench with --solver-cmd: solve each puzzle N times and keep the '
                              'fastest time (the counts must agree)')
@@ -524,6 +548,14 @@ def main():
         print(f"Pinned to exclusive cpuset core(s): {joined}")
     else:
         print(f"(no exclusive cpuset; run scripts/cpuset_setup.sh as root for stable timings)")
+
+    global KEEP_OLD_HEADERS
+    KEEP_OLD_HEADERS = args.keep_old_headers
+
+    if args.strip_old_headers:
+        changed = sum(strip_old_headers(p) for p in args.strip_old_headers)
+        print(f"stripped old header blocks from {changed} of {len(args.strip_old_headers)} files")
+        return
 
     if args.record:
         record_file(args.record[0], args.record[1])
