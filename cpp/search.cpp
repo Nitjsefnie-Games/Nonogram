@@ -871,8 +871,7 @@ public:
     // (byte = 4*lg + next two mantissa bits), so decode_work is within 20%.
     static int encode_work(std::uint64_t n) {
         if (n < 4) return static_cast<int>(n);  // 0..3 exact: byte/4 == 0 plus the fraction
-        int lg = 0;
-        while ((n >> (lg + 1)) != 0) ++lg;
+        const int lg = 63 - __builtin_clzll(n);
         const int frac = static_cast<int>((n >> (lg - 2)) & 3);
         return std::min(255, lg * 4 + frac);
     }
@@ -886,10 +885,16 @@ private:
     struct Slot { std::uint64_t a, b; u128 count; };
     static constexpr std::size_t kMinSlots = 4096;
 
+    // Doubles while small; from 64k slots (2 MB, one huge page) grows 4x,
+    // since every growth re-places every entry (two window scans each) and
+    // the re-placing was 2/3 of StateTable::insert on easy_medium/108.
+    // Capped by the budget-derived max_slots_, which is a power of two.
     void grow() {
         HugeArray<Slot> old;
         old.swap(slots_);
-        nslots_ *= 2;
+        std::size_t factor = (nslots_ >= (std::size_t{1} << 16)) ? 4 : 2;
+        while (factor > 2 && nslots_ * factor > max_slots_) factor /= 2;
+        nslots_ *= factor;
         mask_ = nslots_ - 1;
         slots_.assign(nslots_);
         count_ = 0;
