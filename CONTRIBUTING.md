@@ -175,6 +175,7 @@ with the numbers that kept it out of the shipped build:
 | `PROBE_WINDOW`, `PROBE_THRESH` | the shut-off's yield window and threshold |
 | `DEAD_WINDOW`, `DEAD_FRAC` | the dead-work watchdog's window and fraction |
 | `EARLY_SOLVE=1` | anytime: stop the probe pass at a probe that completes the grid |
+| `NO_PROBE_SKIP=1` | probe every cell both ways even when an earlier probe of the same pass already bounds the fill below the best branch score (the skip is on in the shipped min-balanced and anytime-max orders; corpus probes -14.5%, counts and strategy labels unchanged) |
 | `DEBUG_IMPL=1/2` | implication graph with contrapositive edges: count / act |
 | `NO_STATE_CACHE=1` | count mode without the region state cache (the count of a region's state, keyed by its line keys, reused when another branch order reaches it; it also serves the region split, so a split-off region seen before is a hit at its search's root) |
 | `STATE_CACHE_PROBE_ONLY=1` | key and look up every node but never take a hit: the instruction delta against `NO_STATE_CACHE=1` is the cache's own cost |

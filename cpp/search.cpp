@@ -338,6 +338,9 @@ const bool g_no_state_cache = std::getenv("NO_STATE_CACHE") != nullptr;
 // hit, so the tree is the no-cache tree and the instruction delta against
 // NO_STATE_CACHE=1 is the cache's own cost.
 const bool g_state_cache_probe_only = std::getenv("STATE_CACHE_PROBE_ONLY") != nullptr;
+// NO_PROBE_SKIP=1 probes every cell both ways even when an earlier probe
+// of the pass bounds the result (see ProbeBounds), for measuring the skip.
+const bool g_no_probe_skip = std::getenv("NO_PROBE_SKIP") != nullptr;
 // STATE_CACHE_YIELD=<x> overrides the per-bucket gate's threshold (nodes
 // saved per lookup below which a node-size bucket stops using the cache;
 // 0 never gates).
@@ -346,6 +349,7 @@ const double g_state_cache_yield = std::getenv("STATE_CACHE_YIELD") ? std::atof(
 constexpr double g_state_cache_yield = 0.5;
 constexpr bool g_no_state_cache = false;
 constexpr bool g_state_cache_probe_only = false;
+constexpr bool g_no_probe_skip = false;
 constexpr std::uint64_t g_dead_window = 4096;
 constexpr double g_dead_frac = 0.9;
 constexpr int g_debug_impl = 0;
@@ -1360,6 +1364,57 @@ struct ProbeResult {
     int pixels_filled;
 };
 
+// What the probes of one pass at one node imply about each other. When
+// probing A=v settled B=w without a contradiction, the propagation from
+// B=w alone reaches a subset of that fixpoint (line propagation is
+// monotone and the fixpoint is closed under it), so B=w is consistent and
+// settles at most as many cells: the fill of the A=v probe bounds the
+// fill of the B=w probe from above. The pass records, per (cell, value),
+// the smallest such bound seen; a later probe whose bound is already below
+// the best branch score so far cannot become the branch cell (its own
+// fill is at most the bound) and cannot be forced (it is consistent), so
+// it is skipped and the bound stands in for its fill in the comparisons
+// below. The branch cell and the forced cells of the pass are unchanged;
+// the node's tree is bit-for-bit identical. Only recorded for probes whose
+// fill is below the best score (note_below), since a higher bound could
+// only matter once the best grows past it and those probes carry the long
+// trails that make recording cost what the skips save. Bounds hold for one
+// board: a forced commit advances the generation (invalidate()).
+struct ProbeBounds {
+    // One word per (cell, value): the generation's complement in the high
+    // half, the fill in the low half, so within the current generation the
+    // smallest fill is the minimum word and note() is a branch-free min. An
+    // empty word (all ones) never matches the generation (never 0).
+    std::vector<std::uint64_t> v;
+    std::uint32_t cur = 0;
+    int W = 0;
+    int note_below = 0;
+    void reset(int height, int width) {
+        const std::size_t n = static_cast<std::size_t>(height) * static_cast<std::size_t>(width) * 2;
+        if (v.size() != n || cur == 0xFFFFFFFFu) { v.assign(n, ~0ULL); cur = 0; }
+        W = width;
+        ++cur;
+    }
+    void invalidate() {
+        if (cur == 0xFFFFFFFFu) { std::fill(v.begin(), v.end(), ~0ULL); cur = 0; }
+        ++cur;
+    }
+    std::uint64_t stamp() const { return static_cast<std::uint64_t>(~cur) << 32; }
+    std::size_t at(int row, int col, std::int8_t val) const {
+        return (static_cast<std::size_t>(row) * static_cast<std::size_t>(W) + static_cast<std::size_t>(col)) * 2 + static_cast<std::size_t>(val);
+    }
+    void note(int row, int col, std::int8_t val, std::uint64_t stamped_fill) {
+        std::uint64_t& w = v[at(row, col, val)];
+        w = std::min(w, stamped_fill);
+    }
+    // The bound, or INT_MAX when no probe of this pass settled the cell to val.
+    int bound(int row, int col, std::int8_t val) const {
+        const std::uint64_t w = v[at(row, col, val)];
+        return (w >> 32) == (stamp() >> 32) ? static_cast<int>(w & 0xFFFFFFFFu) : INT_MAX;
+    }
+};
+std::uint64_t g_stat_probe_skips = 0;  // probes the bounds made unnecessary
+
 // RAII guard that snapshots a small amount of Picture state at construction
 // and restores pic to its entry state on destruction by walking the trail.
 struct ProbeGuard {
@@ -1408,7 +1463,8 @@ ProbeResult probe_cell(int row,
                        std::int8_t val,
                        const std::vector<const LineSpec*>& mapped_rows,
                        const std::vector<const LineSpec*>& mapped_cols,
-                       Picture& pic) {
+                       Picture& pic,
+                       ProbeBounds* bounds) {
     // Reusable per-probe trail. probe_cell never nests (it calls only
     // solve_lines, which never probes), and the previous probe's ProbeGuard
     // already reverted every cell it touched, so we just clear the index buffer
@@ -1442,6 +1498,17 @@ ProbeResult probe_cell(int row,
     }
 
     if (g_debug_stats) ++g_stat_probe_ok;
+    const int filled = count_solved_pixels(pic);
+    if (bounds != nullptr && filled < bounds->note_below) {
+        // Every cell this probe settled is bounded by its fill (see ProbeBounds).
+        const int W = pic.width();
+        const std::int8_t* px = pic.pixels.data();
+        const std::uint64_t stamped = bounds->stamp() | static_cast<std::uint32_t>(filled);
+        for (int e : trail.changed_cell_indices) {
+            const int r = trail_row(e), c = trail_col(e);
+            bounds->note(r, c, px[r * W + c], stamped);
+        }
+    }
     if (g_debug_impl) {
         g_impl_off.push_back(static_cast<int>(g_impl_rec.size()));
         const int W = pic.width();
@@ -1450,7 +1517,7 @@ ProbeResult probe_cell(int row,
             g_impl_rec.push_back((e << 1) | v);
         }
     }
-    return ProbeResult{true, count_solved_pixels(pic)};
+    return ProbeResult{true, filled};
 }
 
 // Implication-graph analysis of the current node's probe record (see
@@ -1958,13 +2025,45 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         const std::int8_t* pxs = pic.pixels.data();
         if (g_debug_impl) { g_impl_rec.clear(); g_impl_off.clear(); }
 
+        // A probe whose bound (ProbeBounds) is below the best score so far
+        // is consistent and cannot become the branch cell, so it is skipped
+        // and the bound stands in for its fill. The BRANCH_K score needs
+        // both real fills and the ANYTIME_TB experiments read the loser's
+        // fill on a tie, so the skip is off in those; it is on in the
+        // shipped min-balanced and anytime-max orders.
+        static thread_local ProbeBounds bounds;
+        const bool skip_ok = !g_no_probe_skip && state.balance_k <= 0.0 && g_anytime_tb == 0;
+        bounds.reset(H, W);
+
         for (int idx : order) {
             int row = unknown_coords[idx].first;
             int col = unknown_coords[idx].second;
             if (pxs[row * W + col] != UNKNOWN) continue;  // settled by an earlier commit this pass
 
-            ProbeResult full_res = probe_cell(row, col, FULL, mapped_rows, mapped_cols, pic);
-            ProbeResult empty_res = probe_cell(row, col, EMPTY, mapped_rows, mapped_cols, pic);
+            // Each value is skipped only when a bound proves it consistent
+            // (bound set) AND below the best score. A skipped value is never
+            // a contradiction, so the "exactly one probe contradicts" test
+            // that forces a cell, and the "both contradict" test that kills
+            // the node, both see the same outcomes a full probe would: the
+            // strategy label and the tree are unchanged. In particular, a
+            // contradicting FULL never lets EMPTY be assumed consistent --
+            // that would mark a contradiction on a node that is merely dead.
+            ProbeResult full_res, empty_res;
+            bounds.note_below = skip_ok ? best_pixels : INT_MIN;
+            const int bound_full = skip_ok ? bounds.bound(row, col, FULL) : INT_MAX;
+            if (bound_full < best_pixels) {
+                if (g_debug_stats) ++g_stat_probe_skips;
+                full_res = ProbeResult{true, bound_full};
+            } else {
+                full_res = probe_cell(row, col, FULL, mapped_rows, mapped_cols, pic, &bounds);
+            }
+            const int bound_empty = skip_ok ? bounds.bound(row, col, EMPTY) : INT_MAX;
+            if (bound_empty < best_pixels) {
+                if (g_debug_stats) ++g_stat_probe_skips;
+                empty_res = ProbeResult{true, bound_empty};
+            } else {
+                empty_res = probe_cell(row, col, EMPTY, mapped_rows, mapped_cols, pic, &bounds);
+            }
 
             state.record_probe((!full_res.ok) || (!empty_res.ok));
 
@@ -1989,6 +2088,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 if (pic.is_solved()) {
                     return solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
                 }
+                bounds.invalidate();  // the board grew: earlier bounds no longer hold
                 committed = true;
                 continue;
             }
@@ -2252,8 +2352,8 @@ double estimate_dive(const std::vector<const LineSpec*>& mapped_rows,
         if (br < 0) return weight;  // no unknowns (already solved-equivalent)
 
         // Count viable values via lookahead probes (each reverts pic).
-        ProbeResult pf = probe_cell(br, bc, FULL, mapped_rows, mapped_cols, pic);
-        ProbeResult pe = probe_cell(br, bc, EMPTY, mapped_rows, mapped_cols, pic);
+        ProbeResult pf = probe_cell(br, bc, FULL, mapped_rows, mapped_cols, pic, nullptr);
+        ProbeResult pe = probe_cell(br, bc, EMPTY, mapped_rows, mapped_cols, pic, nullptr);
         const int nv = (pf.ok ? 1 : 0) + (pe.ok ? 1 : 0);
         if (nv == 0) return 0.0;
         std::int8_t val;
@@ -2416,8 +2516,9 @@ void solve(const std::vector<std::vector<int>>& rows,
         for (int i = 0; i < 64; ++i) {
             if (g_stat_probe_lookups_hist[i]) std::fprintf(stderr, " %d:%llu", i, static_cast<unsigned long long>(g_stat_probe_lookups_hist[i]));
         }
-        std::fprintf(stderr, "\ncache-stats: probe-pairs=%llu with-contradiction=%llu\n",
-                     static_cast<unsigned long long>(g_stat_probe_pairs), static_cast<unsigned long long>(g_stat_probe_hits));
+        std::fprintf(stderr, "\ncache-stats: probe-pairs=%llu with-contradiction=%llu probes-skipped=%llu\n",
+                     static_cast<unsigned long long>(g_stat_probe_pairs), static_cast<unsigned long long>(g_stat_probe_hits),
+                     static_cast<unsigned long long>(g_stat_probe_skips));
         std::fprintf(stderr, "cache-stats: solutions_found=%d skip_probing=%d\n", state.solutions_found, static_cast<int>(state.skip_probing));
         std::fprintf(stderr, "cache-stats: latched subtrees dead[log2 size:count]:");
         for (int i = 0; i < 40; ++i) if (g_stat_dead_hist[i]) std::fprintf(stderr, " %d:%llu", i, static_cast<unsigned long long>(g_stat_dead_hist[i]));
