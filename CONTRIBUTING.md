@@ -144,13 +144,14 @@ on branch-node counts, which are deterministic, rather than on wall time:
 
 ```
 make stats
-bench/nodes.py ./solver-stats --exclude extreme -o bench/results/<tag>-nodes.jsonl
+bench/nodes.py ./solver-stats -o bench/results/<tag>-nodes.jsonl
 bench/nodes.py --compare bench/results/a-nodes.jsonl bench/results/b-nodes.jsonl
 ```
 
-`extreme/` holds fully counted puzzles that take minutes each (3867:
-63,502,007,481 solutions in ten minutes), so a routine node-count run
-excludes it; include it when the change targets that class.
+`nodes.py` skips `partially_solved/` and `in_progress/` (no finished
+count to check) and `extreme/` (fully counted puzzles that take minutes
+to hours each, 3867 ten minutes, 30254 forty) by default; `--exclude`
+adds categories on top of those and `--include-all` runs everything.
 
 Two things to know when reading those numbers. The corpus's two largest
 trees (`easy_large/6689`, `easy_large/3929`) run with probing shut off after the
@@ -167,6 +168,7 @@ with the numbers that kept it out of the shipped build:
 |---|---|
 | `BRANCH_K=k` | branch score `k*min - max` instead of min with the balanced tie-break |
 | `ANYTIME_TB=1/2` | anytime-mode tie-break on the max toward larger / smaller min |
+| `BRANCH_MAX=1` | the anytime order (larger probe fill first) in every mode: clears dead and sparse subtrees fast (pikachu 47% of the space in 300 s against 10%) but exhaustive trees grow, corpus +24% nodes and 9x probes (9-Dom 3k -> 114k nodes), so not shipped |
 | `FIRST_VAL=1` | explore the branch value whose probe settled fewer cells first |
 | `NO_SKIP=1` | never latch the probing shut-off |
 | `SMALL_NOPROBE=n` | branch without probing at non-root nodes with at most n unknown cells (shipped: 47; 0 disables) |

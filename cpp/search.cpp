@@ -305,6 +305,13 @@ const int g_debug_impl = std::getenv("DEBUG_IMPL") ? std::atoi(std::getenv("DEBU
 // ANYTIME_TB=1 breaks anytime-mode ties on the max toward the larger min,
 // =2 toward the smaller min (the shipped order is first-found).
 const int g_anytime_tb = std::getenv("ANYTIME_TB") ? std::atoi(std::getenv("ANYTIME_TB")) : 0;
+// BRANCH_MAX=1 scores branch cells by the larger probe fill (the anytime
+// order) in every mode. Count mode then clears dead and sparse subtrees
+// far faster (300 s: pikachu 47% of the space against 10%, 7785 50%
+// against 8%, 13480 50% against 11% with zero solutions in that half)
+// but exhaustive trees grow: corpus +24% branch nodes and 9x probes,
+// 9-Dom 3,232 -> 114,021 nodes, 6574 154 -> 102,529. Not shipped.
+const bool g_branch_max = std::getenv("BRANCH_MAX") != nullptr;
 // FIRST_VAL=1 explores the branch value whose probe settled FEWER cells
 // first (the shipped order explores the one that settled more).
 const bool g_first_val_low = std::getenv("FIRST_VAL") != nullptr;
@@ -343,6 +350,7 @@ constexpr std::uint64_t g_dead_window = 4096;
 constexpr double g_dead_frac = 0.9;
 constexpr int g_debug_impl = 0;
 constexpr int g_anytime_tb = 0;
+constexpr bool g_branch_max = false;
 constexpr bool g_first_val_low = false;
 constexpr bool g_no_skip = false;
 constexpr int g_small_noprobe = kSmallNoProbe;
@@ -2005,7 +2013,8 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             const int f = full_res.pixels_filled, e = empty_res.pixels_filled;
             const int lo = std::min(f, e), hi = std::max(f, e);
             bool better;
-            if (state.keep_probing) {
+            const bool max_order = state.keep_probing || g_branch_max;
+            if (max_order) {
                 better = hi > best_pixels;
                 if (g_anytime_tb == 1) better = better || (hi == best_pixels && lo > best_lo);
                 if (g_anytime_tb == 2) better = better || (hi == best_pixels && lo < best_lo);
@@ -2017,7 +2026,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 better = lo > best_pixels || (lo == best_pixels && hi < best_other);
             }
             if (better) {
-                best_pixels = state.keep_probing ? hi : lo;
+                best_pixels = max_order ? hi : lo;
                 best_other = hi;
                 best_lo = lo;
                 best_row = row;

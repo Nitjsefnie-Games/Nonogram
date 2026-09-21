@@ -24,7 +24,11 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))      # cpp/
 NONO = os.path.join(os.path.dirname(ROOT), "nonograms")
-DEFAULT_EXCLUDE = ("partially_solved", "in_progress")
+# Folders without a finished count (no golden header) and the fully counted
+# puzzles that take minutes each; --exclude adds to these, it does not
+# replace them (a run that replaced them walked into in_progress and sat
+# on an unfinishable puzzle for an hour).
+DEFAULT_EXCLUDE = ("partially_solved", "in_progress", "extreme")
 
 
 def golden(path):
@@ -130,7 +134,8 @@ def main():
     ap.add_argument("binary", nargs="?")
     ap.add_argument("-o", "--out")
     ap.add_argument("--timeout", type=float, default=900.0)
-    ap.add_argument("--exclude", default=",".join(DEFAULT_EXCLUDE))
+    ap.add_argument("--exclude", default="", help="extra categories to skip, comma-separated, on top of " + ",".join(DEFAULT_EXCLUDE) + "; --include-all runs everything")
+    ap.add_argument("--include-all", action="store_true", help="run every category, the defaults included")
     ap.add_argument("--env", action="append", default=[], metavar="K=V")
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"))
     ap.add_argument("--top", type=int, default=15)
@@ -142,6 +147,8 @@ def main():
         ap.error("binary and -o are required unless --compare is given")
     extra = dict(kv.split("=", 1) for kv in args.env)
     exclude = tuple(c for c in args.exclude.split(",") if c)
+    if not args.include_all:
+        exclude = DEFAULT_EXCLUDE + exclude
     run(args.binary, args.out, exclude, args.timeout, extra)
 
 
