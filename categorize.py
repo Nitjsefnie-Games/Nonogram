@@ -333,7 +333,7 @@ def solve_puzzle_text_external(clue_text, puzzle_id, solver_cmd, timeout_s=None)
     return n_solutions, strategy, elapsed, rows, cols
 
 
-def rebench_file(path, solver_cmd=None):
+def rebench_file(path, solver_cmd=None, repeat=1):
     try:
         rows, cols = load_clues(path)
     except Exception as exc:
@@ -348,7 +348,14 @@ def rebench_file(path, solver_cmd=None):
         n_solutions, strategy = solve_with_strategy(rows, cols)
         elapsed = time.perf_counter() - start
     else:
+        # Best of `repeat` runs: the fastest time is the one least disturbed
+        # by whatever else the machine was doing; the count must not vary.
         n_solutions, strategy, elapsed = _solve_via_external(solver_cmd, path)
+        for _ in range(repeat - 1):
+            n2, s2, t2 = _solve_via_external(solver_cmd, path)
+            if n2 != n_solutions or s2 != strategy:
+                raise RuntimeError(f"{path}: runs disagree ({n_solutions} {strategy.value} vs {n2} {s2.value})")
+            elapsed = min(elapsed, t2)
     return place_with_header(path, rows, cols, n_solutions, strategy, elapsed)
 
 
@@ -426,7 +433,7 @@ def previous_solve_time(path):
     return None
 
 
-def rebench_folder(root, excludes, solver_cmd=None):
+def rebench_folder(root, excludes, solver_cmd=None, repeat=1):
     print(f"Rebenching {root}")
     if excludes:
         print(f"Excluded folders (exact-name match): {sorted(excludes)}")
@@ -447,7 +454,7 @@ def rebench_folder(root, excludes, solver_cmd=None):
 
     rebenched = moved = 0
     for path in files:
-        ok, new_path, elapsed = rebench_file(path, solver_cmd=solver_cmd)
+        ok, new_path, elapsed = rebench_file(path, solver_cmd=solver_cmd, repeat=repeat)
         if not ok:
             continue
         rebenched += 1
@@ -477,6 +484,9 @@ def main():
                         help='Write the golden header for PUZZLE from LOG, a finished solver run\'s stdout '
                              '(journalctl -o cat dump with the Found / Time / Strategy lines), and move '
                              'the file to its time bucket; no re-solve')
+    parser.add_argument('--repeat', type=int, default=1, metavar='N',
+                        help='--rebench with --solver-cmd: solve each puzzle N times and keep the '
+                             'fastest time (the counts must agree)')
     parser.add_argument('--rebench', metavar='DIR',
                         help='Re-solve every puzzle file under DIR with the current solver instead of fetching from webpbn')
     parser.add_argument('--exclude', action='append', default=[], metavar='FOLDER',
@@ -515,7 +525,7 @@ def main():
         return
 
     if args.rebench:
-        rebench_folder(args.rebench, set(args.exclude), solver_cmd=args.solver_cmd)
+        rebench_folder(args.rebench, set(args.exclude), solver_cmd=args.solver_cmd, repeat=args.repeat)
         return
 
     if args.start is not None:
