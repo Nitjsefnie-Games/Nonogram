@@ -501,15 +501,20 @@ public:
 
     // On a miss, remembers the empty slot it stopped at so the insert that
     // follows need not hash and walk the probe sequence a second time.
+    // KW is the key's word count when the caller knows it at compile time
+    // (propagate() dispatches on it once per propagation), 0 for the runtime kw_:
+    // with a runtime count the hash and the compare were loops, or a call
+    // when moved out of line, on every lookup.
+    template <int KW>
     unsigned char* find(const std::uint64_t* key, std::uint16_t tag) {
-        const std::uint64_t h = hash(key, tag);
+        const std::uint64_t h = hash<KW>(key, tag);
         std::size_t idx = h & mask_;
         tag = full_tag(tag, h);
         for (;;) {
             unsigned char* s = slot(idx);
             const std::uint16_t t = load_u16(s + hdr_);
             if (t == kEmptyTag) { miss_slot_ = s; miss_tag_ = tag; return nullptr; }
-            if (t == tag && keys_equal(s, key)) return s;
+            if (t == tag && keys_equal<KW>(s, key)) return s;
             idx = (idx + 1) & mask_;
         }
     }
@@ -559,29 +564,29 @@ public:
 private:
     static constexpr std::size_t kMinSlots = 1u << 12;  // 128 KB at 32-byte slots
 
+    // KW = 0 reads the word count from kw_ (insert and grow, off the hot
+    // path); a positive KW is a compile-time count and the same value.
+    template <int KW = 0>
     std::uint64_t hash(const std::uint64_t* key, std::uint16_t tag) const {
         namespace wy = ankerl::unordered_dense::detail::wyhash;
+        const int kw = KW > 0 ? KW : kw_;
         // One 64x64->128 multiply-fold covers the common <= 2-word key; the
         // tag is folded in by a cheap multiply so it perturbs every bit.
         const std::uint64_t t = static_cast<std::uint64_t>(tag) * 0x9E3779B97F4A7C15ULL;
-        if (kw_ <= 2) {
-            const std::uint64_t k1 = (kw_ == 2) ? key[1] : 0;
+        if (kw <= 2) {
+            const std::uint64_t k1 = (kw == 2) ? key[1] : 0;
             return wy::mix(key[0] ^ t, k1 ^ 0xE7037ED1A0B428DBULL);
         }
         std::uint64_t h = wy::mix(t, 0xA0761D6478BD642FULL);
-        for (int w = 0; w < kw_; ++w) h = wy::mix(h ^ key[w], 0xE7037ED1A0B428DBULL);
+        for (int w = 0; w < kw; ++w) h = wy::mix(h ^ key[w], 0xE7037ED1A0B428DBULL);
         return h;
     }
 
+    template <int KW = 0>
     bool keys_equal(const unsigned char* s, const std::uint64_t* key) const {
-        if (kw_ == 2) {  // the common case: no loop with a runtime trip count
-            std::uint64_t a, b;
-            std::memcpy(&a, s, 8);
-            std::memcpy(&b, s + 8, 8);
-            return ((a ^ key[0]) | (b ^ key[1])) == 0;
-        }
+        const int kw = KW > 0 ? KW : kw_;
         std::uint64_t diff = 0;
-        for (int w = 0; w < kw_; ++w) {
+        for (int w = 0; w < kw; ++w) {
             std::uint64_t v;
             std::memcpy(&v, s + 8 * static_cast<std::size_t>(w), 8);
             diff |= v ^ key[w];
@@ -1003,6 +1008,7 @@ struct SolveState {
     bool count_mode = false;
     u128 result = 0;
     std::vector<char> region_row;   // empty = whole grid
+    std::vector<std::uint64_t> region_bits;  // the same rows as a bitset (trail.row_words words)
     std::uint64_t regions_split = 0, region_calls = 0;
     // Count of the whole current region by state, consulted at every
     // count-mode branch node: the state is the region's rows with unknowns
@@ -1245,7 +1251,8 @@ BatchResult solve_one_batch_legacy(const LineSpec& spec,
     return g_fast_cache.insert(key, tag, res);
 }
 
-template <bool FAST>
+// KW: the puzzle's key word count when known at compile time (1..4), else 0.
+template <bool FAST, int KW>
 inline BatchResult solve_one_batch(const std::vector<const LineSpec*>& mapped,
                                    int index,
                                    bool is_col,
@@ -1254,13 +1261,13 @@ inline BatchResult solve_one_batch(const std::vector<const LineSpec*>& mapped,
         return solve_one_batch_legacy(*mapped[index], index, is_col, pic);
     }
 
-    const int kw = pic.key_words;
+    const int kw = KW > 0 ? KW : pic.key_words;
     const std::uint64_t* key =
         (is_col ? pic.col_keys.data() : pic.row_keys.data()) + static_cast<std::size_t>(index) * kw;
     const std::uint16_t tag = (is_col ? g_col_tags : g_row_tags)[static_cast<std::size_t>(index)];
 
     if (g_debug_stats) ++g_stat_lookups;
-    unsigned char* s = g_fast_cache.find(key, tag);
+    unsigned char* s = g_fast_cache.find<KW>(key, tag);
     if (s == nullptr) {
         s = solve_one_batch_miss(*mapped[index], index, is_col, pic, key, tag);
     }
@@ -1335,31 +1342,64 @@ void write_intersection(const BatchResult& r, int line_index, Picture& pic, bool
 // false, on success returns true.
 // ---------------------------------------------------------------------------
 
-bool solve_lines(const std::vector<const LineSpec*>& mapped,
-                 Picture& pic,
-                 bool is_row,
-                 Trail& trail) {
+// FAST: the fast line cache (vs the legacy string-keyed one); KW: the key
+// word count when it is one of the fast cache's 1..4, else 0 (runtime).
+template <bool FAST, int KW>
+inline bool solve_lines(const std::vector<const LineSpec*>& mapped,
+                        Picture& pic,
+                        bool is_row,
+                        Trail& trail) {
     auto& queue = is_row ? pic.row_queue : pic.col_queue;
     auto& dirty = is_row ? pic.row_dirty : pic.col_dirty;
-    // The fast/legacy choice is per puzzle; decide it once per drain rather
-    // than per line.
-    auto drain = [&](auto fast) -> bool {
-        while (!queue.empty()) {
-            const int index = queue.front();
-            queue.pop_front();
-            dirty[index] = 0;
-            BatchResult r = solve_one_batch<decltype(fast)::value>(mapped, index, !is_row, pic);
-            if (!r.success) {
-                return false;
-            }
-            if (r.n8 > 0 || (r.n8 == BatchResult::kLegacy && r.ded != nullptr)) {
-                write_intersection(r, index, pic, is_row, trail);
-            }
+    while (!queue.empty()) {
+        const int index = queue.front();
+        queue.pop_front();
+        dirty[index] = 0;
+        BatchResult r = solve_one_batch<FAST, KW>(mapped, index, !is_row, pic);
+        if (!r.success) {
+            return false;
         }
-        queue.reset();
-        return true;
-    };
-    return g_fast_mode ? drain(std::true_type{}) : drain(std::false_type{});
+        if (r.n8 > 0 || (r.n8 == BatchResult::kLegacy && r.ded != nullptr)) {
+            write_intersection(r, index, pic, is_row, trail);
+        }
+    }
+    queue.reset();
+    return true;
+}
+
+// Propagation to a fixpoint: drain rows and columns until neither queue
+// holds a line. Returns false on a contradiction (a line with no valid
+// filling), leaving the queues as they are for the caller's revert.
+template <bool FAST, int KW>
+bool propagate_t(const std::vector<const LineSpec*>& mapped_rows,
+                 const std::vector<const LineSpec*>& mapped_cols,
+                 Picture& pic,
+                 Trail& trail) {
+    while (pic.has_dirty()) {
+        if (!solve_lines<FAST, KW>(mapped_rows, pic, true, trail)) return false;
+        if (!solve_lines<FAST, KW>(mapped_cols, pic, false, trail)) return false;
+    }
+    return true;
+}
+
+// The fast/legacy choice and the key word count are per puzzle; decided
+// once per propagation, not per line, so the lookup's hash and key compare
+// inside are straight-line code for 1 to 4 words (the fast cache's whole
+// range) instead of loops with a runtime trip count (a 90 x 69 count run
+// -10.7% instructions), and the drain loop itself stays inlined in the
+// per-width instantiation instead of being called per queue.
+inline bool propagate(const std::vector<const LineSpec*>& mapped_rows,
+                      const std::vector<const LineSpec*>& mapped_cols,
+                      Picture& pic,
+                      Trail& trail) {
+    if (!g_fast_mode) return propagate_t<false, 0>(mapped_rows, mapped_cols, pic, trail);
+    switch (pic.key_words) {
+        case 1: return propagate_t<true, 1>(mapped_rows, mapped_cols, pic, trail);
+        case 2: return propagate_t<true, 2>(mapped_rows, mapped_cols, pic, trail);
+        case 3: return propagate_t<true, 3>(mapped_rows, mapped_cols, pic, trail);
+        case 4: return propagate_t<true, 4>(mapped_rows, mapped_cols, pic, trail);
+        default: return propagate_t<true, 0>(mapped_rows, mapped_cols, pic, trail);
+    }
 }
 
 int count_solved_pixels(const Picture& pic) {
@@ -1508,13 +1548,8 @@ ProbeResult probe_cell(int row,
     // dirty, so solve_lines below re-solves them and reports any contradiction
     // via solve_line_batch's total==0. solve_check was a redundant O(H+W)
     // re-validation of every line on every probe.
-    while (pic.has_dirty()) {
-        if (!solve_lines(mapped_rows, pic, true, trail)) {
-            return ProbeResult{false, 0};
-        }
-        if (!solve_lines(mapped_cols, pic, false, trail)) {
-            return ProbeResult{false, 0};
-        }
+    if (!propagate(mapped_rows, mapped_cols, pic, trail)) {
+        return ProbeResult{false, 0};
     }
 
     if (g_debug_stats) ++g_stat_probe_ok;
@@ -1795,13 +1830,20 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             state_key = StateTable::normalize(gk.a, gk.b);
         } else {
             // The region's rows, and the columns those rows have unknowns in.
+            // The rows come from the region bitset less trail bucket 0 (rows
+            // without unknowns), not a test of every row of the grid.
             static thread_local std::vector<std::uint64_t> col_mask;
             col_mask.assign(static_cast<std::size_t>(kw), 0);
             std::uint64_t ka = 0, kb = 0;
-            for (int r = 0; r < H; ++r) {
-                if (uir[r] == 0 || !region[r]) continue;
-                ka ^= rh[r].a; kb += rh[r].b;
-                for (int w = 0; w < kw; ++w) col_mask[static_cast<std::size_t>(w)] |= rk[r * kw + w] & kUnknownBits;
+            const std::uint64_t* zero_rows = trail.row_bucket.data();
+            for (int wd = 0; wd < trail.row_words; ++wd) {
+                std::uint64_t m = state.region_bits[static_cast<std::size_t>(wd)] & ~zero_rows[wd];
+                while (m != 0) {
+                    const int r = 64 * wd + __builtin_ctzll(m);
+                    m &= m - 1;
+                    ka ^= rh[r].a; kb += rh[r].b;
+                    for (int w = 0; w < kw; ++w) col_mask[static_cast<std::size_t>(w)] |= rk[r * kw + w] & kUnknownBits;
+                }
             }
             for (int w = 0; w < kw; ++w) {
                 std::uint64_t m = col_mask[static_cast<std::size_t>(w)];
@@ -1944,6 +1986,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             // the share is restored once when the split completes.
             const double mass_at_split = g_explored_mass;
             std::vector<char> saved_region = state.region_row;
+            std::vector<std::uint64_t> saved_region_bits = state.region_bits;
             const std::vector<std::uint64_t> comps(comp_rows.begin(), comp_rows.end());
             const double scale_at_split = g_mass_scale;
             g_mass_scale = scale_at_split / static_cast<double>(roots);
@@ -1957,6 +2000,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 const std::uint64_t* comp = comps.data() + static_cast<std::size_t>(region_index) * row_words;
                 state.region_row.assign(static_cast<std::size_t>(H), 0);
                 for (int r = 0; r < H; ++r) state.region_row[static_cast<std::size_t>(r)] = static_cast<char>((comp[r >> 6] >> (r & 63)) & 1);
+                state.region_bits.assign(comp, comp + row_words);
                 ++state.region_calls;
                 const std::size_t mark = trail.changed_cell_indices.size();
                 const int saved_unknown_count = pic.unknown_count;
@@ -1968,6 +2012,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 if (total == 0) break;
             }
             state.region_row = saved_region;
+            state.region_bits = saved_region_bits;
             state.result = total;
             g_mass_scale = scale_at_split;
             g_explored_mass = mass_at_split + g_half_pow[static_cast<std::size_t>(state.branch_depth)] * scale_at_split;
@@ -2158,10 +2203,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 trail.changed_cell_indices.push_back(trail_pack(row, col));
                 pic.mark_row_dirty(row);
                 pic.mark_col_dirty(col);
-                while (pic.has_dirty()) {
-                    if (!solve_lines(mapped_rows, pic, true, trail)) return true;  // dead branch
-                    if (!solve_lines(mapped_cols, pic, false, trail)) return true;
-                }
+                if (!propagate(mapped_rows, mapped_cols, pic, trail)) return true;  // dead branch
                 if (pic.is_solved()) {
                     return solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
                 }
@@ -2247,10 +2289,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                         trail.changed_cell_indices.push_back(fc.first);
                         pic.mark_row_dirty(r);
                         pic.mark_col_dirty(c);
-                        while (pic.has_dirty()) {
-                            if (!solve_lines(mapped_rows, pic, true, trail)) return true;
-                            if (!solve_lines(mapped_cols, pic, false, trail)) return true;
-                        }
+                        if (!propagate(mapped_rows, mapped_cols, pic, trail)) return true;
                     }
                     return solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
                 }
@@ -2366,15 +2405,9 @@ bool solve_real(const std::vector<const LineSpec*>& mapped_rows,
     // it — replacing the old redundant solve_check full-board pass. The
     // is_solved() callback must come AFTER this drain so an invalid completing
     // assignment is rejected (solve_lines returns false) rather than accepted.
-    while (pic.has_dirty()) {
-        if (!solve_lines(mapped_rows, pic, true, trail)) {
-            state.result = 0;
-            return true;
-        }
-        if (!solve_lines(mapped_cols, pic, false, trail)) {
-            state.result = 0;
-            return true;
-        }
+    if (!propagate(mapped_rows, mapped_cols, pic, trail)) {
+        state.result = 0;
+        return true;
     }
 
     if (pic.is_solved()) {
@@ -2406,10 +2439,7 @@ double estimate_dive(const std::vector<const LineSpec*>& mapped_rows,
     double weight = 1.0;
     std::vector<int> ur(static_cast<std::size_t>(H)), uc(static_cast<std::size_t>(W));
     while (true) {
-        while (pic.has_dirty()) {
-            if (!solve_lines(mapped_rows, pic, true, trail)) return 0.0;
-            if (!solve_lines(mapped_cols, pic, false, trail)) return 0.0;
-        }
+        if (!propagate(mapped_rows, mapped_cols, pic, trail)) return 0.0;
         if (pic.is_solved()) return weight;
 
         // Pick the most-constrained unknown cell (fewest unknowns in row+col).
