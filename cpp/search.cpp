@@ -985,25 +985,28 @@ private:
     std::size_t nslots_ = 0, mask_ = 0, count_ = 0, max_slots_ = 0;
 };
 
-// 128-bit hash of one line for the state cache: its tag (index plus a
-// row/column bit) and its packed key words, two independent wyhash chains.
-// The chains' starts depend on the tag alone, so they are computed once
-// per line (line_seed, kept in SolveState) and the per-node hash of a
-// changed line is one multiply-fold per word per chain.
+// Start of the two wyhash chains of one line's 128-bit hash for the state
+// cache: depends on the line's tag (index plus a row/column bit) alone, so
+// it is computed once per line (kept in SolveState); residual_key below
+// folds the line's residual constraint onto it.
 inline StateTable::Key line_seed(std::uint64_t tag) {
     namespace wy = ankerl::unordered_dense::detail::wyhash;
     return StateTable::Key{wy::mix(0x243F6A8885A308D3ULL ^ tag, 0xE7037ED1A0B428DBULL),
                            wy::mix(0x13198A2E03707344ULL ^ tag, 0x8EBC6AF09C88C6E3ULL)};
 }
-inline StateTable::Key hash_line(StateTable::Key seed, const std::uint64_t* words, int kw) {
-    namespace wy = ankerl::unordered_dense::detail::wyhash;
-    std::uint64_t ha = seed.a, hb = seed.b;
-    for (int w = 0; w < kw; ++w) {
-        ha = wy::mix(ha ^ words[w], 0xE7037ED1A0B428DBULL);
-        hb = wy::mix(hb ^ words[w], 0x8EBC6AF09C88C6E3ULL);
-    }
-    return StateTable::Key{ha, hb};
-}
+
+// What residual_key last computed for a line, so the next computation
+// resumes the sweeps instead of restarting them: descending the tree,
+// the known prefix and suffix only grow, so the previous state sets are
+// the prefixes of the new sweeps whenever the cells they covered are
+// unchanged (checked on the packed key words). A revert shrinks them and
+// the sweeps restart from the ends.
+struct ResidualMemo {
+    std::uint32_t fu = 0, lu = 0;  // prefix length; one past the last unknown
+    std::uint64_t key[kMaxFastCells / 32] = {};
+    std::uint64_t fwd[4] = {}, bwd[4] = {};
+    bool valid = false;
+};
 
 // ---------------------------------------------------------------------------
 // SolveState — mirrors picture.py SolveState (without print_state).
@@ -1073,6 +1076,7 @@ struct SolveState {
     // every branch node.
     std::vector<StateTable::Key> row_hash, col_hash;
     std::vector<StateTable::Key> row_seed, col_seed;  // line_seed per row / column
+    std::vector<ResidualMemo> row_memo, col_memo;     // residual_key's resume state per line
     StateTable::Key grid_key{0, 0};
     std::uint64_t state_lookups = 0, state_hits = 0, state_evictions = 0;
     // Adaptive gate by node size (bucket = log2 of the unknown cells):
@@ -1239,6 +1243,142 @@ inline const std::int8_t* line_cells(int index, bool is_col, const Picture& pic,
     }
     n = static_cast<std::size_t>(W);
     return px + static_cast<std::size_t>(index) * W;
+}
+
+// The state cache's hash of one line (see SolveState::state_cache): the
+// line's residual constraint on its unknown cells, not its content. A
+// region's count depends on a line only through which fillings of its
+// unknown cells the clue admits, and that is fixed by the clue DFA's
+// state set after the known prefix (the cells before the first unknown),
+// the cells from the first to the last unknown, and the state set that
+// accepts the known suffix. Two contents that differ only in how the
+// prefix or suffix was filled -- the same rows completed in a different
+// order, or a different way -- hash the same, so the second is a cache
+// hit; keyed on the content they were distinct states. Measured on the
+// content key's misses (stats build): 3867 at 150k nodes 52% would have
+// hit, 23210 62%, medium/7382 85%.
+// words: the line's packed key (2 bits per cell, kUnknownBits marks the
+// unknown cells); cells: its bytes. The middle is hashed from the key
+// words masked to [first unknown, last unknown]; the two sweeps run on
+// the cells, one word of DFA states when the clue fits (2 words on a
+// carry pair, more words in a loop).
+// Mask of the digits of cells < p (prefix) / >= p (suffix) in key word w.
+inline std::uint64_t prefix_digits(int w, std::size_t p) {
+    const std::size_t lo = 32 * static_cast<std::size_t>(w);
+    if (p <= lo) return 0;
+    if (p >= lo + 32) return ~0ULL;
+    return (1ULL << (2 * (p - lo))) - 1;
+}
+inline std::uint64_t suffix_digits(int w, std::size_t p) {
+    const std::size_t lo = 32 * static_cast<std::size_t>(w);
+    if (p <= lo) return ~0ULL;
+    if (p >= lo + 32) return 0;
+    return ~0ULL << (2 * (p - lo));
+}
+
+// fwd holds the forward state set after cells [0, fwd_from) on entry and
+// after [0, fu) on exit; bwd the backward set before cells [bwd_from, n)
+// on entry and before [lu, n) on exit.
+template <int NW>
+inline void residual_sweeps(const LineSpec& spec, const std::int8_t* cells, std::size_t n, std::size_t fu, std::size_t lu,
+                            std::uint64_t* fwd, std::uint64_t* bwd, std::size_t fwd_from, std::size_t bwd_from) {
+    // Per-cell-value mask tables, as in the line solver: the sweeps are
+    // then branch-free on the (data-dependent) cell values.
+    //   forward:  next = (cur & stay[v]) | ((cur << 1) & step[v])
+    //   backward: prev = (cur & stay[v]) | ((cur & step[v]) >> 1)
+    std::uint64_t stay[3][NW], step[3][NW];
+    for (int w = 0; w < NW; ++w) {
+        const std::uint64_t em = spec.empty_mask[static_cast<std::size_t>(w)];
+        stay[EMPTY][w] = em; stay[FULL][w] = 0; stay[UNKNOWN][w] = em;
+        step[EMPTY][w] = em; step[FULL][w] = spec.full_mask[static_cast<std::size_t>(w)]; step[UNKNOWN][w] = spec.state_valid[static_cast<std::size_t>(w)];
+    }
+    if (fwd_from == 0) {
+        for (int w = 0; w < NW; ++w) fwd[w] = 0;
+        fwd[0] = 1;
+    }
+    for (std::size_t i = fwd_from; i < fu; ++i) {
+        const int v = cells[i];
+        std::uint64_t carry = 0;
+        for (int w = 0; w < NW; ++w) {
+            const std::uint64_t cur = fwd[w];
+            const std::uint64_t sh = (cur << 1) | carry;
+            carry = cur >> 63;
+            fwd[w] = (cur & stay[v][w]) | (sh & step[v][w]);
+        }
+    }
+    if (bwd_from == n) {
+        for (int w = 0; w < NW; ++w) bwd[w] = 0;
+        bwd[(spec.len_states - 1) / 64] |= 1ULL << ((spec.len_states - 1) % 64);
+        if (spec.len_states >= 2) bwd[(spec.len_states - 2) / 64] |= 1ULL << ((spec.len_states - 2) % 64);
+    }
+    for (std::size_t i = bwd_from; i > lu; ) {
+        const int v = cells[--i];
+        std::uint64_t carry = 0;
+        for (int w = NW - 1; w >= 0; --w) {
+            const std::uint64_t cur = bwd[w];
+            const std::uint64_t masked = cur & step[v][w];
+            const std::uint64_t sh = (masked >> 1) | carry;
+            carry = masked << 63;
+            bwd[w] = (cur & stay[v][w]) | sh;
+        }
+    }
+}
+
+inline StateTable::Key residual_key(StateTable::Key seed, const LineSpec& spec, const std::int8_t* cells, std::size_t n,
+                                    const std::uint64_t* words, int kw, ResidualMemo& memo) {
+    namespace wy = ankerl::unordered_dense::detail::wyhash;
+    // First and last unknown cell from the packed key.
+    std::size_t fu = 0, lu = 0;
+    for (int w = 0; w < kw; ++w) {
+        const std::uint64_t m = words[w] & kUnknownBits;
+        if (m) { fu = 32 * static_cast<std::size_t>(w) + (static_cast<std::size_t>(__builtin_ctzll(m)) >> 1); break; }
+    }
+    for (int w = kw - 1; w >= 0; --w) {
+        const std::uint64_t m = words[w] & kUnknownBits;
+        if (m) { lu = 32 * static_cast<std::size_t>(w) + (63 - static_cast<std::size_t>(__builtin_clzll(m))) / 2; break; }
+    }
+    const std::size_t lu1 = lu + 1;
+    // Resume the sweeps from the memo where the cells it covered are unchanged.
+    std::size_t fwd_from = 0, bwd_from = n;
+    std::uint64_t* fwd = memo.fwd;
+    std::uint64_t* bwd = memo.bwd;
+    if (memo.valid) {
+        if (memo.fu <= fu) {
+            std::uint64_t diff = 0;
+            for (int w = 0; w < kw; ++w) diff |= (words[w] ^ memo.key[w]) & prefix_digits(w, memo.fu);
+            if (diff == 0) fwd_from = memo.fu;
+        }
+        if (memo.lu >= lu1) {
+            std::uint64_t diff = 0;
+            for (int w = 0; w < kw; ++w) diff |= (words[w] ^ memo.key[w]) & suffix_digits(w, memo.lu);
+            if (diff == 0) bwd_from = memo.lu;
+        }
+    }
+    const int nw = static_cast<int>(spec.n_words);
+    if (nw == 1) residual_sweeps<1>(spec, cells, n, fu, lu1, fwd, bwd, fwd_from, bwd_from);
+    else if (nw == 2) residual_sweeps<2>(spec, cells, n, fu, lu1, fwd, bwd, fwd_from, bwd_from);
+    else if (nw == 3) residual_sweeps<3>(spec, cells, n, fu, lu1, fwd, bwd, fwd_from, bwd_from);
+    else residual_sweeps<4>(spec, cells, n, fu, lu1, fwd, bwd, fwd_from, bwd_from);
+    memo.fu = static_cast<std::uint32_t>(fu);
+    memo.lu = static_cast<std::uint32_t>(lu1);
+    for (int w = 0; w < kw; ++w) memo.key[w] = words[w];
+    memo.valid = true;
+    std::uint64_t ha = seed.a ^ (fu | (lu << 8)), hb = seed.b + (fu | (lu << 8));
+    for (int w = 0; w < nw; ++w) {
+        ha = wy::mix(ha ^ fwd[w], 0xE7037ED1A0B428DBULL); hb = wy::mix(hb ^ fwd[w], 0x8EBC6AF09C88C6E3ULL);
+        ha = wy::mix(ha ^ bwd[w], 0xE7037ED1A0B428DBULL); hb = wy::mix(hb ^ bwd[w], 0x8EBC6AF09C88C6E3ULL);
+    }
+    // The cells from fu to lu: the key words with the digits outside zeroed.
+    for (int w = 0; w < kw; ++w) {
+        const std::size_t lo = 32 * static_cast<std::size_t>(w), hi = lo + 31;
+        std::uint64_t mask = ~0ULL;
+        if (fu > lo) mask &= (fu > hi) ? 0 : (~0ULL << (2 * (fu - lo)));
+        if (lu < hi) mask &= (lu < lo) ? 0 : (~0ULL >> (2 * (hi - lu)));
+        const std::uint64_t v = words[w] & mask;
+        ha = wy::mix(ha ^ v, 0xE7037ED1A0B428DBULL);
+        hb = wy::mix(hb ^ v, 0x8EBC6AF09C88C6E3ULL);
+    }
+    return StateTable::Key{ha, hb};
 }
 
 BatchResult solve_one_batch_legacy(const LineSpec& spec,
@@ -1872,7 +2012,9 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         StateTable::Key& gk = state.grid_key;
         for (int r : trail.dirty_rows) {
             gk.a ^= rh[r].a; gk.b -= rh[r].b;
-            rh[r] = uir[r] > 0 ? hash_line(state.row_seed[static_cast<std::size_t>(r)], rk + static_cast<std::size_t>(r) * kw, kw)
+            rh[r] = uir[r] > 0 ? residual_key(state.row_seed[static_cast<std::size_t>(r)], *mapped_rows[static_cast<std::size_t>(r)],
+                                              px + static_cast<std::size_t>(r) * W, static_cast<std::size_t>(W),
+                                              rk + static_cast<std::size_t>(r) * kw, kw, state.row_memo[static_cast<std::size_t>(r)])
                                : StateTable::Key{0, 0};
             gk.a ^= rh[r].a; gk.b += rh[r].b;
             trail.row_hash_dirty[static_cast<std::size_t>(r)] = 0;
@@ -1880,8 +2022,14 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         trail.dirty_rows.clear();
         for (int c : trail.dirty_cols) {
             gk.a ^= ch[c].a; gk.b -= ch[c].b;
-            ch[c] = uic[c] > 0 ? hash_line(state.col_seed[static_cast<std::size_t>(c)], ck + static_cast<std::size_t>(c) * kw, kw)
-                               : StateTable::Key{0, 0};
+            if (uic[c] > 0) {
+                std::size_t n;
+                const std::int8_t* cells = line_cells(c, true, pic, n);
+                ch[c] = residual_key(state.col_seed[static_cast<std::size_t>(c)], *mapped_cols[static_cast<std::size_t>(c)], cells, n,
+                                     ck + static_cast<std::size_t>(c) * kw, kw, state.col_memo[static_cast<std::size_t>(c)]);
+            } else {
+                ch[c] = StateTable::Key{0, 0};
+            }
             gk.a ^= ch[c].a; gk.b += ch[c].b;
             trail.col_hash_dirty[static_cast<std::size_t>(c)] = 0;
         }
@@ -2635,6 +2783,8 @@ void solve(const std::vector<std::vector<int>>& rows,
         state.col_hash.assign(static_cast<std::size_t>(W), StateTable::Key{0, 0});
         state.row_seed.resize(static_cast<std::size_t>(H));
         state.col_seed.resize(static_cast<std::size_t>(W));
+        state.row_memo.assign(static_cast<std::size_t>(H), ResidualMemo{});
+        state.col_memo.assign(static_cast<std::size_t>(W), ResidualMemo{});
         for (int r = 0; r < H; ++r) state.row_seed[static_cast<std::size_t>(r)] = line_seed(static_cast<std::uint64_t>(r) | (1ULL << 40));
         for (int c = 0; c < W; ++c) state.col_seed[static_cast<std::size_t>(c)] = line_seed(static_cast<std::uint64_t>(c) | (1ULL << 41));
         state.grid_key = StateTable::Key{0, 0};
