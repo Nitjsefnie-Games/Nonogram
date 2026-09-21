@@ -1640,14 +1640,22 @@ void revert_branch(Picture& pic,
                    Trail& trail,
                    std::size_t mark,
                    int saved_unknown_count) {
-    while (trail.changed_cell_indices.size() > mark) {
-        const int e = trail.changed_cell_indices.back();
-        // Entries below `counted` were subtracted from the per-line counts
-        // at a branch node; add them back. Entries above it never were.
-        if (trail.changed_cell_indices.size() <= trail.counted) trail.unsettle(trail_row(e), trail_col(e));
-        trail.changed_cell_indices.pop_back();
+    // Entries below `counted` were subtracted from the per-line counts at a
+    // branch node; add them back. Entries above it never were. Two loops
+    // over the two ranges, newest first, instead of a test per entry.
+    const int* tr = trail.changed_cell_indices.data();
+    const std::size_t n = trail.changed_cell_indices.size();
+    const std::size_t split = std::max(mark, std::min(n, trail.counted));
+    for (std::size_t i = n; i > split; ) {
+        const int e = tr[--i];
         pic.unset(trail_row(e), trail_col(e));
     }
+    for (std::size_t i = split; i > mark; ) {
+        const int e = tr[--i];
+        trail.unsettle(trail_row(e), trail_col(e));
+        pic.unset(trail_row(e), trail_col(e));
+    }
+    if (n > mark) trail.changed_cell_indices.resize(mark);
     if (trail.counted > mark) trail.counted = mark;
     pic.unknown_count = saved_unknown_count;
     while (!pic.row_queue.empty()) {
