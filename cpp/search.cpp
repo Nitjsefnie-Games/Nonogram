@@ -165,10 +165,14 @@ LineCache g_legacy_cache;
 // Slot layout (byte offsets, kw = key words, S = slot bytes):
 //   [0, 8kw)        key words
 //   [8kw, 8kw+2)    tag: bits 0-9 spec id * 2 + orientation, bits 10-15 a
-//                   hash fingerprint (kEmptyTag marks a free slot). Many
-//                   entries share a spec, so the id alone let most same-spec
-//                   probe neighbours through to the key compare; the
-//                   fingerprint rejects 63/64 of them on the tag word.
+//                   hash fingerprint, stored complemented so that a zero
+//                   word marks a free slot and a fresh zero-filled table
+//                   needs no clearing pass (a tag of 0xFFFF, id 511 with
+//                   fingerprint 63, is indistinguishable from free: its
+//                   entry is simply lost, as it was with 0xFFFF as the
+//                   free marker). Many entries share a spec, so the id
+//                   alone let most same-spec probe neighbours through to the
+//                   key compare; the fingerprint rejects 63/64 of them.
 //   [8kw+2]         deduction count
 //   [8kw+3]         flags: bit0 = line satisfiable, bit1 = deductions spilled
 //   [8kw+4, S)      deductions inline, or (spilled) uint32 offset into arena_
@@ -178,37 +182,63 @@ LineCache g_legacy_cache;
 __extension__ typedef unsigned __int128 u128;
 
 constexpr int kMaxFastCells = 128;   // 7-bit positions in the deduction bytes
-constexpr std::uint16_t kEmptyTag = 0xFFFF;
+constexpr std::uint16_t kEmptyStored = 0;  // complemented tag of a free slot
 constexpr std::uint8_t kFlagSat = 1;
 constexpr std::uint8_t kFlagSpilled = 2;
 constexpr std::size_t kHugePage = 2u << 20;
 
-// Page-aligned, hugepage-advised byte buffer for the slot table.
+// Zero-filled buffer for a hash table. Below one huge page it is ordinary
+// aligned heap memory cleared here. From one huge page up it is a fresh
+// anonymous mapping trimmed to a 2 MB boundary, advised for transparent
+// huge pages and prefaulted (MADV_POPULATE_WRITE): the kernel zeroes the
+// pages once as it faults them in, and the table needs no clearing pass
+// of its own -- the second zeroing of every grown table was 4% of a 90 x
+// 69 count run and 1.8% of easy_medium/108. Prefaulting keeps the faults
+// out of the random-access lookups (page-by-page faulting on a mapping
+// touched at random got 4 KB pages and 4.6x the kernel time).
 struct SlotBuf {
     unsigned char* p = nullptr;
     std::size_t bytes = 0;
+    bool mapped = false;
     SlotBuf() = default;
     SlotBuf(const SlotBuf&) = delete;
     SlotBuf& operator=(const SlotBuf&) = delete;
     ~SlotBuf() { release(); }
     void release() {
-        if (p != nullptr) std::free(p);
+        if (p != nullptr) {
+            if (mapped) munmap(p, bytes); else std::free(p);
+        }
         p = nullptr;
         bytes = 0;
+        mapped = false;
     }
     void allocate(std::size_t n) {
         release();
-        void* mem = nullptr;
-        // Hugepage alignment only once the table is hugepage-sized: a 2 MB
-        // alignment on a small table faults in a whole zeroed hugepage, which
-        // showed up as ~0.3 ms of startup on puzzles that solve in 0.1 ms.
-        const std::size_t align = (n >= kHugePage) ? kHugePage : 64;
-        if (posix_memalign(&mem, align, n) != 0) throw std::bad_alloc();
-        p = static_cast<unsigned char*>(mem);
-        bytes = n;
-        if (n >= kHugePage) madvise(p, n, MADV_HUGEPAGE);  // advisory; failure is harmless
+        if (n < kHugePage) {
+            // A 2 MB alignment on a small table faults in a whole zeroed
+            // hugepage, ~0.3 ms of startup on puzzles that solve in 0.1 ms.
+            void* mem = nullptr;
+            if (posix_memalign(&mem, 64, n) != 0) throw std::bad_alloc();
+            std::memset(mem, 0, n);
+            p = static_cast<unsigned char*>(mem);
+            bytes = n;
+            return;
+        }
+        const std::size_t len = (n + kHugePage - 1) / kHugePage * kHugePage;
+        void* raw = mmap(nullptr, len + kHugePage, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (raw == MAP_FAILED) throw std::bad_alloc();
+        const std::uintptr_t lo = reinterpret_cast<std::uintptr_t>(raw);
+        const std::uintptr_t start = (lo + kHugePage - 1) / kHugePage * kHugePage;
+        if (start > lo) munmap(raw, start - lo);
+        const std::uintptr_t end = start + len;
+        if (end < lo + len + kHugePage) munmap(reinterpret_cast<void*>(end), lo + len + kHugePage - end);
+        p = reinterpret_cast<unsigned char*>(start);
+        bytes = len;
+        mapped = true;
+        madvise(p, len, MADV_HUGEPAGE);        // advisory; failure is harmless
+        madvise(p, len, MADV_POPULATE_WRITE);  // prefault; on failure pages fault in on first touch
     }
-    void swap(SlotBuf& o) { std::swap(p, o.p); std::swap(bytes, o.bytes); }
+    void swap(SlotBuf& o) { std::swap(p, o.p); std::swap(bytes, o.bytes); std::swap(mapped, o.mapped); }
 };
 
 // DEBUG_CACHE_STATS=1: count line-cache lookups / misses and histogram the
@@ -494,9 +524,9 @@ public:
     std::size_t header_offset() const { return hdr_; }
     const std::uint8_t* arena() const { return arena_.data(); }
 
-    // Returns the slot holding (key, tag), or nullptr.
+    // The complemented tag word a slot stores for (tag, hash h).
     static std::uint16_t full_tag(std::uint16_t tag, std::uint64_t h) {
-        return static_cast<std::uint16_t>(tag | ((h >> 58) << 10));
+        return static_cast<std::uint16_t>(~(tag | ((h >> 58) << 10)));
     }
 
     // On a miss, remembers the empty slot it stopped at so the insert that
@@ -513,7 +543,7 @@ public:
         for (;;) {
             unsigned char* s = slot(idx);
             const std::uint16_t t = load_u16(s + hdr_);
-            if (t == kEmptyTag) { miss_slot_ = s; miss_tag_ = tag; return nullptr; }
+            if (t == kEmptyStored) { miss_slot_ = s; miss_tag_ = tag; return nullptr; }
             if (t == tag && keys_equal<KW>(s, key)) return s;
             idx = (idx + 1) & mask_;
         }
@@ -598,20 +628,19 @@ private:
 
     unsigned char* free_slot(std::uint64_t h) {
         std::size_t idx = h & mask_;
-        while (load_u16(slot(idx) + hdr_) != kEmptyTag) idx = (idx + 1) & mask_;
+        while (load_u16(slot(idx) + hdr_) != kEmptyStored) idx = (idx + 1) & mask_;
         return slot(idx);
     }
 
     void alloc(std::size_t n) {
-        buf_.allocate(n << slot_shift_);
-        std::memset(buf_.p, 0xFF, buf_.bytes);
+        buf_.allocate(n << slot_shift_);  // zero-filled: every slot free
         nslots_ = n;
         mask_ = n - 1;
         count_ = 0;
     }
 
     void clear_slots() {
-        std::memset(buf_.p, 0xFF, buf_.bytes);
+        std::memset(buf_.p, 0, buf_.bytes);
         count_ = 0;
         arena_.clear();
     }
@@ -631,10 +660,10 @@ private:
         for (std::size_t i = 0; i < old_n; ++i) {
             const unsigned char* s = old.p + (i << slot_shift_);
             const std::uint16_t t = load_u16(s + hdr_);
-            if (t == kEmptyTag) continue;
+            if (t == kEmptyStored) continue;
             std::uint64_t key[kMaxFastCells / 32];
             std::memcpy(key, s, hdr_);
-            std::memcpy(free_slot(hash(key, static_cast<std::uint16_t>(t & 0x3FF))), s, slot_bytes);
+            std::memcpy(free_slot(hash(key, static_cast<std::uint16_t>(~t & 0x3FF))), s, slot_bytes);
             ++count_;
         }
     }
@@ -773,26 +802,21 @@ public:
     ~HugeArray() { release(); }
     HugeArray(const HugeArray&) = delete;
     HugeArray& operator=(const HugeArray&) = delete;
+    // Zero-filled by SlotBuf (fresh prefaulted huge pages, no memset pass).
     void assign(std::size_t n) {
-        release();
-        const std::size_t align = 2u << 20;
-        std::size_t bytes = n * sizeof(T);
-        bytes = (bytes + align - 1) / align * align;
-        void* p = std::aligned_alloc(align, bytes);
-        if (p == nullptr) throw std::bad_alloc();
-        madvise(p, bytes, MADV_HUGEPAGE);
-        std::memset(p, 0, bytes);
-        data_ = static_cast<T*>(p);
+        buf_.allocate(n * sizeof(T));
+        data_ = reinterpret_cast<T*>(buf_.p);
         n_ = n;
     }
-    void swap(HugeArray& o) noexcept { std::swap(data_, o.data_); std::swap(n_, o.n_); }
+    void swap(HugeArray& o) noexcept { buf_.swap(o.buf_); std::swap(data_, o.data_); std::swap(n_, o.n_); }
     T& operator[](std::size_t i) { return data_[i]; }
     const T& operator[](std::size_t i) const { return data_[i]; }
     const T* begin() const { return data_; }
     const T* end() const { return data_ + n_; }
 
 private:
-    void release() { std::free(data_); data_ = nullptr; n_ = 0; }
+    void release() { buf_.release(); data_ = nullptr; n_ = 0; }
+    SlotBuf buf_;
     T* data_ = nullptr;
     std::size_t n_ = 0;
 };

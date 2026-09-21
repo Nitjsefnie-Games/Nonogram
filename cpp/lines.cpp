@@ -42,6 +42,13 @@ struct LineScratch {
     std::vector<std::uint64_t> bw_full;
     std::vector<std::uint64_t> bw_empty_shifted;
     std::vector<std::uint64_t> bw_full_shifted;
+    std::vector<int> ded;  // deduction candidates of the fused sweeps, one per cell
+
+    // n ints of uninitialized-by-contract scratch for the deduction sweep.
+    int* ded_buf(std::size_t n) {
+        if (ded.size() < n) ded.resize(n);
+        return ded.data();
+    }
 
     void ensure(std::size_t n_rows, std::size_t n_words) {
         if (forward.size() < n_rows * n_words) forward.resize(n_rows * n_words);
@@ -140,12 +147,13 @@ void solve_line_batch_1w(const std::int8_t* line, std::size_t n,
     // backward state itself only needs to be kept in a register.
     //
     // Deductions are collected branch-free: every cell writes a candidate
-    // into the next output slot and the cursor advances only for an UNKNOWN
-    // cell that is determined (exactly one of can_empty / can_full). The
-    // sweep runs high-to-low, so they land in descending position order and
-    // are reversed at the end to keep the ascending order consumers expect.
-    result.deductions.resize(n);
-    int* out = result.deductions.data();
+    // into the next slot of a scratch buffer and the cursor advances only
+    // for an UNKNOWN cell that is determined (exactly one of can_empty /
+    // can_full). The sweep runs high-to-low, so they land in descending
+    // position order and are copied out reversed into the ascending order
+    // consumers expect. (Sizing the result vector to n first zero-filled n
+    // ints per line solve: 4% of a 90 x 69 count run in memset.)
+    int* out = g_scratch.ded_buf(n);
     std::size_t k = 0;
     std::uint64_t cur = accept;
     for (std::size_t pi = n; pi-- > 0; ) {
@@ -161,7 +169,82 @@ void solve_line_batch_1w(const std::int8_t* line, std::size_t n,
         cur = (cur & stay[v]) | ((cur & step[v]) >> 1);
     }
     result.deductions.resize(k);
-    std::reverse(result.deductions.begin(), result.deductions.end());
+    int* d = result.deductions.data();
+    for (std::size_t i = 0; i < k; ++i) d[i] = out[k - 1 - i];
+    result.total = 1;
+}
+
+// Two-word states (65 to 128 DFA states): the one-word routine on 128-bit
+// values held as a (lo, hi) pair, with the shifts carrying between the
+// words. Same tables, same fused backward sweep, same deductions as the
+// general routine below, which this replaces for n_words == 2 (the general
+// loops over words with a runtime count, three passes, and pushes each
+// deduction; on a 90 x 69 count run it was 14% of the instructions).
+void solve_line_batch_2w(const std::int8_t* line, std::size_t n,
+                         const LineSpec& spec, LineSolveResult& result,
+                         bool has_unknown) {
+    const std::size_t len_states = spec.len_states;
+    const std::uint64_t sv0 = spec.state_valid[0], sv1 = spec.state_valid[1];
+    const std::uint64_t em0 = spec.empty_mask[0], em1 = spec.empty_mask[1];
+    const std::uint64_t fm0 = spec.full_mask[0], fm1 = spec.full_mask[1];
+
+    result.deductions.clear();
+    result.total = 0;
+
+    g_scratch.ensure(n + 1, 2);
+    std::uint64_t* fwd = g_scratch.forward.data();
+
+    const std::uint64_t stay0[3] = {em0, 0, em0}, stay1[3] = {em1, 0, em1};
+    const std::uint64_t step0[3] = {em0, fm0, sv0}, step1[3] = {em1, fm1, sv1};
+
+    fwd[0] = 1ULL;
+    fwd[1] = 0;
+    for (std::size_t p = 0; p < n; ++p) {
+        const std::uint64_t lo = fwd[2 * p], hi = fwd[2 * p + 1];
+        const int v = line[p];
+        fwd[2 * p + 2] = (lo & stay0[v]) | ((lo << 1) & step0[v]);
+        fwd[2 * p + 3] = (hi & stay1[v]) | (((hi << 1) | (lo >> 63)) & step1[v]);
+    }
+
+    // Accept states len_states-1 and len_states-2; len_states >= 65 here, so
+    // both are in the high word unless len_states == 65 (state 63 is in the
+    // low word).
+    std::uint64_t acc0 = 0, acc1 = 0;
+    {
+        const std::size_t s1 = len_states - 1, s2 = len_states - 2;
+        if (s1 >= 64) acc1 |= 1ULL << (s1 - 64); else acc0 |= 1ULL << s1;
+        if (s2 >= 64) acc1 |= 1ULL << (s2 - 64); else acc0 |= 1ULL << s2;
+    }
+    if (((fwd[2 * n] & acc0) | (fwd[2 * n + 1] & acc1)) == 0) {
+        return;  // unsat
+    }
+    if (!has_unknown) {
+        result.total = 1;
+        return;
+    }
+
+    int* out = g_scratch.ded_buf(n);
+    std::size_t k = 0;
+    std::uint64_t lo = acc0, hi = acc1;
+    for (std::size_t pi = n; pi-- > 0; ) {
+        const int v = line[pi];
+        const std::uint64_t f0 = fwd[2 * pi], f1 = fwd[2 * pi + 1];
+        const std::uint64_t be0 = lo & em0, be1 = hi & em1;
+        const std::uint64_t bf0 = lo & fm0, bf1 = hi & fm1;
+        // 128-bit >> 1 of (be0, be1) and (bf0, bf1).
+        const std::uint64_t bes0 = (be0 >> 1) | (be1 << 63), bes1 = be1 >> 1;
+        const std::uint64_t bfs0 = (bf0 >> 1) | (bf1 << 63), bfs1 = bf1 >> 1;
+        const int can_empty = ((f0 & (be0 | bes0)) | (f1 & (be1 | bes1))) != 0;
+        const int can_full = ((f0 & bfs0) | (f1 & bfs1)) != 0;
+        out[k] = deduce_pack(static_cast<int>(pi), static_cast<std::int8_t>(can_full));
+        k += static_cast<std::size_t>((v == UNKNOWN) & (can_empty ^ can_full));
+        const std::uint64_t s0 = lo & step0[v], s1 = hi & step1[v];
+        lo = (lo & stay0[v]) | ((s0 >> 1) | (s1 << 63));
+        hi = (hi & stay1[v]) | (s1 >> 1);
+    }
+    result.deductions.resize(k);
+    int* d = result.deductions.data();
+    for (std::size_t i = 0; i < k; ++i) d[i] = out[k - 1 - i];
     result.total = 1;
 }
 }  // namespace
@@ -182,6 +265,10 @@ void solve_line_batch(const std::int8_t* line, std::size_t n,
 
     if (n_words == 1) {
         solve_line_batch_1w(line, n, spec, result, has_unknown);
+        return;
+    }
+    if (n_words == 2) {
+        solve_line_batch_2w(line, n, spec, result, has_unknown);
         return;
     }
 
