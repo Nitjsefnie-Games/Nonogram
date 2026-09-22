@@ -416,11 +416,18 @@ std::string u128_str(u128 v) {
 }
 
 std::string eta_str(double seconds) {
+    // A fraction below the print precision extrapolates to 1e60 seconds
+    // and more; past a million years the number carries no information
+    // (and "%.1fd" of it overflowed the buffer, dropping the unit), so
+    // print "inf". The comparison chain also sends NaN there.
+    constexpr double year = 365.25 * 86400.0;
     char buf[64];
     if (seconds < 120.0) std::snprintf(buf, sizeof buf, "%.0fs", seconds);
     else if (seconds < 7200.0) std::snprintf(buf, sizeof buf, "%.1fmin", seconds / 60.0);
     else if (seconds < 172800.0) std::snprintf(buf, sizeof buf, "%.1fh", seconds / 3600.0);
-    else std::snprintf(buf, sizeof buf, "%.1fd", seconds / 86400.0);
+    else if (seconds < 2.0 * year) std::snprintf(buf, sizeof buf, "%.1fd", seconds / 86400.0);
+    else if (seconds < 1e6 * year) std::snprintf(buf, sizeof buf, "%.3gy", seconds / year);
+    else std::snprintf(buf, sizeof buf, "inf");
     return buf;
 }
 
