@@ -393,6 +393,68 @@ constexpr std::size_t g_probe_window = 100;
 constexpr double g_probe_thresh = 0.01;
 #endif
 std::uint64_t g_stat_probe_pairs = 0, g_stat_probe_hits = 0;  // probe pairs, and those with a contradiction
+
+// Probe memo. A probe (cell, value) at one node solved a set of lines --
+// the rows and columns of the cells it settled, the probe cell included,
+// since a line is solved exactly when a cell of it changed. If none of
+// those lines has had a committed change since (a set or a revert on the
+// solve() trail; a probe's own reverted changes do not count), replaying
+// the probe now solves the same contents in the same order, reaches the
+// same fixpoint with the same settled cells (all still unknown), and meets
+// the same contradiction if it met one. So the memo answers the probe:
+// same outcome, same fill, hence the same branch choice, forced cells and
+// tree, bit for bit. Each line carries the generation of its last
+// committed change; a memo carries the generation it was taken at and is
+// valid while no line it touched has a later stamp.
+// Measured (count mode, corpus gate 0 mismatches, nodes identical): it
+// answers 25-29% of the probes on hard/3867, easy_large/7382 and
+// hard/23210 and cuts the corpus's probes 19.9%, instructions 3867 (150k
+// nodes) -5.3%, 7382 -3.8%, 12130 -0.4% -- but the probes it answers are
+// the short, cache-hot ones, and the memo line and stamp loads plus a
+// 32-byte store per probe cost more cycles than those saved: quiet core,
+// medians of 7, 3867 +0.3%, 7382 +3.6%, 12130 +3.0%. Storing memos only
+// for probes of <= 12 cells is no better. Not shipped: PROBE_MEMO=1 in
+// the stats build.
+// A cell's two memos are one 64-byte line: 32-byte entries, three words of
+// lines (H + W <= 192), a 32-bit generation. The generation wraps after
+// 4 billion committed changes; then every memo is dropped and the stamps
+// restart, so a stale memo can never read as valid (a wrong answer would
+// force a cell wrongly and lose solutions).
+struct ProbeMemo {
+    std::uint32_t gen = 0;          // 0 = none
+    std::uint16_t fill = 0;         // cells the probe settled, itself included
+    std::uint8_t ok = 0;            // consistent
+    std::uint8_t pad = 0;
+    std::uint64_t touched[3] = {};  // lines: rows, then columns at H + c
+};
+struct alignas(64) ProbeMemoPair { ProbeMemo v[2]; };  // [0] EMPTY, [1] FULL
+static_assert(sizeof(ProbeMemoPair) == 64, "a cell's memo pair must be one cache line");
+constexpr int kMemoWords = 3;
+#ifdef NONOGRAM_STATS
+const bool g_probe_memo = std::getenv("PROBE_MEMO") != nullptr;
+bool g_memo_enabled = false;              // this puzzle fits the memo: fast mode, H + W <= 192
+#else
+constexpr bool g_probe_memo = false;
+constexpr bool g_memo_enabled = false;    // every memo hook folds away
+#endif
+int g_memo_H = 0, g_memo_words = 0;
+std::vector<ProbeMemoPair> g_memo;        // by row * W + col
+std::vector<std::uint32_t> g_line_stamp;  // per line, the generation of its last committed change
+std::uint32_t g_gen = 1;
+std::uint64_t g_stat_memo_checked = 0, g_stat_memo_valid = 0;
+inline void memo_next_gen() {
+    if (++g_gen == 0) {  // wrapped: forget everything
+        std::fill(g_memo.begin(), g_memo.end(), ProbeMemoPair{});
+        std::fill(g_line_stamp.begin(), g_line_stamp.end(), 0u);
+        g_gen = 1;
+    }
+}
+inline void stamp_cell(int row, int col) {
+    if (g_memo_enabled) {
+        g_line_stamp[static_cast<std::size_t>(row)] = g_gen;
+        g_line_stamp[static_cast<std::size_t>(g_memo_H + col)] = g_gen;
+    }
+}
 // Fraction of the search space completed so far; see SolveState::branch_depth.
 double g_explored_mass = 0.0;
 volatile std::sig_atomic_t g_stop_requested = 0;
@@ -768,6 +830,7 @@ struct Trail {
     // so the flags are set there, not per cell change inside Picture:
     // probes change and revert thousands of cells per node.
     bool track_hash = false;
+    bool stamps = false;  // the solve() trail: its cell changes stamp their lines (probe memo)
     std::vector<std::uint8_t> row_hash_dirty, col_hash_dirty;
     std::vector<int> dirty_rows, dirty_cols;
     void mark_hash_dirty(int r, int c) {
@@ -1499,6 +1562,7 @@ inline void write_intersection_impl(Iter first, Iter last, Pos pos_of, Val val_o
             pic.set_known(row, col, val_of(*first));
             pic.mark_col_dirty(col);
             trail.changed_cell_indices.push_back(trail_pack(row, col));
+            if (g_memo_enabled && trail.stamps) stamp_cell(row, col);
         }
     } else {
         const int col = line_index;
@@ -1507,6 +1571,7 @@ inline void write_intersection_impl(Iter first, Iter last, Pos pos_of, Val val_o
             pic.set_known(row, col, val_of(*first));
             pic.mark_row_dirty(row);
             trail.changed_cell_indices.push_back(trail_pack(row, col));
+            if (g_memo_enabled && trail.stamps) stamp_cell(row, col);
         }
     }
 }
@@ -1738,6 +1803,28 @@ ProbeResult probe_cell(int row,
     // and reuse its capacity — no per-probe heap allocation.
     static thread_local Trail trail;
     trail.changed_cell_indices.clear();
+    // A valid memo answers the probe (see ProbeMemo).
+    ProbeMemo* memo = nullptr;
+    if (g_memo_enabled) {
+        memo = &g_memo[static_cast<std::size_t>(row) * pic.width() + col].v[val == FULL ? 1 : 0];
+        if (memo->gen != 0) {
+            bool valid = true;
+            for (int w = 0; w < g_memo_words && valid; ++w) {
+                std::uint64_t m = memo->touched[w];
+                while (m != 0) {
+                    const int b = 64 * w + __builtin_ctzll(m);
+                    m &= m - 1;
+                    if (g_line_stamp[static_cast<std::size_t>(b)] > memo->gen) { valid = false; break; }
+                }
+            }
+            if (g_debug_stats) { ++g_stat_memo_checked; if (valid) ++g_stat_memo_valid; }
+            if (valid) {
+                if (g_debug_stats && memo->ok) ++g_stat_probe_ok;
+                // The caller compares absolute known counts within one pass.
+                return memo->ok ? ProbeResult{true, count_solved_pixels(pic) + static_cast<int>(memo->fill)} : ProbeResult{false, 0};
+            }
+        }
+    }
     if (g_debug_stats) { ++g_stat_probes; g_stat_probe_cur = 0; }
     struct ProbeStat { ~ProbeStat() { if (g_debug_stats) ++g_stat_probe_lookups_hist[std::min<std::uint64_t>(g_stat_probe_cur, 63)]; } } probe_stat;
 
@@ -1755,7 +1842,21 @@ ProbeResult probe_cell(int row,
     // dirty, so solve_lines below re-solves them and reports any contradiction
     // via solve_line_batch's total==0. solve_check was a redundant O(H+W)
     // re-validation of every line on every probe.
-    if (!propagate(mapped_rows, mapped_cols, pic, trail)) {
+    const bool consistent = propagate(mapped_rows, mapped_cols, pic, trail);
+    if (memo != nullptr) {
+        memo->gen = g_gen;
+        memo->ok = consistent ? 1 : 0;
+        memo->fill = static_cast<std::uint16_t>(trail.changed_cell_indices.size());
+        std::uint64_t t[kMemoWords] = {0, 0, 0};
+        const int H = g_memo_H;
+        for (int e : trail.changed_cell_indices) {
+            const int r = trail_row(e), b = H + trail_col(e);
+            t[r >> 6] |= 1ULL << (r & 63);
+            t[b >> 6] |= 1ULL << (b & 63);
+        }
+        for (int w = 0; w < kMemoWords; ++w) memo->touched[w] = t[w];
+    }
+    if (!consistent) {
         return ProbeResult{false, 0};
     }
 
@@ -1908,14 +2009,17 @@ void revert_branch(Picture& pic,
     const int* tr = trail.changed_cell_indices.data();
     const std::size_t n = trail.changed_cell_indices.size();
     const std::size_t split = std::max(mark, std::min(n, trail.counted));
+    if (g_memo_enabled && n > mark) memo_next_gen();  // a revert changes its lines too
     for (std::size_t i = n; i > split; ) {
         const int e = tr[--i];
         pic.unset(trail_row(e), trail_col(e));
+        stamp_cell(trail_row(e), trail_col(e));
     }
     for (std::size_t i = split; i > mark; ) {
         const int e = tr[--i];
         trail.unsettle(trail_row(e), trail_col(e));
         pic.unset(trail_row(e), trail_col(e));
+        stamp_cell(trail_row(e), trail_col(e));
     }
     if (n > mark) trail.changed_cell_indices.resize(mark);
     if (trail.counted > mark) trail.counted = mark;
@@ -2372,9 +2476,15 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         const bool skip_ok = !g_no_probe_skip && state.balance_k <= 0.0 && g_anytime_tb == 0;
         bounds.reset(H, W);
 
-        for (int idx : order) {
+        for (std::size_t oi = 0; oi < order.size(); ++oi) {
+            const int idx = order[oi];
             int row = unknown_coords[idx].first;
             int col = unknown_coords[idx].second;
+            if (g_memo_enabled && oi + 4 < order.size()) {
+                // The memo pair (one line) of a cell four probes ahead.
+                const auto& nx = unknown_coords[static_cast<std::size_t>(order[oi + 4])];
+                __builtin_prefetch(&g_memo[static_cast<std::size_t>(nx.first) * W + nx.second]);
+            }
             if (pxs[row * W + col] != UNKNOWN) continue;  // settled by an earlier commit this pass
 
             // Each value is skipped only when a bound proves it consistent
@@ -2414,8 +2524,10 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 // Forced commit: record the pixel on the trail so a parent
                 // backtrack frame can revert it if its own branch fails, then
                 // propagate in place and keep probing the remaining cells.
+                if (g_memo_enabled) memo_next_gen();
                 pic.set_known(row, col, forced);
                 trail.changed_cell_indices.push_back(trail_pack(row, col));
+                stamp_cell(row, col);
                 pic.mark_row_dirty(row);
                 pic.mark_col_dirty(col);
                 if (!propagate(mapped_rows, mapped_cols, pic, trail)) return true;  // dead branch
@@ -2500,8 +2612,10 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                             if (pxs[r * W + c] != fc.second) return true;  // dead
                             continue;
                         }
+                        if (g_memo_enabled) memo_next_gen();
                         pic.set_known(r, c, fc.second);
                         trail.changed_cell_indices.push_back(fc.first);
+                        stamp_cell(r, c);
                         pic.mark_row_dirty(r);
                         pic.mark_col_dirty(c);
                         if (!propagate(mapped_rows, mapped_cols, pic, trail)) return true;
@@ -2558,8 +2672,10 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         const int saved_unknown_count = pic.unknown_count;
 
         // Apply the branch pixel (record on trail).
+        if (g_memo_enabled) memo_next_gen();
         pic.set_known(row, col, val);
         trail.changed_cell_indices.push_back(trail_pack(row, col));
+        stamp_cell(row, col);
         pic.mark_row_dirty(row);
         pic.mark_col_dirty(col);
 
@@ -2805,6 +2921,17 @@ void solve(const std::vector<std::vector<int>>& rows,
         for (int r = 0; r < H; ++r) trail.dirty_rows[static_cast<std::size_t>(r)] = r;
         for (int c = 0; c < W; ++c) trail.dirty_cols[static_cast<std::size_t>(c)] = c;
     }
+#ifdef NONOGRAM_STATS
+    g_memo_enabled = g_probe_memo && g_fast_mode && H + W <= 64 * kMemoWords;
+#endif
+    if (g_memo_enabled) {
+        g_memo_H = H;
+        g_memo_words = (H + W + 63) / 64;
+        g_memo.assign(static_cast<std::size_t>(H) * W, ProbeMemoPair{});
+        g_line_stamp.assign(static_cast<std::size_t>(H + W), 0u);
+        g_gen = 1;
+        trail.stamps = true;
+    }
     const std::uint64_t solve_tsc0 = g_debug_stats ? __rdtsc() : 0;
     (void)solve_real(mapped_rows, mapped_cols, pic, state, on_solution, trail);
     if (g_debug_stats && count_mode) {
@@ -2856,6 +2983,8 @@ void solve(const std::vector<std::vector<int>>& rows,
                      static_cast<unsigned long long>(g_stat_probe_pairs), static_cast<unsigned long long>(g_stat_probe_hits),
                      static_cast<unsigned long long>(g_stat_probe_skips));
         std::fprintf(stderr, "cache-stats: solutions_found=%d skip_probing=%d\n", state.solutions_found, static_cast<int>(state.skip_probing));
+        std::fprintf(stderr, "cache-stats: probe memo checked=%llu answered=%llu (PROBE_MEMO=1)\n",
+                     static_cast<unsigned long long>(g_stat_memo_checked), static_cast<unsigned long long>(g_stat_memo_valid));
         std::fprintf(stderr, "cache-stats: latched subtrees dead[log2 size:count]:");
         for (int i = 0; i < 40; ++i) if (g_stat_dead_hist[i]) std::fprintf(stderr, " %d:%llu", i, static_cast<unsigned long long>(g_stat_dead_hist[i]));
         std::fprintf(stderr, "\ncache-stats: latched subtrees live[log2 size:count]:");

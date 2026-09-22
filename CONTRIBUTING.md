@@ -176,11 +176,43 @@ with the numbers that kept it out of the shipped build:
 | `DEAD_WINDOW`, `DEAD_FRAC` | the dead-work watchdog's window and fraction |
 | `EARLY_SOLVE=1` | anytime: stop the probe pass at a probe that completes the grid |
 | `NO_PROBE_SKIP=1` | probe every cell both ways even when an earlier probe of the same pass already bounds the fill below the best branch score (the skip is on in the shipped min-balanced and anytime-max orders; corpus probes -14.5%, counts and strategy labels unchanged) |
+| `PROBE_MEMO=1` | answer a probe from its memo while none of the lines it solved (the lines of the cells it settled) has had a committed change since: same outcome and fill, tree bit-for-bit the same (corpus gate 0 mismatches, probes -19.9%). Instructions 3867 (150k nodes) -5.3%, 7382 -3.8%, 12130 -0.4%, but cycles on a quiet core (medians of 7) 3867 +0.3%, 7382 +3.6%, 12130 +3.0%: it answers the short cache-hot probes and pays memo-line and stamp loads plus a 32-byte store per probe. Not shipped |
 | `DEBUG_IMPL=1/2` | implication graph with contrapositive edges: count / act |
 | `NO_STATE_CACHE=1` | count mode without the region state cache (the count of a region's state, keyed by its line keys, reused when another branch order reaches it; it also serves the region split, so a split-off region seen before is a hit at its search's root) |
 | `STATE_CACHE_PROBE_ONLY=1` | key and look up every node but never take a hit: the instruction delta against `NO_STATE_CACHE=1` is the cache's own cost |
 | `STATE_CACHE_YIELD=<x>` | the state cache's per-node-size gate: a size bucket stops using the cache while the cycles its hits save fall below x times the cycles its lookups cost (default 1). The gate and the table's eviction read cycle counters, so a long run's tree is not bit-for-bit reproducible; on the corpus neither fires and two `nodes.py` runs agree on every puzzle (checked 2026-09-18), and `0` makes the gate inert for a strictly deterministic tree |
 | `DEBUG_CACHE_STATS=1` | the counters themselves, including the latched dead/live subtree histogram and the state cache's lookups, hits and evictions |
+
+Measured on the partially solved class (explored fraction and count after
+60-300 s on one core, build 6b570c1b3) and not shipped, each a search
+policy the stats build no longer carries:
+
+- **Row-major / column-major branch order** (the row-by-row DP the state
+  cache would memoize): without probing pikachu counts 1,836 solutions in
+  65 s against 39M, with probing 2.65M; first-cell order walks into dead
+  subtrees the most-constrained order avoids. A Python model of that DP
+  holds 1.2M distinct column-state tuples after 13 of easy_medium/108's
+  20 rows, more states than the puzzle has solutions.
+- **Column cuts in the region split** (treating a column as independent
+  segments at every boundary where its clue automaton has one viable
+  state, so rows above and below multiply): exact, fires on 60% of
+  pikachu's splits, but only where a plain split was near; 7785 431M
+  against 860M counted in 60 s, 16900 4.2e9 against 12.7e9.
+- **Probing only the K most constrained cells**: K=16 and 64 count
+  nothing on pikachu and 16900 in 65 s and a fifth on 7785; the full
+  pass's forced-cell detection is what keeps the search out of dead
+  subtrees.
+- **Trusting every probe bound** (a cell proven consistent by an earlier
+  probe is never probed, the bound stands in for its fill): pikachu 9.7M
+  against 39M, 7382 13.9 s against 4.8 s; recording bounds on every
+  consistent probe costs more than the skips save.
+- **Support-keyed nogoods** (a dead subtree's zero keyed on the lines its
+  search consulted rather than the whole state): every dead subtree above
+  32 nodes on 3867, 9892 and 12548 consulted 90-100% of the region's
+  lines, so nothing would generalise.
+- **Block restore of the picture after a probe** instead of walking the
+  trail: probes settle 8-13 cells on average (3867 9.8, 7382 12.8, pikachu
+  13, 23210 8.2), fewer than a block copy of the keys is worth.
 
 Three things hold in every build. `STATE_CACHE_MB` sets the state cache's
 budget (default 512; it starts small and doubles up to that). A count-mode
