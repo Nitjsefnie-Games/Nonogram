@@ -2,6 +2,7 @@
 #include "types.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <cstddef>
@@ -443,6 +444,15 @@ template <class Holds>
 int explain_greedy(const std::int8_t* line, std::size_t n, int pos, int* out, Holds holds) {
     static thread_local std::vector<std::int8_t> buf;
     buf.assign(line, line + n);
+#ifdef NONOGRAM_STATS
+    // The precondition (the whole content forces / is unsat): a wrong
+    // content would otherwise come back as "every known cell is a reason".
+    if (!holds(buf.data())) {
+        std::fprintf(stderr, "stats check failed: explain precondition (the line content does not %s)\n",
+                     pos >= 0 ? "force the cell" : "contradict");
+        std::abort();
+    }
+#endif
     std::vector<int> known;
     for (int i = 0; i < static_cast<int>(n); ++i) if (buf[i] != UNKNOWN && i != pos) known.push_back(i);
     std::sort(known.begin(), known.end(), [pos](int a, int b) {

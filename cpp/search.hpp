@@ -32,10 +32,16 @@ void solve(const std::vector<std::vector<int>>& rows,
            bool count_mode = false,
            std::string* out_count = nullptr,
            bool learn = false);
-// learn: clause-learning mode (--learn). Propagation to a fixpoint also
-// runs unit propagation over the learnt clauses (none are learnt yet). The
-// stats build (make stats) also turns it on with LEARN=1 in the environment;
-// LEARN_MAX_CLAUSES caps the clause store (default 50000).
+// learn: clause-learning mode (--learn). Every contradiction the search
+// commits to (a failed propagation after a branch value or a probe-forced
+// commit) is analysed to a first-UIP clause, which is added to a clause
+// store; propagation to a fixpoint also runs unit propagation over those
+// clauses. Backtracking stays chronological, so the tree only loses
+// branches the clauses prove dead, and the count is unchanged. The stats
+// build (make stats) also turns it on with LEARN=1 in the environment, and
+// LEARN_CHECK=1 there checks every learnt clause against every solution
+// (bench/learn_check.sh); LEARN_MAX_CLAUSES caps the clause store (default
+// 50000).
 // count_mode: count solutions instead of visiting them. on_solution is never
 // called; the exact total is written to *out_count in decimal. After
 // propagation at every branch node the unknown cells are split into regions
