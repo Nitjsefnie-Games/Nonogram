@@ -55,7 +55,8 @@ public:
 
     int size() const { return live_; }   // live clauses
     std::size_t max_clauses() const { return max_clauses_; }
-    // Clauses added since the last propagate call examined them.
+    // Clauses of two or more literals added since the last propagate call
+    // examined them (a unit is examined by every call anyway).
     bool has_fresh() const { return !fresh_.empty(); }
 
     // `assigned(l)` tells a literal's state (1 true, -1 false, 0 free);
@@ -111,9 +112,10 @@ public:
     // highest lbd first (ties: lowest activity, then highest id). Survivors
     // keep their ids and literal order; dead ids are reused by add. Watches
     // are rebuilt for the survivors, so call it between propagations only.
-    // A fresh clause is never deleted (it counts as locked until propagate
-    // has examined it: a clause just learnt at a contradiction would
-    // otherwise be an ordinary candidate before it ever took effect).
+    // A clause propagate has not examined yet, a unit included, is never
+    // deleted (it counts as locked until then: a clause just learnt at a
+    // contradiction would otherwise be an ordinary candidate before it ever
+    // took effect).
     void reduce();
 
 private:
@@ -177,6 +179,7 @@ template <class Assigned, class Force>
 int ClauseStore::propagate(const int* newly_true, int n_new, Assigned assigned, Force force) {
     queue_.clear();
     for (const int id : units_) {
+        is_fresh_[id] = 0;  // examined: an ordinary reduce candidate from now on
         const int l = arena_[start_[id] + 1];
         const int state = assigned(l);
         if (state > 0) continue;

@@ -52,13 +52,9 @@ int ClauseStore::add(const int* lits, int n, int lbd) {
     act_[id] = 0.0f;
     locked_[id] = 0;
     dead_[id] = 0;
-    is_fresh_[id] = 0;
-    if (n == 1) {
-        units_.push_back(id);
-    } else {
-        fresh_.push_back(id);   // watched when propagate first examines it
-        is_fresh_[id] = 1;
-    }
+    is_fresh_[id] = 1;   // until propagate first examines it (see reduce)
+    if (n == 1) units_.push_back(id);
+    else fresh_.push_back(id);   // watched when examined
     ++live_;
     return id;
 }

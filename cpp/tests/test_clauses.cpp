@@ -363,6 +363,36 @@ int main() {
         if (!same_lits(s, id[0], {P(0), P(1)})) return fail("reduce/fresh: the best examined clause was deleted");
     }
 
+    // A unit clause is fresh until propagate examines it too: reduce spares a
+    // just-learnt unit with the worst lbd, and it forces on the next call.
+    // Once examined it is an ordinary candidate.
+    {
+        ClauseStore s;
+        s.init(20, 2);
+        Env e(20);
+        std::vector<int> id;
+        for (int i = 0; i < 3; ++i) {
+            const int c[] = {P(2 * i), P(2 * i + 1)};
+            id.push_back(s.add(c, 2, 2 + i));
+        }
+        if (e.propagate(s, {}) != -1 || s.has_fresh()) return fail("reduce/unit: setup");
+        const int u[] = {P(11)};
+        const int uid = s.add(u, 1, 10);
+        s.reduce();
+        if (s.size() != 2) return fail("reduce/unit: reduce did not get back to max_clauses");
+        if (e.propagate(s, {}) != -1) return fail("reduce/unit: conflict");
+        if (e.trail != std::vector<std::pair<int, int>>{{P(11), uid}}) return fail("reduce/unit: the unexamined unit was deleted");
+        if (!same_lits(s, id[0], {P(0), P(1)})) return fail("reduce/unit: the best examined clause was deleted");
+        const int c[] = {P(12), P(13)};
+        s.add(c, 2, 2);
+        if (e.propagate(s, {}) != -1 || s.has_fresh()) return fail("reduce/unit: second setup");
+        s.reduce();
+        if (s.size() != 2) return fail("reduce/unit: second reduce did not get back to max_clauses");
+        e.revert();
+        if (e.propagate(s, {}) != -1) return fail("reduce/unit: conflict after the second reduce");
+        if (!e.trail.empty()) return fail("reduce/unit: the examined unit survived as the worst clause");
+    }
+
     // (d) reduce: 20 clauses on disjoint cells, lbd 2..21, the two worst locked.
     {
         const int n_cells = 64;
