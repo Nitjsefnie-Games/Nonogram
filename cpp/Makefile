@@ -11,8 +11,9 @@ CXXFLAGS = -O3 -march=native -flto -std=c++17 -Wall -Wextra -pedantic \
 # per process, page faults 234 -> 149, measured over 200 runs).
 LDFLAGS = -static
 
-SRCS = main.cpp lines.cpp picture.cpp puzzle_io.cpp search.cpp
+SRCS = main.cpp lines.cpp picture.cpp puzzle_io.cpp search.cpp clauses.cpp
 OBJS = $(SRCS:.cpp=.o)
+TESTS = $(wildcard tests/*.cpp)
 
 PGO_DIR = pgo-data
 
@@ -27,7 +28,7 @@ solver: $(OBJS)
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) solver solver-stats
+	rm -f $(OBJS) solver solver-stats $(TESTS:tests/%.cpp=tests/%)
 
 # Diagnostic build: DEBUG_CACHE_STATS=1 prints line-cache and probe
 # statistics to stderr. Separate binary because the counters cost ~3% of
@@ -61,9 +62,8 @@ pgo-clean:
 
 .PHONY: all clean pgo pgo-clean stats
 
-TESTS = $(wildcard tests/*.cpp)
 test: $(TESTS:tests/%.cpp=tests/%)
 	for t in $(TESTS:tests/%.cpp=tests/%); do ./$$t || exit 1; done
-tests/%: tests/%.cpp lines.cpp picture.cpp $(wildcard *.hpp)
-	$(CXX) $(CXXFLAGS) $(LDFLAGS) -I. -o $@ $< lines.cpp picture.cpp
+tests/%: tests/%.cpp lines.cpp picture.cpp clauses.cpp $(wildcard *.hpp)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -I. -o $@ $< lines.cpp picture.cpp clauses.cpp
 .PHONY: test
