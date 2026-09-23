@@ -98,6 +98,7 @@ public:
         return &arena_[start_[id] + 1];
     }
     int lbd(int id) const { return lbd_[id]; }
+    bool is_unit(int id) const { return arena_[start_[id]] == 1; }
     void bump(int id) { act_[id] += 1.0f; }            // activity for deletion
     void lock(int id, bool locked) { locked_[id] = locked; }   // a reason on a trail is never deleted
     // The store is never told about reverts, so the caller recomputes the
@@ -110,7 +111,9 @@ public:
     // highest lbd first (ties: lowest activity, then highest id). Survivors
     // keep their ids and literal order; dead ids are reused by add. Watches
     // are rebuilt for the survivors, so call it between propagations only.
-    // Dead ids leave the fresh list; a fresh survivor stays fresh.
+    // A fresh clause is never deleted (it counts as locked until propagate
+    // has examined it: a clause just learnt at a contradiction would
+    // otherwise be an ordinary candidate before it ever took effect).
     void reduce();
 
 private:

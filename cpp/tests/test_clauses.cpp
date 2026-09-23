@@ -321,11 +321,14 @@ int main() {
             const int c[] = {P(3 * i), P(3 * i + 1)};
             id.push_back(s.add(c, 2, 2 + i));
         }
+        {
+            Env seen(40);  // examine them: reduce never deletes a fresh clause
+            if (seen.propagate(s, {}) != -1 || s.has_fresh()) return fail("unlock_all: setup");
+        }
         s.lock(id[5], true);
         s.unlock_all();
         s.reduce();
         if (s.size() > 2) return fail("unlock_all: reduce left more than max_clauses");
-        // the dead ids left the fresh list: propagate reaches the survivors only
         Env e(40);
         if (e.propagate(s, {}) != -1 || !e.trail.empty()) return fail("unlock_all: survivors misbehaved");
         if (s.has_fresh()) return fail("unlock_all: fresh list not emptied");
@@ -334,6 +337,30 @@ int main() {
         if (e.trail != std::vector<std::pair<int, int>>{{P(1), id[0]}}) return fail("unlock_all: lowest-lbd survivor did not force");
         e.set(N(15));
         if (e.propagate(s, {N(15)}) != -1 || e.trail.size() != 1) return fail("unlock_all: the unlocked worst clause survived");
+    }
+
+    // reduce never deletes a clause propagate has not examined yet: a fresh
+    // clause with the worst lbd survives and forces on the next call.
+    {
+        ClauseStore s;
+        s.init(20, 2);
+        Env e(20);
+        std::vector<int> id;
+        for (int i = 0; i < 3; ++i) {
+            const int c[] = {P(2 * i), P(2 * i + 1)};
+            id.push_back(s.add(c, 2, 2 + i));
+        }
+        if (e.propagate(s, {}) != -1 || s.has_fresh()) return fail("reduce/fresh: setup");
+        e.set(N(10));
+        if (e.propagate(s, {N(10)}) != -1) return fail("reduce/fresh: setup round");
+        const int f[] = {P(10), P(11)};
+        const int fid = s.add(f, 2, 10);
+        s.reduce();
+        if (s.size() != 2) return fail("reduce/fresh: reduce did not get back to max_clauses");
+        if (!s.has_fresh()) return fail("reduce/fresh: the fresh clause was deleted");
+        if (e.propagate(s, {}) != -1) return fail("reduce/fresh: conflict");
+        if (e.trail != std::vector<std::pair<int, int>>{{P(11), fid}}) return fail("reduce/fresh: the kept fresh clause did not force");
+        if (!same_lits(s, id[0], {P(0), P(1)})) return fail("reduce/fresh: the best examined clause was deleted");
     }
 
     // (d) reduce: 20 clauses on disjoint cells, lbd 2..21, the two worst locked.
@@ -349,6 +376,8 @@ int main() {
             id.push_back(s.add(cl[i].data(), 3, 2 + i));
             if (id[i] < 0) return fail("(d) add refused");
         }
+        // examined (all free: literal order unchanged): reduce never deletes a fresh clause
+        if (e.propagate(s, {}) != -1 || s.has_fresh()) return fail("(d) setup");
         for (int i = 0; i < 20; i += 3) s.bump(id[i]);
         s.lock(id[19], true);
         s.lock(id[18], true);

@@ -68,7 +68,7 @@ void ClauseStore::reduce() {
     const int n_ids = static_cast<int>(start_.size());
     std::vector<int> cand;
     for (int id = 0; id < n_ids; ++id)
-        if (!dead_[id] && !locked_[id]) cand.push_back(id);
+        if (!dead_[id] && !locked_[id] && !is_fresh_[id]) cand.push_back(id);  // fresh: not examined yet
     // Half of the unlocked clauses, or as many as it takes to get back to
     // max_clauses when the locked ones are a large share of the store.
     const std::size_t excess = static_cast<std::size_t>(live_) - max_clauses_;
