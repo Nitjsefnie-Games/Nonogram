@@ -1,6 +1,7 @@
 #include "clauses.hpp"
 #include <algorithm>
-#include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 
 void ClauseStore::init(int n_cells, std::size_t max_clauses) {
@@ -8,10 +9,12 @@ void ClauseStore::init(int n_cells, std::size_t max_clauses) {
     start_.clear();
     watches_.assign(static_cast<std::size_t>(n_cells) * 2, std::vector<int>());
     units_.clear();
+    fresh_.clear();
     lbd_.clear();
     act_.clear();
     locked_.clear();
     dead_.clear();
+    is_fresh_.clear();
     free_.clear();
     queue_.clear();
     max_clauses_ = max_clauses;
@@ -20,9 +23,14 @@ void ClauseStore::init(int n_cells, std::size_t max_clauses) {
 
 int ClauseStore::add(const int* lits, int n, int lbd) {
     if (n < 1) return -1;
-#ifndef NDEBUG
+#ifdef NONOGRAM_STATS
+    // Checked in the stats build (assert is compiled out of every build).
     for (int a = 0; a < n; ++a)
-        for (int b = a + 1; b < n; ++b) assert((lits[a] >> 1) != (lits[b] >> 1) && "clause cells must be distinct");
+        for (int b = a + 1; b < n; ++b)
+            if ((lits[a] >> 1) == (lits[b] >> 1)) {
+                std::fprintf(stderr, "stats check failed: clause cells must be distinct (cell %d twice)\n", lits[a] >> 1);
+                std::abort();
+            }
 #endif
     int id;
     if (!free_.empty()) {
@@ -35,6 +43,7 @@ int ClauseStore::add(const int* lits, int n, int lbd) {
         act_.push_back(0.0f);
         locked_.push_back(0);
         dead_.push_back(0);
+        is_fresh_.push_back(0);
     }
     start_[id] = arena_.size();
     arena_.push_back(n);
@@ -43,11 +52,12 @@ int ClauseStore::add(const int* lits, int n, int lbd) {
     act_[id] = 0.0f;
     locked_[id] = 0;
     dead_[id] = 0;
+    is_fresh_[id] = 0;
     if (n == 1) {
         units_.push_back(id);
     } else {
-        watches_[lits[0]].push_back(id);
-        watches_[lits[1]].push_back(id);
+        fresh_.push_back(id);   // watched when propagate first examines it
+        is_fresh_[id] = 1;
     }
     ++live_;
     return id;
@@ -74,14 +84,17 @@ void ClauseStore::reduce() {
     std::nth_element(cand.begin(), cand.begin() + (n_del - 1), cand.end(), worse);
     for (std::size_t i = 0; i < n_del; ++i) {
         dead_[cand[i]] = 1;
+        is_fresh_[cand[i]] = 0;
         free_.push_back(cand[i]);
     }
+    fresh_.erase(std::remove_if(fresh_.begin(), fresh_.end(), [this](int id) { return dead_[id] != 0; }), fresh_.end());
     live_ -= static_cast<int>(n_del);
     // add pops from the back: reuse the lowest ids first.
     std::sort(free_.begin(), free_.end(), std::greater<int>());
 
     // Compact the arena (survivors keep their ids and literal order) and
-    // rebuild the watches: each survivor still watches its lits[0] and lits[1].
+    // rebuild the watches: each watched survivor still watches its lits[0]
+    // and lits[1]; a fresh one is watched when propagate examines it.
     std::vector<int> arena;
     arena.reserve(arena_.size());
     for (auto& w : watches_) w.clear();
@@ -93,7 +106,7 @@ void ClauseStore::reduce() {
         arena.insert(arena.end(), c, c + 1 + c[0]);
         if (c[0] == 1) {
             units_.push_back(id);
-        } else {
+        } else if (!is_fresh_[id]) {
             watches_[c[1]].push_back(id);
             watches_[c[2]].push_back(id);
         }

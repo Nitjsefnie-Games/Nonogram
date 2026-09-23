@@ -258,6 +258,84 @@ int main() {
         if (e.propagate(s, {N(5)}) != uid) return fail("unit {5}: falsified unit not reported");
     }
 
+    // Fresh clauses (n >= 2) are examined once each by the next propagate
+    // call, right after the units, whatever its newly_true list.
+    {
+        ClauseStore s;
+        s.init(12, 100);
+        Env e(12);
+        // (1) unit under the assignment when added: forced on the next call,
+        // with the forced literal at lits[0] and a false literal at lits[1].
+        e.set(N(0));
+        e.set(N(1));
+        if (e.propagate(s, {N(0), N(1)}) != -1) return fail("fresh: empty store conflicted");
+        const int c1[] = {P(0), P(1), P(2)};
+        const int id1 = s.add(c1, 3, 2);
+        if (!s.has_fresh()) return fail("fresh: an added clause is not fresh");
+        if (e.propagate(s, {}) != -1) return fail("fresh: unit fresh clause conflicted");
+        if (e.trail != std::vector<std::pair<int, int>>{{P(2), id1}}) return fail("fresh: unit fresh clause did not force");
+        if (s.has_fresh()) return fail("fresh: a forcing clause stayed fresh");
+        {
+            int n = 0;
+            const int* l = s.lits(id1, &n);
+            if (n != 3 || l[0] != P(2) || e.assigned(l[1]) >= 0) return fail("fresh: forced literal not at lits[0] / lits[1] not false");
+        }
+        // (2) satisfied when added: dropped without forcing; its watches work
+        // after a revert.
+        e.revert();
+        e.set(P(3));
+        if (e.propagate(s, {P(3)}) != -1) return fail("fresh: round before the satisfied clause");
+        const int c2[] = {N(4), P(3)};
+        const int id2 = s.add(c2, 2, 2);
+        if (e.propagate(s, {}) != -1 || !e.trail.empty()) return fail("fresh: satisfied clause forced or conflicted");
+        if (s.has_fresh()) return fail("fresh: a satisfied clause stayed fresh");
+        e.revert();
+        e.set(N(3));
+        if (e.propagate(s, {N(3)}) != -1) return fail("fresh: satisfied clause conflicted after a revert");
+        if (e.trail != std::vector<std::pair<int, int>>{{N(4), id2}}) return fail("fresh: satisfied clause's watches lost");
+        // (3) all false when added: the conflict, and it stays fresh; after a
+        // revert it gets two free watches and propagates normally.
+        e.revert();
+        e.set(N(5));
+        e.set(N(6));
+        if (e.propagate(s, {N(5), N(6)}) != -1) return fail("fresh: round before the false clause");
+        const int c3[] = {P(5), P(6)};
+        const int id3 = s.add(c3, 2, 2);
+        if (e.propagate(s, {}) != id3) return fail("fresh: all-false fresh clause not the conflict");
+        if (!s.has_fresh()) return fail("fresh: the conflicting clause was dropped from fresh");
+        e.revert();
+        if (e.propagate(s, {}) != -1 || !e.trail.empty()) return fail("fresh: free clause forced or conflicted");
+        if (s.has_fresh()) return fail("fresh: a clause with two free literals stayed fresh");
+        e.set(N(5));
+        if (e.propagate(s, {N(5)}) != -1) return fail("fresh: conflict after the watches were set");
+        if (e.trail != std::vector<std::pair<int, int>>{{P(6), id3}}) return fail("fresh: watched clause did not force");
+    }
+
+    // unlock_all clears every lock: a clause locked, then unlocked, is
+    // deleted by reduce like any other.
+    {
+        ClauseStore s;
+        s.init(40, 2);
+        std::vector<int> id;
+        for (int i = 0; i < 6; ++i) {
+            const int c[] = {P(3 * i), P(3 * i + 1)};
+            id.push_back(s.add(c, 2, 2 + i));
+        }
+        s.lock(id[5], true);
+        s.unlock_all();
+        s.reduce();
+        if (s.size() > 2) return fail("unlock_all: reduce left more than max_clauses");
+        // the dead ids left the fresh list: propagate reaches the survivors only
+        Env e(40);
+        if (e.propagate(s, {}) != -1 || !e.trail.empty()) return fail("unlock_all: survivors misbehaved");
+        if (s.has_fresh()) return fail("unlock_all: fresh list not emptied");
+        e.set(N(0));
+        if (e.propagate(s, {N(0)}) != -1) return fail("unlock_all: survivor conflicted");
+        if (e.trail != std::vector<std::pair<int, int>>{{P(1), id[0]}}) return fail("unlock_all: lowest-lbd survivor did not force");
+        e.set(N(15));
+        if (e.propagate(s, {N(15)}) != -1 || e.trail.size() != 1) return fail("unlock_all: the unlocked worst clause survived");
+    }
+
     // (d) reduce: 20 clauses on disjoint cells, lbd 2..21, the two worst locked.
     {
         const int n_cells = 64;
@@ -316,6 +394,6 @@ int main() {
         if (e.trail != std::vector<std::pair<int, int>>{{N(63), fid}}) return fail("(d) reused clause did not force");
     }
 
-    std::printf("ok: clause store propagation, conflicts, reverts, units, reduce\n");
+    std::printf("ok: clause store propagation, conflicts, reverts, units, fresh clauses, reduce\n");
     return 0;
 }
