@@ -28,7 +28,7 @@ NONO = os.path.join(os.path.dirname(ROOT), "nonograms")
 # puzzles that take minutes each; --exclude adds to these, it does not
 # replace them (a run that replaced them walked into in_progress and sat
 # on an unfinishable puzzle for an hour).
-DEFAULT_EXCLUDE = ("partially_solved", "in_progress", "extreme")
+DEFAULT_EXCLUDE = ("partially_solved", "in_progress", "extreme", "insane")
 
 
 def golden(path):

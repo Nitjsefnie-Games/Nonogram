@@ -149,8 +149,9 @@ bench/nodes.py --compare bench/results/a-nodes.jsonl bench/results/b-nodes.jsonl
 ```
 
 `nodes.py` skips `partially_solved/` and `in_progress/` (no finished
-count to check) and `extreme/` (fully counted puzzles that take minutes
-to hours each, 3867 ten minutes, 30254 forty) by default; `--exclude`
+count to check), `extreme/` (fully counted puzzles that take minutes
+to hours each, 3867 ten minutes, 30254 forty) and `insane/` (six hours
+and up, 7785 twenty-two) by default; `--exclude`
 adds categories on top of those and `--include-all` runs everything.
 
 Two things to know when reading those numbers. The corpus's two largest
