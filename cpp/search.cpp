@@ -863,6 +863,22 @@ constexpr bool g_learn_check = false;
 std::vector<std::vector<int>> g_check_clauses;
 bool g_learn_check_inner = false;  // the check's own enumeration runs solve() without learning
 
+// Learning inside a region search. A learnt clause is implied, but one with a
+// literal off the region's lines can force or conflict inside the region's
+// search only when the outside has no completion in this context. The region
+// count is then 0 and the split node's product is right, but the region's
+// nodes would cache reduced counts under keys built from the region's lines
+// alone, which a later context with a feasible outside would read back. So
+// a clause force or conflict whose clause has a literal off the region's
+// lines bumps g_region_outside_events, and a region node whose subtree saw
+// one is not inserted into the state cache (lookups stay). The masks are the
+// active region's rows and the columns its rows had unknowns in at the split
+// (a cell is on the region's lines iff its row or its column is); empty
+// outside region searches. Written only when learning.
+std::vector<char> g_region_line_row, g_region_line_col;
+std::uint64_t g_region_outside_events = 0;
+std::uint64_t g_stat_region_inserts_skipped = 0;
+
 // An invariant the stats build checks (assert is compiled out of both
 // builds by -DNDEBUG); nothing in the release build.
 #ifdef NONOGRAM_STATS
@@ -1752,6 +1768,19 @@ std::vector<int> g_clause_lits;
 // lists are global, so the clauses the probe's cells make unit are found
 // like any other. Returns false on a conflict (g_conflict_clause set); the
 // caller then reverts the round, as after a line contradiction.
+// Whether clause `id` has a literal off the active region's lines (false
+// outside region searches).
+inline bool clause_leaves_region(int id, int W) {
+    if (g_region_line_row.empty()) return false;
+    int n = 0;
+    const int* l = g_clauses.lits(id, &n);
+    for (int i = 0; i < n; ++i) {
+        const int cell = l[i] >> 1;
+        if (!g_region_line_row[static_cast<std::size_t>(cell / W)] && !g_region_line_col[static_cast<std::size_t>(cell % W)]) return true;
+    }
+    return false;
+}
+
 bool clause_pass(Picture& pic, Trail& trail) {
     if (g_clauses.size() == 0) {  // no units, no watches, nothing fresh
         trail.clause_next = trail.changed_cell_indices.size();
@@ -1782,9 +1811,8 @@ bool clause_pass(Picture& pic, Trail& trail) {
         pic.mark_col_dirty(c);
         // A unit clause is implied by the puzzle, so its literal is true at
         // level 0 wherever it is forced; conflict analysis then drops it.
-        int n_lits = 0;
-        g_clauses.lits(id, &n_lits);
-        const std::uint16_t level = n_lits == 1 ? 0 : trail.level;
+        const std::uint16_t level = g_clauses.is_unit(id) ? 0 : trail.level;
+        if (clause_leaves_region(id, W)) ++g_region_outside_events;
         trail.push(trail_pack(r, c), Reason{R_CLAUSE, 0, level, static_cast<std::uint32_t>(id)});
         if (g_debug_stats) ++g_stat_clause_forced;
         if (g_memo_enabled && trail.stamps) stamp_cell(r, c);
@@ -1795,6 +1823,7 @@ bool clause_pass(Picture& pic, Trail& trail) {
         g_conflict_clause = conflict;
         g_conflict_line = -1;
         if (g_debug_stats) ++g_stat_clause_conflicts;
+        if (clause_leaves_region(conflict, W)) ++g_region_outside_events;
         return false;
     }
     // The store visited every literal it forced within the call, so the
@@ -2554,6 +2583,14 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
 
     state.result = 0;  // every early return below is a dead branch
     const char* region = state.region_row.empty() ? nullptr : state.region_row.data();
+    // Learning: a region node is cached only if no clause from outside the
+    // region acted in its subtree (see g_region_outside_events).
+    const std::uint64_t region_events_at_entry = g_learn_mode ? g_region_outside_events : 0;
+    auto region_insert_ok = [&]() {
+        if (!g_learn_mode || region == nullptr || g_region_outside_events == region_events_at_entry) return true;
+        if (g_debug_stats) ++g_stat_region_inserts_skipped;
+        return false;
+    };
     int n_unknown = pic.unknown_count;
     if (region) {
         n_unknown = 0;
@@ -2783,6 +2820,11 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             const double mass_at_split = g_explored_mass;
             std::vector<char> saved_region = state.region_row;
             std::vector<std::uint64_t> saved_region_bits = state.region_bits;
+            std::vector<char> saved_line_row, saved_line_col;
+            if (g_learn_mode) {
+                saved_line_row = g_region_line_row;
+                saved_line_col = g_region_line_col;
+            }
             const std::vector<std::uint64_t> comps(comp_rows.begin(), comp_rows.end());
             const double scale_at_split = g_mass_scale;
             g_mass_scale = scale_at_split / static_cast<double>(roots);
@@ -2797,6 +2839,21 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 state.region_row.assign(static_cast<std::size_t>(H), 0);
                 for (int r = 0; r < H; ++r) state.region_row[static_cast<std::size_t>(r)] = static_cast<char>((comp[r >> 6] >> (r & 63)) & 1);
                 state.region_bits.assign(comp, comp + row_words);
+                if (g_learn_mode) {
+                    // The region's lines: its rows, and the columns they have unknowns in.
+                    g_region_line_row = state.region_row;
+                    g_region_line_col.assign(static_cast<std::size_t>(W), 0);
+                    for (int r = 0; r < H; ++r) {
+                        if (!state.region_row[static_cast<std::size_t>(r)]) continue;
+                        for (int w = 0; w < kw; ++w) {
+                            std::uint64_t m = rk[r * kw + w] & kUnknownBits;
+                            while (m != 0) {
+                                g_region_line_col[static_cast<std::size_t>(32 * w + (__builtin_ctzll(m) >> 1))] = 1;
+                                m &= m - 1;
+                            }
+                        }
+                    }
+                }
                 ++state.region_calls;
                 const std::size_t mark = trail.changed_cell_indices.size();
                 const int saved_unknown_count = pic.unknown_count;
@@ -2809,10 +2866,14 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             }
             state.region_row = saved_region;
             state.region_bits = saved_region_bits;
+            if (g_learn_mode) {
+                g_region_line_row.swap(saved_line_row);
+                g_region_line_col.swap(saved_line_col);
+            }
             state.result = total;
             g_mass_scale = scale_at_split;
             g_explored_mass = mass_at_split + g_half_pow[static_cast<std::size_t>(state.branch_depth)] * scale_at_split;
-            if (cache_this_node) {
+            if (cache_this_node && region_insert_ok()) {
                 if (state.state_cache.insert(state_key, total, __rdtsc() - tsc_at_entry)) ++state.state_evictions;
             }
             return true;
@@ -3192,7 +3253,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
     }
     state.result = subtree_total;
     g_counted_so_far -= subtree_total;  // the parent adds it back as one finished child
-    if (cache_this_node) {
+    if (cache_this_node && region_insert_ok()) {
         if (state.state_cache.insert(state_key, subtree_total, __rdtsc() - tsc_at_entry)) ++state.state_evictions;
     }
 
@@ -3370,6 +3431,8 @@ void solve(const std::vector<std::vector<int>>& rows,
         g_conflict_line = -1;
         g_conflict_line_is_col = false;
         g_check_clauses.clear();
+        g_region_line_row.clear();
+        g_region_line_col.clear();
     }
     std::size_t budget = 1024ULL * 1024ULL * 1024ULL;  // 1 GB default
     const char* env = std::getenv("LINE_CACHE_BUDGET_MB");
@@ -3539,11 +3602,11 @@ void solve(const std::vector<std::vector<int>>& rows,
                      static_cast<unsigned long long>(g_stat_probe_skips));
         std::fprintf(stderr, "cache-stats: solutions_found=%d skip_probing=%d\n", state.solutions_found, static_cast<int>(state.skip_probing));
         if (g_learn_mode)
-            std::fprintf(stderr, "cache-stats: learn conflicts=%llu clauses=%llu avg-len=%.1f forced-by-clauses=%llu clause-conflicts=%llu deleted=%llu\n",
+            std::fprintf(stderr, "cache-stats: learn conflicts=%llu clauses=%llu avg-len=%.1f forced-by-clauses=%llu clause-conflicts=%llu deleted=%llu region-inserts-skipped=%llu\n",
                          static_cast<unsigned long long>(g_stat_conflicts), static_cast<unsigned long long>(g_stat_learnt),
                          g_stat_learnt ? static_cast<double>(g_stat_learnt_lits) / static_cast<double>(g_stat_learnt) : 0.0,
                          static_cast<unsigned long long>(g_stat_clause_forced), static_cast<unsigned long long>(g_stat_clause_conflicts),
-                         static_cast<unsigned long long>(g_stat_learnt_deleted));
+                         static_cast<unsigned long long>(g_stat_learnt_deleted), static_cast<unsigned long long>(g_stat_region_inserts_skipped));
         std::fprintf(stderr, "cache-stats: probe memo checked=%llu answered=%llu (PROBE_MEMO=1)\n",
                      static_cast<unsigned long long>(g_stat_memo_checked), static_cast<unsigned long long>(g_stat_memo_valid));
         std::fprintf(stderr, "cache-stats: latched subtrees dead[log2 size:count]:");
