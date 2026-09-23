@@ -2,6 +2,7 @@
 #include "types.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <cstddef>
 #include <vector>
@@ -418,3 +419,50 @@ void solve_line_batch(const std::int8_t* line, std::size_t n,
     result.total = 1;
 }
 
+
+namespace {
+bool line_forces(std::int8_t* buf, std::size_t n, const LineSpec& spec, int pos, std::int8_t val) {
+    static thread_local LineSolveResult r;
+    solve_line_batch(buf, n, spec, r, true);
+    if (r.total == 0) return false;
+    for (int d : r.deductions) if (deduce_pos(d) == pos && deduce_val(d) == val) return true;
+    return false;
+}
+bool line_unsat(std::int8_t* buf, std::size_t n, const LineSpec& spec) {
+    static thread_local LineSolveResult r;
+    solve_line_batch(buf, n, spec, r, true);
+    return r.total == 0;
+}
+// Greedy: drop the known cells farthest from `pos` first (the ones least
+// likely to matter), keeping a drop when the property still holds. Both
+// properties are monotone (a superset of known cells still forces / is still
+// unsat), so a cell kept once can never become droppable later: one pass
+// yields a locally minimal subset. Distance ties go to the lower position so
+// the order, and with it the explanation, does not depend on std::sort.
+template <class Holds>
+int explain_greedy(const std::int8_t* line, std::size_t n, int pos, int* out, Holds holds) {
+    static thread_local std::vector<std::int8_t> buf;
+    buf.assign(line, line + n);
+    std::vector<int> known;
+    for (int i = 0; i < static_cast<int>(n); ++i) if (buf[i] != UNKNOWN && i != pos) known.push_back(i);
+    std::sort(known.begin(), known.end(), [pos](int a, int b) {
+        const int da = std::abs(a - pos), db = std::abs(b - pos);
+        return da != db ? da > db : a < b;
+    });
+    for (int i : known) {
+        const std::int8_t saved = buf[i];
+        buf[i] = UNKNOWN;
+        if (!holds(buf.data())) buf[i] = saved;
+    }
+    int k = 0;
+    for (int i = 0; i < static_cast<int>(n); ++i) if (buf[i] != UNKNOWN && i != pos) out[k++] = i;
+    return k;
+}
+}  // namespace
+
+int explain_deduction(const std::int8_t* line, std::size_t n, const LineSpec& spec, int pos, std::int8_t val, int* out) {
+    return explain_greedy(line, n, pos, out, [&](std::int8_t* b) { return line_forces(b, n, spec, pos, val); });
+}
+int explain_conflict(const std::int8_t* line, std::size_t n, const LineSpec& spec, int* out) {
+    return explain_greedy(line, n, -1, out, [&](std::int8_t* b) { return line_unsat(b, n, spec); });
+}

@@ -38,3 +38,11 @@ LineSpec make_line_spec(const std::vector<int>& clue);
 void solve_line_batch(const std::int8_t* line, std::size_t n,
                       const LineSpec& spec, LineSolveResult& out,
                       bool has_unknown = true);
+
+// Positions (ascending) of a subset of the line's known cells that alone
+// forces cell `pos` to `val`; returns the count. `line` must currently
+// force pos = val (pos is UNKNOWN in it). out has room for n ints.
+int explain_deduction(const std::int8_t* line, std::size_t n, const LineSpec& spec, int pos, std::int8_t val, int* out);
+// Positions of a subset of the known cells that alone makes the line
+// unsatisfiable; `line` must be unsatisfiable. Returns the count.
+int explain_conflict(const std::int8_t* line, std::size_t n, const LineSpec& spec, int* out);

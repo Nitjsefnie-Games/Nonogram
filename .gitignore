@@ -38,6 +38,9 @@
 !/cpp/external/ankerl/
 /cpp/external/ankerl/*
 !/cpp/external/ankerl/*.h
+!/cpp/tests/
+/cpp/tests/*
+!/cpp/tests/*.cpp
 
 # the puzzle corpus: one file per puzzle, no extension, under a category
 # directory (categories come and go, so the directory name is a glob)

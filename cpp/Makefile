@@ -60,3 +60,10 @@ pgo-clean:
 	rm -rf $(PGO_DIR) solver-instrumented
 
 .PHONY: all clean pgo pgo-clean stats
+
+TESTS = $(wildcard tests/*.cpp)
+test: $(TESTS:tests/%.cpp=tests/%)
+	for t in $(TESTS:tests/%.cpp=tests/%); do ./$$t || exit 1; done
+tests/%: tests/%.cpp lines.cpp picture.cpp $(wildcard *.hpp)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -I. -o $@ $< lines.cpp picture.cpp
+.PHONY: test
