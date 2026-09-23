@@ -849,9 +849,12 @@ int g_conflict_line = -1;
 bool g_conflict_line_is_col = false;
 // Learning statistics (DEBUG_CACHE_STATS): contradictions analysed, clauses
 // learnt and their total length, clauses deleted by reduce, cells forced by
-// clauses and clause conflicts (solve and probe trails alike).
+// clauses and clause conflicts (solve and probe trails alike); clauses learnt
+// from contradicting probes, and those of them whose UIP was not the probe
+// pixel (no reason for the forced commit, see probe_cell_t).
 std::uint64_t g_stat_conflicts = 0, g_stat_learnt = 0, g_stat_learnt_lits = 0, g_stat_learnt_deleted = 0;
 std::uint64_t g_stat_clause_forced = 0, g_stat_clause_conflicts = 0;
+std::uint64_t g_stat_probe_learnt = 0, g_stat_probe_uip_elsewhere = 0;
 // LEARN_CHECK=1 (stats build, with learning on): every clause learnt is kept
 // here, deleted ones too, and checked against every solution when solve()
 // returns (see learn_check).
@@ -1772,7 +1775,9 @@ std::vector<int> g_clause_lits;
 // reason. On a probe trail this sees the probe's own cells only: the solve
 // trail is at its clause fixpoint whenever a probe starts, and the watch
 // lists are global, so the clauses the probe's cells make unit are found
-// like any other. Returns false on a conflict (g_conflict_clause set); the
+// like any other. The one fresh clause a probe can meet is the one its
+// cell's other probe just learnt, which the probe pixel satisfies (see
+// probe_cell_t). Returns false on a conflict (g_conflict_clause set); the
 // caller then reverts the round, as after a line contradiction. Never
 // called inside a region search (see g_region_depth).
 bool clause_pass(Picture& pic, Trail& trail) {
@@ -1834,10 +1839,14 @@ bool clause_pass(Picture& pic, Trail& trail) {
 // contradiction takes effect at the next propagation). No pass runs inside
 // a region search, on either trail (see g_region_depth): a clause learnt
 // there waits for the search to return. So the propagation that first
-// examines a clause is always on the solve trail: the node that learnt
-// returns dead (a region loop breaks on it) and, once no region search is
-// active, the next propagation is a parent's next branch value, before any
-// node probes.
+// examines a clause is on the solve trail, or is a probe's that the clause
+// cannot act in. A clause learnt at a committed contradiction: the node
+// that learnt returns dead (a region loop breaks on it) and, once no region
+// search is active, the next propagation is a parent's next branch value,
+// before any node probes. A clause a probe learnt (probe_cell_t) asserts
+// the probed cell's other value: the cell's other probe, if it runs, sets
+// that value, and the forced commit's propagation holds it too; when both
+// probes contradict, the node returns dead as above.
 template <bool FAST, int KW, bool LEARN>
 bool propagate_t(const std::vector<const LineSpec*>& mapped_rows,
                  const std::vector<const LineSpec*>& mapped_cols,
@@ -2134,6 +2143,10 @@ int count_solved_pixels(const Picture& pic) {
 struct ProbeResult {
     bool ok;
     int pixels_filled;
+    // Learning only: when the probe contradicted, the clause its conflict
+    // analysis learnt, if that clause asserts the probed cell's other value
+    // (the forced commit's reason, see the probing pass); -1 otherwise.
+    int learnt_clause = -1;
 };
 
 // What the probes of one pass at one node imply about each other. When
@@ -2251,7 +2264,7 @@ ProbeResult probe_cell_t(int row,
                          const std::vector<const LineSpec*>& mapped_cols,
                          Picture& pic,
                          ProbeBounds* bounds,
-                         std::uint16_t solve_level) {
+                         const Trail* solve_trail) {
     // Reusable per-probe trail (one per LEARN instantiation). probe_cell
     // never nests (it calls only solve_lines, which never probes), and the
     // previous probe's ProbeGuard already reverted every cell it touched (and
@@ -2260,7 +2273,7 @@ ProbeResult probe_cell_t(int row,
     static thread_local Trail trail;
     trail.changed_cell_indices.clear();
     if constexpr (!LEARN) {
-        (void)solve_level;
+        (void)solve_trail;
     } else {
         trail.reasons.clear();
         STATS_CHECK(trail.clause_next == 0);  // the last probe's guard reset it
@@ -2268,7 +2281,7 @@ ProbeResult probe_cell_t(int row,
             trail.cell_pos.assign(static_cast<std::size_t>(pic.height()) * pic.width(), UINT32_MAX);
         }
         trail.W = pic.width();
-        trail.level = static_cast<std::uint16_t>(solve_level + 1);
+        trail.level = static_cast<std::uint16_t>((solve_trail != nullptr ? solve_trail->level : 0) + 1);
     }
     // A valid memo answers the probe (see ProbeMemo).
     ProbeMemo* memo = nullptr;
@@ -2325,7 +2338,43 @@ ProbeResult probe_cell_t(int row,
         for (int w = 0; w < kMemoWords; ++w) memo->touched[w] = t[w];
     }
     if (!consistent) {
-        return ProbeResult{false, 0};
+        ProbeResult res{false, 0};
+        if constexpr (LEARN) {
+            // Learn from the contradiction here, while the probe trail still
+            // holds its reasons and the conflict record is this probe's (the
+            // guard reverts both when we return, and the pair's other probe
+            // overwrites the record). The probe pixel is the only decision
+            // at the probe level, so the UIP is the probe pixel unless a
+            // cell the probe forced lies on every path from it to the
+            // conflict. With the pixel as UIP the clause reads "the solve
+            // trail's literals it names imply the other value": the forced
+            // commit's reason. Otherwise it asserts that forced cell's
+            // negation, still implied, but no reason for the commit.
+            if (solve_trail != nullptr) {
+                const int id = analyze_conflict(trail, solve_trail, pic, mapped_rows, mapped_cols);
+                if (id >= 0) {
+                    if (g_debug_stats) ++g_stat_probe_learnt;
+                    int n = 0;
+                    const int* l = g_clauses.lits(id, &n);
+                    const int probe_lit = (row * pic.width() + col) * 2 + (val == FULL ? 1 : 0);
+#ifdef NONOGRAM_STATS
+                    // Every literal is false at the conflict: the asserting
+                    // one on the probe trail (the UIP is a probe-level
+                    // entry), the rest on the solve trail (the probe trail's
+                    // other entries are at the probe level or at level 0).
+                    for (int i = 0; i < n; ++i) {
+                        const std::size_t cell = static_cast<std::size_t>(l[i] >> 1);
+                        STATS_CHECK(pic.pixels[cell] != UNKNOWN && l[i] == (cell_lit(pic, static_cast<int>(cell)) ^ 1));
+                        STATS_CHECK(i == 0 ? trail.cell_pos[cell] != UINT32_MAX
+                                           : trail.cell_pos[cell] == UINT32_MAX && solve_trail->cell_pos[cell] != UINT32_MAX);
+                    }
+#endif
+                    if (l[0] == (probe_lit ^ 1)) res.learnt_clause = id;
+                    else if (g_debug_stats) ++g_stat_probe_uip_elsewhere;  // implied, but no reason for the commit
+                }
+            }
+        }
+        return res;
     }
 
     if (g_debug_stats) ++g_stat_probe_ok;
@@ -2359,9 +2408,9 @@ ProbeResult probe_cell(int row,
                        const std::vector<const LineSpec*>& mapped_cols,
                        Picture& pic,
                        ProbeBounds* bounds,
-                       std::uint16_t solve_level) {
-    return g_learn_mode ? probe_cell_t<true>(row, col, val, mapped_rows, mapped_cols, pic, bounds, solve_level)
-                        : probe_cell_t<false>(row, col, val, mapped_rows, mapped_cols, pic, bounds, solve_level);
+                       const Trail* solve_trail) {
+    return g_learn_mode ? probe_cell_t<true>(row, col, val, mapped_rows, mapped_cols, pic, bounds, solve_trail)
+                        : probe_cell_t<false>(row, col, val, mapped_rows, mapped_cols, pic, bounds, solve_trail);
 }
 
 // Implication-graph analysis of the current node's probe record (see
@@ -3012,20 +3061,20 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 if (g_debug_stats) ++g_stat_probe_skips;
                 full_res = ProbeResult{true, bound_full};
             } else {
-                full_res = probe_cell(row, col, FULL, mapped_rows, mapped_cols, pic, &bounds, trail.level);
+                full_res = probe_cell(row, col, FULL, mapped_rows, mapped_cols, pic, &bounds, &trail);
             }
             const int bound_empty = skip_ok ? bounds.bound(row, col, EMPTY) : INT_MAX;
             if (bound_empty < best_pixels) {
                 if (g_debug_stats) ++g_stat_probe_skips;
                 empty_res = ProbeResult{true, bound_empty};
             } else {
-                empty_res = probe_cell(row, col, EMPTY, mapped_rows, mapped_cols, pic, &bounds, trail.level);
+                empty_res = probe_cell(row, col, EMPTY, mapped_rows, mapped_cols, pic, &bounds, &trail);
             }
 
             state.record_probe((!full_res.ok) || (!empty_res.ok));
 
             if (!full_res.ok && !empty_res.ok) {
-                return true; // dead branch
+                return true; // dead branch (learning: each probe learnt its clause)
             }
 
             if (full_res.ok != empty_res.ok) {
@@ -3036,8 +3085,21 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 // propagate in place and keep probing the remaining cells.
                 if (g_memo_enabled) memo_next_gen();
                 pic.set_known(row, col, forced);
-                // No clause for the commit yet: UINT32_MAX (no antecedents).
-                trail.record(trail_pack(row, col), Reason{R_PROBE, 0, trail.level, UINT32_MAX});
+                // Learning: the contradicting probe's clause asserts this
+                // value from solve-trail literals alone, so it is the
+                // commit's reason (a unit clause: true in every solution,
+                // level 0, as clause_pass records it). Without one (no
+                // clause learnt, or its UIP was not the probe pixel):
+                // UINT32_MAX, no antecedents, like a decision.
+                Reason reason{R_PROBE, 0, trail.level, UINT32_MAX};
+                if (g_learn_mode) {
+                    const int learnt = full_res.ok ? empty_res.learnt_clause : full_res.learnt_clause;
+                    if (learnt >= 0) {
+                        reason.id = static_cast<std::uint32_t>(learnt);
+                        if (g_clauses.is_unit(learnt)) reason.level = 0;
+                    }
+                }
+                trail.record(trail_pack(row, col), reason);
                 stamp_cell(row, col);
                 pic.mark_row_dirty(row);
                 pic.mark_col_dirty(col);
@@ -3316,8 +3378,8 @@ double estimate_dive(const std::vector<const LineSpec*>& mapped_rows,
         if (br < 0) return weight;  // no unknowns (already solved-equivalent)
 
         // Count viable values via lookahead probes (each reverts pic).
-        ProbeResult pf = probe_cell(br, bc, FULL, mapped_rows, mapped_cols, pic, nullptr, 0);
-        ProbeResult pe = probe_cell(br, bc, EMPTY, mapped_rows, mapped_cols, pic, nullptr, 0);
+        ProbeResult pf = probe_cell(br, bc, FULL, mapped_rows, mapped_cols, pic, nullptr, nullptr);
+        ProbeResult pe = probe_cell(br, bc, EMPTY, mapped_rows, mapped_cols, pic, nullptr, nullptr);
         const int nv = (pf.ok ? 1 : 0) + (pe.ok ? 1 : 0);
         if (nv == 0) return 0.0;
         std::int8_t val;
@@ -3550,7 +3612,8 @@ void solve(const std::vector<std::vector<int>>& rows,
         std::fprintf(stderr, "\n");
     }
 
-    if (g_debug_stats) {
+    // Once per run: not again for learn_check's own enumeration.
+    if (g_debug_stats && !g_learn_check_inner) {
         std::fprintf(stderr, "cache-stats: lookups=%llu misses=%llu probes=%llu\ncache-stats: deductions-per-entry histogram:",
                      static_cast<unsigned long long>(g_stat_lookups),
                      static_cast<unsigned long long>(g_stat_misses),
@@ -3570,11 +3633,12 @@ void solve(const std::vector<std::vector<int>>& rows,
                      static_cast<unsigned long long>(g_stat_probe_skips));
         std::fprintf(stderr, "cache-stats: solutions_found=%d skip_probing=%d\n", state.solutions_found, static_cast<int>(state.skip_probing));
         if (g_learn_mode)
-            std::fprintf(stderr, "cache-stats: learn conflicts=%llu clauses=%llu avg-len=%.1f forced-by-clauses=%llu clause-conflicts=%llu deleted=%llu\n",
+            std::fprintf(stderr, "cache-stats: learn conflicts=%llu clauses=%llu avg-len=%.1f forced-by-clauses=%llu clause-conflicts=%llu deleted=%llu probe-conflicts-learned=%llu probe-uip-elsewhere=%llu\n",
                          static_cast<unsigned long long>(g_stat_conflicts), static_cast<unsigned long long>(g_stat_learnt),
                          g_stat_learnt ? static_cast<double>(g_stat_learnt_lits) / static_cast<double>(g_stat_learnt) : 0.0,
                          static_cast<unsigned long long>(g_stat_clause_forced), static_cast<unsigned long long>(g_stat_clause_conflicts),
-                         static_cast<unsigned long long>(g_stat_learnt_deleted));
+                         static_cast<unsigned long long>(g_stat_learnt_deleted), static_cast<unsigned long long>(g_stat_probe_learnt),
+                         static_cast<unsigned long long>(g_stat_probe_uip_elsewhere));
         std::fprintf(stderr, "cache-stats: probe memo checked=%llu answered=%llu (PROBE_MEMO=1)\n",
                      static_cast<unsigned long long>(g_stat_memo_checked), static_cast<unsigned long long>(g_stat_memo_valid));
         std::fprintf(stderr, "cache-stats: latched subtrees dead[log2 size:count]:");
