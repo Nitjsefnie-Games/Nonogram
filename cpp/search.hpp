@@ -30,7 +30,12 @@ void solve(const std::vector<std::vector<int>>& rows,
            bool keep_probing = false,
            double balance_k = 0.0,
            bool count_mode = false,
-           std::string* out_count = nullptr);
+           std::string* out_count = nullptr,
+           bool learn = false);
+// learn: clause-learning mode (--learn). Propagation to a fixpoint also
+// runs unit propagation over the learnt clauses (none are learnt yet). The
+// stats build (make stats) also turns it on with LEARN=1 in the environment;
+// LEARN_MAX_CLAUSES caps the clause store (default 50000).
 // count_mode: count solutions instead of visiting them. on_solution is never
 // called; the exact total is written to *out_count in decimal. After
 // propagation at every branch node the unknown cells are split into regions

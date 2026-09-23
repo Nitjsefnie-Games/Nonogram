@@ -33,6 +33,7 @@ void print_usage(std::FILE* stream) {
     std::fprintf(stream, "                   puzzles stop at a different point. Ignored by --anytime\n");
     std::fprintf(stream, "  --print-every N  Log count + rate + elapsed every N solutions\n");
     std::fprintf(stream, "                   (default: progressive batches starting at 10, x1.1)\n");
+    std::fprintf(stream, "  --learn          Learn a clause from every contradiction (count mode)\n");
 }
 
 // Format an integer with comma thousands separators (e.g. 30000 -> "30,000").
@@ -122,6 +123,7 @@ int main(int argc, char** argv) {
     bool anytime = false;          // keep lookahead probing on for whole search
     double balance_k = 0.0;        // --balance K: K*min - max branch score
     long long estimate_dives = 0;  // >0: Knuth-estimate solution count, don't solve
+    bool learn = false;            // --learn: clause-learning mode
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -129,6 +131,8 @@ int main(int argc, char** argv) {
             print_progress = true;
         } else if (std::strcmp(a, "--anytime") == 0) {
             anytime = true;
+        } else if (std::strcmp(a, "--learn") == 0) {
+            learn = true;
         } else if (std::strcmp(a, "--estimate") == 0) {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "--estimate requires a dive count\n");
@@ -355,7 +359,7 @@ int main(int argc, char** argv) {
     const bool count_mode = !print_progress && !have_max && !anytime;
     std::string count_str;
     if (count_mode) set_progress_interval(60.0);
-    solve(clues.rows, clues.cols, callback, &strategy, anytime, balance_k, count_mode, &count_str);
+    solve(clues.rows, clues.cols, callback, &strategy, anytime, balance_k, count_mode, &count_str, learn);
 
     auto end = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(end - start).count();

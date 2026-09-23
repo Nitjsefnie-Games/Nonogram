@@ -1,5 +1,6 @@
 #include "search.hpp"
 
+#include "clauses.hpp"
 #include "lines.hpp"
 #include "picture.hpp"
 #include "types.hpp"
@@ -799,9 +800,10 @@ void reset_line_cache(int height, int width, std::size_t budget_bytes, bool rese
 // paths. A single Trail is owned by solve(); each backtrack branch uses
 // trail.size() as a mark, applies its branch pixel + propagation, then
 // truncates the trail (reverting cells to UNKNOWN) before the next branch.
-// probe_cell uses a private local Trail because its mutations are reverted
-// before returning to its caller (solve_backtrack), so they don't need to
-// commingle with the outer trail.
+// Probes use their own Trail (a reused one per LEARN instantiation of
+// probe_cell_t) because their mutations are reverted before returning to
+// the caller (solve_backtrack), so they don't need to commingle with the
+// outer trail.
 // ---------------------------------------------------------------------------
 
 // Trail entries carry (row, col) rather than a linear index so a revert can
@@ -825,6 +827,32 @@ struct Reason { std::uint8_t kind; std::uint8_t is_col; std::uint16_t level; std
 // instructions for 17.5M pushes); the per-node sites use Trail::record.
 bool g_learn_mode = false;
 
+// The learnt clauses (--learn), shared by the solve trail and the probe
+// trails: the watch lists are global, so a probe's clause pass finds the
+// clauses its cells make unit like any other. Initialised by solve() only
+// when learning is on.
+ClauseStore g_clauses;
+// The last contradiction a propagation reported (learning only): a clause
+// id, or else the line (index, and whether it is a column) whose solve
+// found no filling. Conflict analysis starts from it.
+int g_conflict_clause = -1;
+int g_conflict_line = -1;
+bool g_conflict_line_is_col = false;
+
+// An invariant the stats build checks (assert is compiled out of both
+// builds by -DNDEBUG); nothing in the release build.
+#ifdef NONOGRAM_STATS
+#define STATS_CHECK(cond) \
+    do { \
+        if (!(cond)) { \
+            std::fprintf(stderr, "stats check failed: %s (%s:%d)\n", #cond, __FILE__, __LINE__); \
+            std::abort(); \
+        } \
+    } while (0)
+#else
+#define STATS_CHECK(cond) do {} while (0)
+#endif
+
 struct Trail {
     std::vector<int> changed_cell_indices;  // packed (row, col); see trail_pack
     std::vector<Reason> reasons;            // parallel to changed_cell_indices
@@ -836,6 +864,9 @@ struct Trail {
     // (region searches nest inside their split node's level); on the probe
     // trail the solve trail's level + 1.
     std::uint16_t level = 0;
+    // Learning only: the first changed_cell_indices entry the clause pass
+    // has not seen yet (see clause_pass). A revert lowers it to the mark.
+    std::size_t clause_next = 0;
     void push(int packed, Reason r) {
         cell_pos[static_cast<std::size_t>(trail_row(packed)) * W + trail_col(packed)] = static_cast<std::uint32_t>(changed_cell_indices.size());
         changed_cell_indices.push_back(packed);
@@ -1579,9 +1610,9 @@ inline BatchResult solve_one_batch(const std::vector<const LineSpec*>& mapped,
 // write_intersection: apply the deduced positions/values to pic, marking
 // the cross-direction dirty for any cells that go from UNKNOWN to a value.
 //
-// Every pixel transition UNKNOWN -> value is recorded into trail (linear cell
-// index r*W + c). On revert, the caller truncates the trail and walks each
-// recorded index back to UNKNOWN.
+// Every pixel transition UNKNOWN -> value is recorded into trail (the packed
+// (row, col) entry, see trail_pack). On revert, the caller truncates the
+// trail and walks each recorded entry back to UNKNOWN.
 // ---------------------------------------------------------------------------
 
 template <bool LEARN, typename Iter, typename Pos, typename Val>
@@ -1619,15 +1650,15 @@ __attribute__((flatten)) void write_intersection(const BatchResult& r, int line_
     if (r.n8 != BatchResult::kLegacy) {
         const std::uint8_t* d = static_cast<const std::uint8_t*>(r.ded);
         write_intersection_impl<LEARN>(d, d + r.n8,
-                                [](std::uint8_t b) { return static_cast<int>(b & 0x7F); },
-                                [](std::uint8_t b) { return static_cast<std::int8_t>(b >> 7); },
-                                line_index, pic, is_row, trail);
+                                       [](std::uint8_t b) { return static_cast<int>(b & 0x7F); },
+                                       [](std::uint8_t b) { return static_cast<std::int8_t>(b >> 7); },
+                                       line_index, pic, is_row, trail);
     } else {
         const auto* v = static_cast<const std::vector<int>*>(r.ded);
         write_intersection_impl<LEARN>(v->begin(), v->end(),
-                                [](int enc) { return deduce_pos(enc); },
-                                [](int enc) { return deduce_val(enc); },
-                                line_index, pic, is_row, trail);
+                                       [](int enc) { return deduce_pos(enc); },
+                                       [](int enc) { return deduce_val(enc); },
+                                       line_index, pic, is_row, trail);
     }
 }
 
@@ -1668,6 +1699,11 @@ inline bool solve_lines(const std::vector<const LineSpec*>& mapped,
         BatchResult r = solve_one_batch<FAST, KW>(mapped, index, !is_row, pic, h);
         h = next_h;
         if (!r.success) {
+            if constexpr (LEARN) {
+                g_conflict_line = index;
+                g_conflict_line_is_col = !is_row;
+                g_conflict_clause = -1;
+            }
             return false;
         }
         if (r.n8 > 0 || (r.n8 == BatchResult::kLegacy && r.ded != nullptr)) {
@@ -1678,19 +1714,85 @@ inline bool solve_lines(const std::vector<const LineSpec*>& mapped,
     return true;
 }
 
+// The literals of the trail entries clause_pass has not seen yet (reused;
+// passes never nest: a probe's pass runs while no solve-trail pass does).
+std::vector<int> g_clause_lits;
+
+// Clause propagation (learning only) over the trail entries since the last
+// pass: each becomes the literal it made true, and the store visits the
+// clauses those make false, and whatever they force, to the clause fixpoint
+// in one call. A forced cell is set, its row and column are marked dirty
+// (the line drain picks them up) and it goes on the trail with an R_CLAUSE
+// reason. On a probe trail this sees the probe's own cells only: the solve
+// trail is at its clause fixpoint whenever a probe starts, and the watch
+// lists are global, so the clauses the probe's cells make unit are found
+// like any other. Returns false on a conflict (g_conflict_clause set); the
+// caller then reverts the round, as after a line contradiction.
+bool clause_pass(Picture& pic, Trail& trail) {
+    const int W = pic.width();
+    std::int8_t* px = pic.pixels.data();
+    const std::size_t n = trail.changed_cell_indices.size();
+    g_clause_lits.clear();
+    for (std::size_t i = trail.clause_next; i < n; ++i) {
+        const int e = trail.changed_cell_indices[i];
+        const int cell = trail_row(e) * W + trail_col(e);
+        g_clause_lits.push_back(cell * 2 + (px[cell] == FULL ? 1 : 0));
+    }
+    trail.clause_next = n;
+    auto assigned = [px](int l) -> int {
+        const std::int8_t v = px[l >> 1];
+        if (v == UNKNOWN) return 0;
+        return (v == FULL) == ((l & 1) != 0) ? 1 : -1;
+    };
+    auto force = [&pic, &trail, px, W](int l, int id) -> bool {
+        const int cell = l >> 1;
+        const std::int8_t v = (l & 1) ? FULL : EMPTY;
+        if (px[cell] != UNKNOWN) return px[cell] == v;
+        const int r = cell / W, c = cell % W;
+        pic.set_known(r, c, v);
+        pic.mark_row_dirty(r);
+        pic.mark_col_dirty(c);
+        trail.push(trail_pack(r, c), Reason{R_CLAUSE, 0, trail.level, static_cast<std::uint32_t>(id)});
+        if (g_memo_enabled && trail.stamps) stamp_cell(r, c);
+        return true;
+    };
+    const int conflict = g_clauses.propagate(g_clause_lits.data(), static_cast<int>(g_clause_lits.size()), assigned, force);
+    if (conflict >= 0) {
+        g_conflict_clause = conflict;
+        g_conflict_line = -1;
+        return false;
+    }
+    // The store visited every literal it forced within the call, so the
+    // entries it pushed need no second visit.
+    trail.clause_next = trail.changed_cell_indices.size();
+    return true;
+}
+
 // Propagation to a fixpoint: drain rows and columns until neither queue
 // holds a line. Returns false on a contradiction (a line with no valid
 // filling), leaving the queues as they are for the caller's revert.
+// Learning adds a clause pass whenever the drain left trail entries it has
+// not seen, and drains again when the pass set cells, so the fixpoint is
+// closed under both. The pass runs only for new entries: a unit clause the
+// store holds would be forced on any call, but no clause is asserted here;
+// whoever adds one asserts it.
 template <bool FAST, int KW, bool LEARN>
 bool propagate_t(const std::vector<const LineSpec*>& mapped_rows,
                  const std::vector<const LineSpec*>& mapped_cols,
                  Picture& pic,
                  Trail& trail) {
-    while (pic.has_dirty()) {
-        if (!solve_lines<FAST, KW, LEARN>(mapped_rows, pic, true, trail)) return false;
-        if (!solve_lines<FAST, KW, LEARN>(mapped_cols, pic, false, trail)) return false;
+    for (;;) {
+        while (pic.has_dirty()) {
+            if (!solve_lines<FAST, KW, LEARN>(mapped_rows, pic, true, trail)) return false;
+            if (!solve_lines<FAST, KW, LEARN>(mapped_cols, pic, false, trail)) return false;
+        }
+        if constexpr (!LEARN) {
+            return true;
+        } else {
+            if (trail.clause_next >= trail.changed_cell_indices.size()) return true;
+            if (!clause_pass(pic, trail)) return false;  // sets g_conflict_clause
+        }
     }
-    return true;
 }
 
 // The fast/legacy choice and the key word count are per puzzle; decided
@@ -1703,8 +1805,10 @@ bool propagate_t(const std::vector<const LineSpec*>& mapped_rows,
 // propagation (probe_cell_t calls propagate_l directly), and runs the
 // runtime-width drain only: instantiating every width on it as well left
 // Picture::set_known out of line in the LTO build (+11.7% instructions on
-// easy_large/7382 with learning off; write_intersection is flattened for the
-// same reason), and deciding it per deduced line cost +1.4%.
+// easy_large/7382 with learning off), and deciding it per deduced line cost
+// +1.4%. write_intersection is flattened for the same reason: without its
+// __attribute__((flatten)) (GCC/Clang only) LTO stops inlining set_known
+// there too, about 11% more instructions on the off path.
 template <bool LEARN>
 inline bool propagate_l(const std::vector<const LineSpec*>& mapped_rows,
                         const std::vector<const LineSpec*>& mapped_cols,
@@ -1834,6 +1938,7 @@ struct ProbeGuard {
                 pic.unset(trail_row(*it), trail_col(*it));
                 cell_pos[static_cast<std::size_t>(trail_row(*it)) * tw + trail_col(*it)] = UINT32_MAX;
             }
+            trail.clause_next = 0;  // every entry is undone (the next probe clears the buffers)
         } else {
             for (auto it = trail.changed_cell_indices.rbegin();
                  it != trail.changed_cell_indices.rend(); ++it) {
@@ -1880,6 +1985,7 @@ ProbeResult probe_cell_t(int row,
         (void)solve_level;
     } else {
         trail.reasons.clear();
+        STATS_CHECK(trail.clause_next == 0);  // the last probe's guard reset it
         if (trail.cell_pos.size() != static_cast<std::size_t>(pic.height()) * pic.width()) {
             trail.cell_pos.assign(static_cast<std::size_t>(pic.height()) * pic.width(), UINT32_MAX);
         }
@@ -2108,25 +2214,30 @@ void revert_branch_t(Picture& pic,
     const std::size_t n = trail.changed_cell_indices.size();
     const std::size_t split = std::max(mark, std::min(n, trail.counted));
     if (g_memo_enabled && n > mark) memo_next_gen();  // a revert changes its lines too
-    std::uint32_t* cell_pos = trail.cell_pos.data();
-    const std::size_t tw = static_cast<std::size_t>(trail.W);
+    if constexpr (LEARN) {
+        std::uint32_t* cell_pos = trail.cell_pos.data();
+        const std::size_t tw = static_cast<std::size_t>(trail.W);
+        for (std::size_t i = n; i > mark; ) {
+            const int e = tr[--i];
+            cell_pos[static_cast<std::size_t>(trail_row(e)) * tw + trail_col(e)] = UINT32_MAX;
+        }
+    }
     for (std::size_t i = n; i > split; ) {
         const int e = tr[--i];
         pic.unset(trail_row(e), trail_col(e));
-        if constexpr (LEARN) cell_pos[static_cast<std::size_t>(trail_row(e)) * tw + trail_col(e)] = UINT32_MAX;
         stamp_cell(trail_row(e), trail_col(e));
     }
     for (std::size_t i = split; i > mark; ) {
         const int e = tr[--i];
         trail.unsettle(trail_row(e), trail_col(e));
         pic.unset(trail_row(e), trail_col(e));
-        if constexpr (LEARN) cell_pos[static_cast<std::size_t>(trail_row(e)) * tw + trail_col(e)] = UINT32_MAX;
         stamp_cell(trail_row(e), trail_col(e));
     }
     if (n > mark) {
         trail.changed_cell_indices.resize(mark);
         if constexpr (LEARN) trail.reasons.resize(mark);
     }
+    if constexpr (LEARN) trail.clause_next = std::min(trail.clause_next, mark);
     if (trail.counted > mark) trail.counted = mark;
     pic.unknown_count = saved_unknown_count;
     while (!pic.row_queue.empty()) {
@@ -2596,6 +2707,9 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 __builtin_prefetch(&g_memo[static_cast<std::size_t>(nx.first) * W + nx.second]);
             }
             if (pxs[row * W + col] != UNKNOWN) continue;  // settled by an earlier commit this pass
+            // A probe's clause pass sees only the probe's cells, so the node
+            // must be at its clause fixpoint (see clause_pass).
+            if (g_learn_mode) STATS_CHECK(trail.clause_next == trail.changed_cell_indices.size());
 
             // Each value is skipped only when a bound proves it consistent
             // (bound set) AND below the best score. A skipped value is never
@@ -2783,7 +2897,10 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
 
         // Apply the branch pixel (record on trail).
         if (g_memo_enabled) memo_next_gen();
-        if (g_learn_mode) ++trail.level;  // the branch pixel opens a decision level
+        if (g_learn_mode) {  // the branch pixel opens a decision level
+            assert(trail.level < UINT16_MAX);
+            ++trail.level;
+        }
         pic.set_known(row, col, val);
         trail.record(trail_pack(row, col), Reason{R_DECISION, 0, trail.level, 0});
         stamp_cell(row, col);
@@ -2931,10 +3048,23 @@ void solve(const std::vector<std::vector<int>>& rows,
            bool keep_probing,
            double balance_k,
            bool count_mode,
-           std::string* out_count) {
-    // LEARN=1 turns clause-learning mode on (until --learn replaces it).
-    const char* learn_env = std::getenv("LEARN");
-    g_learn_mode = learn_env != nullptr && std::strcmp(learn_env, "1") == 0;
+           std::string* out_count,
+           bool learn) {
+    // --learn turns clause-learning mode on; the stats build also takes
+    // LEARN=1, so bench/nodes.py --env LEARN=1 gates the mode.
+    g_learn_mode = learn;
+#ifdef NONOGRAM_STATS
+    if (const char* learn_env = std::getenv("LEARN")) g_learn_mode = g_learn_mode || std::strcmp(learn_env, "1") == 0;
+#endif
+    if (g_learn_mode) {
+        std::size_t max_clauses = 50000;
+        if (const char* env = std::getenv("LEARN_MAX_CLAUSES")) {
+            try { max_clauses = static_cast<std::size_t>(std::stoull(env)); } catch (...) {}
+        }
+        g_clauses.init(static_cast<int>(rows.size() * cols.size()), max_clauses);
+        g_conflict_clause = -1;
+        g_conflict_line = -1;
+    }
     std::size_t budget = 1024ULL * 1024ULL * 1024ULL;  // 1 GB default
     const char* env = std::getenv("LINE_CACHE_BUDGET_MB");
     if (env != nullptr) {
@@ -3187,8 +3317,8 @@ double estimate_solutions(const std::vector<std::vector<int>>& rows,
     for (long d = 0; d < n_dives; ++d) {
         Picture pic(H, W);
         Trail trail;
-        trail.W = W;  // propagation pushes onto it (see Trail::push)
-        trail.cell_pos.assign(static_cast<std::size_t>(H) * static_cast<std::size_t>(W), UINT32_MAX);
+        trail.W = W;  // learning's propagation pushes onto it (see Trail::push)
+        if (g_learn_mode) trail.cell_pos.assign(static_cast<std::size_t>(H) * static_cast<std::size_t>(W), UINT32_MAX);
         double est = estimate_dive(mapped_rows, mapped_cols, pic, trail, rng);
         sum += est;
         if (est > 0.0) { ++hits; if (est > maxw) maxw = est; }
