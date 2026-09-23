@@ -804,8 +804,49 @@ void reset_line_cache(int height, int width, std::size_t budget_bytes, bool rese
 // commingle with the outer trail.
 // ---------------------------------------------------------------------------
 
+// Trail entries carry (row, col) rather than a linear index so a revert can
+// update the packed line keys without a division to recover the row.
+inline int trail_pack(int row, int col) { return (row << 16) | col; }
+inline int trail_row(int e) { return e >> 16; }
+inline int trail_col(int e) { return e & 0xFFFF; }
+
+// Why a trail entry was set, for conflict analysis (--learn): a decision
+// (branch or probe pixel), a line's deduction (id = line index, is_col says
+// which array), a learnt clause's unit (id = clause id), or a probe-forced
+// commit (id = its clause). level is the decision level it was set at.
+enum ReasonKind : std::uint8_t { R_DECISION = 0, R_LINE = 1, R_CLAUSE = 2, R_PROBE = 3 };
+struct Reason { std::uint8_t kind; std::uint8_t is_col; std::uint16_t level; std::uint32_t id; };
+
+// Clause-learning mode, set once per solve(). Reasons, cell_pos and levels
+// are recorded only when it is on: the propagation drain, probe_cell (with
+// its guard) and revert_branch are instantiated on a compile-time LEARN
+// chosen once per propagation / probe / revert, so the off path does none
+// of that work (recording unconditionally cost hard/3867 +9.4%
+// instructions for 17.5M pushes); the per-node sites use Trail::record.
+bool g_learn_mode = false;
+
 struct Trail {
     std::vector<int> changed_cell_indices;  // packed (row, col); see trail_pack
+    std::vector<Reason> reasons;            // parallel to changed_cell_indices
+    // Per cell (row * W + col): its index in changed_cell_indices, or
+    // UINT32_MAX when the cell is not on this trail.
+    std::vector<std::uint32_t> cell_pos;
+    int W = 0;  // for cell_pos indexing
+    // Current decision level: on the solve() trail the branch depth
+    // (region searches nest inside their split node's level); on the probe
+    // trail the solve trail's level + 1.
+    std::uint16_t level = 0;
+    void push(int packed, Reason r) {
+        cell_pos[static_cast<std::size_t>(trail_row(packed)) * W + trail_col(packed)] = static_cast<std::uint32_t>(changed_cell_indices.size());
+        changed_cell_indices.push_back(packed);
+        reasons.push_back(r);
+    }
+    // The entry with its reason when learning, the bare entry otherwise
+    // (the sites outside the per-cell loops; see g_learn_mode).
+    void record(int packed, Reason r) {
+        if (g_learn_mode) push(packed, r);
+        else changed_cell_indices.push_back(packed);
+    }
     // Per-row / per-col UNKNOWN counts at the last branch node, maintained
     // from this trail alone: the node entry subtracts every entry pushed
     // since `counted` (cells settled by branch pixels, commits and real
@@ -861,12 +902,6 @@ struct Trail {
         ++col_hist[oc + 1];
     }
 };
-
-// Trail entries carry (row, col) rather than a linear index so a revert can
-// update the packed line keys without a division to recover the row.
-inline int trail_pack(int row, int col) { return (row << 16) | col; }
-inline int trail_row(int e) { return e >> 16; }
-inline int trail_col(int e) { return e & 0xFFFF; }
 
 // Zero-filled array on 2 MB-aligned memory advised for transparent huge
 // pages: the state table is accessed at random, so with 4 KB pages every
@@ -1549,19 +1584,21 @@ inline BatchResult solve_one_batch(const std::vector<const LineSpec*>& mapped,
 // recorded index back to UNKNOWN.
 // ---------------------------------------------------------------------------
 
-template <typename Iter, typename Pos, typename Val>
+template <bool LEARN, typename Iter, typename Pos, typename Val>
 inline void write_intersection_impl(Iter first, Iter last, Pos pos_of, Val val_of,
                                     int line_index, Picture& pic, bool is_row, Trail& trail) {
     // No UNKNOWN re-check: the cache entry was computed for exactly the
     // line's current content (that is its key), and the line DP only emits
     // deductions for cells that are UNKNOWN in that content.
+    [[maybe_unused]] const Reason reason{R_LINE, static_cast<std::uint8_t>(is_row ? 0 : 1), trail.level, static_cast<std::uint32_t>(line_index)};
     if (is_row) {
         const int row = line_index;
         for (; first != last; ++first) {
             const int col = pos_of(*first);
             pic.set_known(row, col, val_of(*first));
             pic.mark_col_dirty(col);
-            trail.changed_cell_indices.push_back(trail_pack(row, col));
+            if constexpr (LEARN) trail.push(trail_pack(row, col), reason);
+            else trail.changed_cell_indices.push_back(trail_pack(row, col));
             if (g_memo_enabled && trail.stamps) stamp_cell(row, col);
         }
     } else {
@@ -1570,22 +1607,24 @@ inline void write_intersection_impl(Iter first, Iter last, Pos pos_of, Val val_o
             const int row = pos_of(*first);
             pic.set_known(row, col, val_of(*first));
             pic.mark_row_dirty(row);
-            trail.changed_cell_indices.push_back(trail_pack(row, col));
+            if constexpr (LEARN) trail.push(trail_pack(row, col), reason);
+            else trail.changed_cell_indices.push_back(trail_pack(row, col));
             if (g_memo_enabled && trail.stamps) stamp_cell(row, col);
         }
     }
 }
 
-void write_intersection(const BatchResult& r, int line_index, Picture& pic, bool is_row, Trail& trail) {
+template <bool LEARN>
+__attribute__((flatten)) void write_intersection(const BatchResult& r, int line_index, Picture& pic, bool is_row, Trail& trail) {
     if (r.n8 != BatchResult::kLegacy) {
         const std::uint8_t* d = static_cast<const std::uint8_t*>(r.ded);
-        write_intersection_impl(d, d + r.n8,
+        write_intersection_impl<LEARN>(d, d + r.n8,
                                 [](std::uint8_t b) { return static_cast<int>(b & 0x7F); },
                                 [](std::uint8_t b) { return static_cast<std::int8_t>(b >> 7); },
                                 line_index, pic, is_row, trail);
     } else {
         const auto* v = static_cast<const std::vector<int>*>(r.ded);
-        write_intersection_impl(v->begin(), v->end(),
+        write_intersection_impl<LEARN>(v->begin(), v->end(),
                                 [](int enc) { return deduce_pos(enc); },
                                 [](int enc) { return deduce_val(enc); },
                                 line_index, pic, is_row, trail);
@@ -1599,7 +1638,7 @@ void write_intersection(const BatchResult& r, int line_index, Picture& pic, bool
 
 // FAST: the fast line cache (vs the legacy string-keyed one); KW: the key
 // word count when it is one of the fast cache's 1..4, else 0 (runtime).
-template <bool FAST, int KW>
+template <bool FAST, int KW, bool LEARN>
 inline bool solve_lines(const std::vector<const LineSpec*>& mapped,
                         Picture& pic,
                         bool is_row,
@@ -1632,7 +1671,7 @@ inline bool solve_lines(const std::vector<const LineSpec*>& mapped,
             return false;
         }
         if (r.n8 > 0 || (r.n8 == BatchResult::kLegacy && r.ded != nullptr)) {
-            write_intersection(r, index, pic, is_row, trail);
+            write_intersection<LEARN>(r, index, pic, is_row, trail);
         }
     }
     queue.reset();
@@ -1642,14 +1681,14 @@ inline bool solve_lines(const std::vector<const LineSpec*>& mapped,
 // Propagation to a fixpoint: drain rows and columns until neither queue
 // holds a line. Returns false on a contradiction (a line with no valid
 // filling), leaving the queues as they are for the caller's revert.
-template <bool FAST, int KW>
+template <bool FAST, int KW, bool LEARN>
 bool propagate_t(const std::vector<const LineSpec*>& mapped_rows,
                  const std::vector<const LineSpec*>& mapped_cols,
                  Picture& pic,
                  Trail& trail) {
     while (pic.has_dirty()) {
-        if (!solve_lines<FAST, KW>(mapped_rows, pic, true, trail)) return false;
-        if (!solve_lines<FAST, KW>(mapped_cols, pic, false, trail)) return false;
+        if (!solve_lines<FAST, KW, LEARN>(mapped_rows, pic, true, trail)) return false;
+        if (!solve_lines<FAST, KW, LEARN>(mapped_cols, pic, false, trail)) return false;
     }
     return true;
 }
@@ -1660,18 +1699,37 @@ bool propagate_t(const std::vector<const LineSpec*>& mapped_rows,
 // range) instead of loops with a runtime trip count (a 90 x 69 count run
 // -10.7% instructions), and the drain loop itself stays inlined in the
 // per-width instantiation instead of being called per queue.
+// Learning mode (see g_learn_mode) is decided here too, once per
+// propagation (probe_cell_t calls propagate_l directly), and runs the
+// runtime-width drain only: instantiating every width on it as well left
+// Picture::set_known out of line in the LTO build (+11.7% instructions on
+// easy_large/7382 with learning off; write_intersection is flattened for the
+// same reason), and deciding it per deduced line cost +1.4%.
+template <bool LEARN>
+inline bool propagate_l(const std::vector<const LineSpec*>& mapped_rows,
+                        const std::vector<const LineSpec*>& mapped_cols,
+                        Picture& pic,
+                        Trail& trail) {
+    if constexpr (LEARN) {
+        return g_fast_mode ? propagate_t<true, 0, true>(mapped_rows, mapped_cols, pic, trail)
+                           : propagate_t<false, 0, true>(mapped_rows, mapped_cols, pic, trail);
+    }
+    if (!g_fast_mode) return propagate_t<false, 0, false>(mapped_rows, mapped_cols, pic, trail);
+    switch (pic.key_words) {
+        case 1: return propagate_t<true, 1, false>(mapped_rows, mapped_cols, pic, trail);
+        case 2: return propagate_t<true, 2, false>(mapped_rows, mapped_cols, pic, trail);
+        case 3: return propagate_t<true, 3, false>(mapped_rows, mapped_cols, pic, trail);
+        case 4: return propagate_t<true, 4, false>(mapped_rows, mapped_cols, pic, trail);
+        default: return propagate_t<true, 0, false>(mapped_rows, mapped_cols, pic, trail);
+    }
+}
+
 inline bool propagate(const std::vector<const LineSpec*>& mapped_rows,
                       const std::vector<const LineSpec*>& mapped_cols,
                       Picture& pic,
                       Trail& trail) {
-    if (!g_fast_mode) return propagate_t<false, 0>(mapped_rows, mapped_cols, pic, trail);
-    switch (pic.key_words) {
-        case 1: return propagate_t<true, 1>(mapped_rows, mapped_cols, pic, trail);
-        case 2: return propagate_t<true, 2>(mapped_rows, mapped_cols, pic, trail);
-        case 3: return propagate_t<true, 3>(mapped_rows, mapped_cols, pic, trail);
-        case 4: return propagate_t<true, 4>(mapped_rows, mapped_cols, pic, trail);
-        default: return propagate_t<true, 0>(mapped_rows, mapped_cols, pic, trail);
-    }
+    return g_learn_mode ? propagate_l<true>(mapped_rows, mapped_cols, pic, trail)
+                        : propagate_l<false>(mapped_rows, mapped_cols, pic, trail);
 }
 
 int count_solved_pixels(const Picture& pic) {
@@ -1748,7 +1806,9 @@ struct ProbeBounds {
 std::uint64_t g_stat_probe_skips = 0;  // probes the bounds made unnecessary
 
 // RAII guard that snapshots a small amount of Picture state at construction
-// and restores pic to its entry state on destruction by walking the trail.
+// and restores pic to its entry state on destruction by walking the trail
+// (and, when learning, clearing the cells' cell_pos).
+template <bool LEARN>
 struct ProbeGuard {
     Picture& pic;
     Trail& trail;
@@ -1766,9 +1826,19 @@ struct ProbeGuard {
         // Walk trail in reverse and restore each cell to UNKNOWN. We bypass
         // Picture::set_pixel because it only adjusts unknown_count for the
         // UNKNOWN -> value direction.
-        for (auto it = trail.changed_cell_indices.rbegin();
-             it != trail.changed_cell_indices.rend(); ++it) {
-            pic.unset(trail_row(*it), trail_col(*it));
+        if constexpr (LEARN) {
+            std::uint32_t* cell_pos = trail.cell_pos.data();
+            const std::size_t tw = static_cast<std::size_t>(trail.W);
+            for (auto it = trail.changed_cell_indices.rbegin();
+                 it != trail.changed_cell_indices.rend(); ++it) {
+                pic.unset(trail_row(*it), trail_col(*it));
+                cell_pos[static_cast<std::size_t>(trail_row(*it)) * tw + trail_col(*it)] = UINT32_MAX;
+            }
+        } else {
+            for (auto it = trail.changed_cell_indices.rbegin();
+                 it != trail.changed_cell_indices.rend(); ++it) {
+                pic.unset(trail_row(*it), trail_col(*it));
+            }
         }
         pic.unknown_count = saved_unknown_count;
 
@@ -1790,19 +1860,32 @@ struct ProbeGuard {
     }
 };
 
-ProbeResult probe_cell(int row,
-                       int col,
-                       std::int8_t val,
-                       const std::vector<const LineSpec*>& mapped_rows,
-                       const std::vector<const LineSpec*>& mapped_cols,
-                       Picture& pic,
-                       ProbeBounds* bounds) {
-    // Reusable per-probe trail. probe_cell never nests (it calls only
-    // solve_lines, which never probes), and the previous probe's ProbeGuard
-    // already reverted every cell it touched, so we just clear the index buffer
-    // and reuse its capacity — no per-probe heap allocation.
+template <bool LEARN>
+ProbeResult probe_cell_t(int row,
+                         int col,
+                         std::int8_t val,
+                         const std::vector<const LineSpec*>& mapped_rows,
+                         const std::vector<const LineSpec*>& mapped_cols,
+                         Picture& pic,
+                         ProbeBounds* bounds,
+                         std::uint16_t solve_level) {
+    // Reusable per-probe trail (one per LEARN instantiation). probe_cell
+    // never nests (it calls only solve_lines, which never probes), and the
+    // previous probe's ProbeGuard already reverted every cell it touched (and
+    // cleared its cell_pos), so we just clear the index buffers and reuse
+    // their capacity — no per-probe heap allocation.
     static thread_local Trail trail;
     trail.changed_cell_indices.clear();
+    if constexpr (!LEARN) {
+        (void)solve_level;
+    } else {
+        trail.reasons.clear();
+        if (trail.cell_pos.size() != static_cast<std::size_t>(pic.height()) * pic.width()) {
+            trail.cell_pos.assign(static_cast<std::size_t>(pic.height()) * pic.width(), UINT32_MAX);
+        }
+        trail.W = pic.width();
+        trail.level = static_cast<std::uint16_t>(solve_level + 1);
+    }
     // A valid memo answers the probe (see ProbeMemo).
     ProbeMemo* memo = nullptr;
     if (g_memo_enabled) {
@@ -1828,11 +1911,12 @@ ProbeResult probe_cell(int row,
     if (g_debug_stats) { ++g_stat_probes; g_stat_probe_cur = 0; }
     struct ProbeStat { ~ProbeStat() { if (g_debug_stats) ++g_stat_probe_lookups_hist[std::min<std::uint64_t>(g_stat_probe_cur, 63)]; } } probe_stat;
 
-    ProbeGuard guard(pic, trail);
+    ProbeGuard<LEARN> guard(pic, trail);
 
     // Apply the probe pixel (record on trail).
     pic.set_known(row, col, val);
-    trail.changed_cell_indices.push_back(trail_pack(row, col));
+    if constexpr (LEARN) trail.push(trail_pack(row, col), Reason{R_DECISION, 0, trail.level, 0});
+    else trail.changed_cell_indices.push_back(trail_pack(row, col));
 
     pic.mark_row_dirty(row);
     pic.mark_col_dirty(col);
@@ -1842,7 +1926,7 @@ ProbeResult probe_cell(int row,
     // dirty, so solve_lines below re-solves them and reports any contradiction
     // via solve_line_batch's total==0. solve_check was a redundant O(H+W)
     // re-validation of every line on every probe.
-    const bool consistent = propagate(mapped_rows, mapped_cols, pic, trail);
+    const bool consistent = propagate_l<LEARN>(mapped_rows, mapped_cols, pic, trail);
     if (memo != nullptr) {
         memo->gen = g_gen;
         memo->ok = consistent ? 1 : 0;
@@ -1881,6 +1965,19 @@ ProbeResult probe_cell(int row,
         }
     }
     return ProbeResult{true, filled};
+}
+
+// The learning choice once per probe (see g_learn_mode).
+ProbeResult probe_cell(int row,
+                       int col,
+                       std::int8_t val,
+                       const std::vector<const LineSpec*>& mapped_rows,
+                       const std::vector<const LineSpec*>& mapped_cols,
+                       Picture& pic,
+                       ProbeBounds* bounds,
+                       std::uint16_t solve_level) {
+    return g_learn_mode ? probe_cell_t<true>(row, col, val, mapped_rows, mapped_cols, pic, bounds, solve_level)
+                        : probe_cell_t<false>(row, col, val, mapped_rows, mapped_cols, pic, bounds, solve_level);
 }
 
 // Implication-graph analysis of the current node's probe record (see
@@ -1999,10 +2096,11 @@ bool impl_analyze(const Picture& pic, const std::vector<std::pair<int, int>>& un
 // Restores unknown_count and the solved-row/col sets from snapshots. Drains
 // any leftover queue entries (clearing their dirty bits) so the picture
 // is in a clean queues-empty / dirty-zero state, matching branch entry.
-void revert_branch(Picture& pic,
-                   Trail& trail,
-                   std::size_t mark,
-                   int saved_unknown_count) {
+template <bool LEARN>
+void revert_branch_t(Picture& pic,
+                     Trail& trail,
+                     std::size_t mark,
+                     int saved_unknown_count) {
     // Entries below `counted` were subtracted from the per-line counts at a
     // branch node; add them back. Entries above it never were. Two loops
     // over the two ranges, newest first, instead of a test per entry.
@@ -2010,18 +2108,25 @@ void revert_branch(Picture& pic,
     const std::size_t n = trail.changed_cell_indices.size();
     const std::size_t split = std::max(mark, std::min(n, trail.counted));
     if (g_memo_enabled && n > mark) memo_next_gen();  // a revert changes its lines too
+    std::uint32_t* cell_pos = trail.cell_pos.data();
+    const std::size_t tw = static_cast<std::size_t>(trail.W);
     for (std::size_t i = n; i > split; ) {
         const int e = tr[--i];
         pic.unset(trail_row(e), trail_col(e));
+        if constexpr (LEARN) cell_pos[static_cast<std::size_t>(trail_row(e)) * tw + trail_col(e)] = UINT32_MAX;
         stamp_cell(trail_row(e), trail_col(e));
     }
     for (std::size_t i = split; i > mark; ) {
         const int e = tr[--i];
         trail.unsettle(trail_row(e), trail_col(e));
         pic.unset(trail_row(e), trail_col(e));
+        if constexpr (LEARN) cell_pos[static_cast<std::size_t>(trail_row(e)) * tw + trail_col(e)] = UINT32_MAX;
         stamp_cell(trail_row(e), trail_col(e));
     }
-    if (n > mark) trail.changed_cell_indices.resize(mark);
+    if (n > mark) {
+        trail.changed_cell_indices.resize(mark);
+        if constexpr (LEARN) trail.reasons.resize(mark);
+    }
     if (trail.counted > mark) trail.counted = mark;
     pic.unknown_count = saved_unknown_count;
     while (!pic.row_queue.empty()) {
@@ -2036,6 +2141,11 @@ void revert_branch(Picture& pic,
         pic.col_dirty[j] = 0;
     }
     pic.col_queue.reset();
+}
+
+void revert_branch(Picture& pic, Trail& trail, std::size_t mark, int saved_unknown_count) {
+    if (g_learn_mode) revert_branch_t<true>(pic, trail, mark, saved_unknown_count);
+    else revert_branch_t<false>(pic, trail, mark, saved_unknown_count);
 }
 
 bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
@@ -2502,14 +2612,14 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 if (g_debug_stats) ++g_stat_probe_skips;
                 full_res = ProbeResult{true, bound_full};
             } else {
-                full_res = probe_cell(row, col, FULL, mapped_rows, mapped_cols, pic, &bounds);
+                full_res = probe_cell(row, col, FULL, mapped_rows, mapped_cols, pic, &bounds, trail.level);
             }
             const int bound_empty = skip_ok ? bounds.bound(row, col, EMPTY) : INT_MAX;
             if (bound_empty < best_pixels) {
                 if (g_debug_stats) ++g_stat_probe_skips;
                 empty_res = ProbeResult{true, bound_empty};
             } else {
-                empty_res = probe_cell(row, col, EMPTY, mapped_rows, mapped_cols, pic, &bounds);
+                empty_res = probe_cell(row, col, EMPTY, mapped_rows, mapped_cols, pic, &bounds, trail.level);
             }
 
             state.record_probe((!full_res.ok) || (!empty_res.ok));
@@ -2526,7 +2636,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 // propagate in place and keep probing the remaining cells.
                 if (g_memo_enabled) memo_next_gen();
                 pic.set_known(row, col, forced);
-                trail.changed_cell_indices.push_back(trail_pack(row, col));
+                trail.record(trail_pack(row, col), Reason{R_PROBE, 0, trail.level, 0});
                 stamp_cell(row, col);
                 pic.mark_row_dirty(row);
                 pic.mark_col_dirty(col);
@@ -2614,7 +2724,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                         }
                         if (g_memo_enabled) memo_next_gen();
                         pic.set_known(r, c, fc.second);
-                        trail.changed_cell_indices.push_back(fc.first);
+                        trail.record(fc.first, Reason{R_DECISION, 0, trail.level, 0});
                         stamp_cell(r, c);
                         pic.mark_row_dirty(r);
                         pic.mark_col_dirty(c);
@@ -2673,8 +2783,9 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
 
         // Apply the branch pixel (record on trail).
         if (g_memo_enabled) memo_next_gen();
+        if (g_learn_mode) ++trail.level;  // the branch pixel opens a decision level
         pic.set_known(row, col, val);
-        trail.changed_cell_indices.push_back(trail_pack(row, col));
+        trail.record(trail_pack(row, col), Reason{R_DECISION, 0, trail.level, 0});
         stamp_cell(row, col);
         pic.mark_row_dirty(row);
         pic.mark_col_dirty(col);
@@ -2697,6 +2808,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         // caches by the subtree; start fetching them under the last revert.
         if (branch == 1 && cache_this_node) state.state_cache.prefetch(state_key);
         revert_branch(pic, trail, mark, saved_unknown_count);
+        if (g_learn_mode) --trail.level;
     }
     state.result = subtree_total;
     g_counted_so_far -= subtree_total;  // the parent adds it back as one finished child
@@ -2793,8 +2905,8 @@ double estimate_dive(const std::vector<const LineSpec*>& mapped_rows,
         if (br < 0) return weight;  // no unknowns (already solved-equivalent)
 
         // Count viable values via lookahead probes (each reverts pic).
-        ProbeResult pf = probe_cell(br, bc, FULL, mapped_rows, mapped_cols, pic, nullptr);
-        ProbeResult pe = probe_cell(br, bc, EMPTY, mapped_rows, mapped_cols, pic, nullptr);
+        ProbeResult pf = probe_cell(br, bc, FULL, mapped_rows, mapped_cols, pic, nullptr, 0);
+        ProbeResult pe = probe_cell(br, bc, EMPTY, mapped_rows, mapped_cols, pic, nullptr, 0);
         const int nv = (pf.ok ? 1 : 0) + (pe.ok ? 1 : 0);
         if (nv == 0) return 0.0;
         std::int8_t val;
@@ -2820,6 +2932,9 @@ void solve(const std::vector<std::vector<int>>& rows,
            double balance_k,
            bool count_mode,
            std::string* out_count) {
+    // LEARN=1 turns clause-learning mode on (until --learn replaces it).
+    const char* learn_env = std::getenv("LEARN");
+    g_learn_mode = learn_env != nullptr && std::strcmp(learn_env, "1") == 0;
     std::size_t budget = 1024ULL * 1024ULL * 1024ULL;  // 1 GB default
     const char* env = std::getenv("LINE_CACHE_BUDGET_MB");
     if (env != nullptr) {
@@ -2881,6 +2996,10 @@ void solve(const std::vector<std::vector<int>>& rows,
     Trail trail;
     // Reserve enough headroom that the trail rarely reallocates.
     trail.changed_cell_indices.reserve(static_cast<std::size_t>(H) * static_cast<std::size_t>(W));
+    trail.W = W;
+    trail.cell_pos.assign(static_cast<std::size_t>(H) * static_cast<std::size_t>(W), UINT32_MAX);
+    trail.reasons.reserve(static_cast<std::size_t>(H) * static_cast<std::size_t>(W));
+    trail.level = 0;
     trail.row_unknown.assign(static_cast<std::size_t>(H), W);
     trail.col_unknown.assign(static_cast<std::size_t>(W), H);
     trail.counted = 0;
@@ -3068,6 +3187,8 @@ double estimate_solutions(const std::vector<std::vector<int>>& rows,
     for (long d = 0; d < n_dives; ++d) {
         Picture pic(H, W);
         Trail trail;
+        trail.W = W;  // propagation pushes onto it (see Trail::push)
+        trail.cell_pos.assign(static_cast<std::size_t>(H) * static_cast<std::size_t>(W), UINT32_MAX);
         double est = estimate_dive(mapped_rows, mapped_cols, pic, trail, rng);
         sum += est;
         if (est > 0.0) { ++hits; if (est > maxw) maxw = est; }
