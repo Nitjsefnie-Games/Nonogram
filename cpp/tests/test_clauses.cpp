@@ -1,4 +1,5 @@
 #include "../clauses.hpp"
+#include <cstddef>
 #include <cstdio>
 #include <utility>
 #include <vector>
@@ -10,10 +11,12 @@ static int N(int x) { return x * 2; }
 
 // A minimal assignment for the store's callbacks: val[cell] is -1 unknown,
 // 0 EMPTY, 1 FULL; every forced literal is appended to the trail with the
-// clause that forced it.
+// clause that forced it. `log` holds every assigned cell in order (set by the
+// test or forced), so revert_to can undo a suffix like the solver's trail.
 struct Env {
     std::vector<int> val;
     std::vector<std::pair<int, int>> trail;   // (literal, reason clause id)
+    std::vector<int> log;                     // assigned cells, in order
     explicit Env(int n) : val(n, -1) {}
     int assigned(int l) const {
         const int v = val[l >> 1];
@@ -25,10 +28,19 @@ struct Env {
         if (v >= 0) return v == (l & 1);
         val[l >> 1] = l & 1;
         trail.push_back({l, id});
+        log.push_back(l >> 1);
         return true;
     }
-    void set(int l) { val[l >> 1] = l & 1; }
-    void revert() { for (int& v : val) v = -1; trail.clear(); }
+    void set(int l) { val[l >> 1] = l & 1; log.push_back(l >> 1); }
+    void revert() { for (int& v : val) v = -1; trail.clear(); log.clear(); }
+    std::size_t mark() const { return log.size(); }
+    // Undo every cell assigned since `m` (a LIFO revert of later rounds).
+    void revert_to(std::size_t m) {
+        while (log.size() > m) { val[log.back()] = -1; log.pop_back(); }
+        std::vector<std::pair<int, int>> kept;
+        for (const auto& t : trail) if (val[t.first >> 1] >= 0) kept.push_back(t);
+        trail.swap(kept);
+    }
     int propagate(ClauseStore& s, const std::vector<int>& newly_true) {
         return s.propagate(newly_true.data(), static_cast<int>(newly_true.size()),
                            [this](int l) { return assigned(l); },
@@ -131,6 +143,100 @@ int main() {
             if (e.propagate(s, {N(0), N(1), N(2)}) != cid) return fail("(c) all-false clause not a conflict");
             e.revert();
         }
+    }
+
+    // Shared watch list, move path: A = {0,1,2} and B = {0,3} both watch 0,
+    // A first. Setting ~0 moves A's watch to 2; B must still be visited and
+    // force 3.
+    {
+        ClauseStore s;
+        s.init(8, 100);
+        Env e(8);
+        const int a[] = {P(0), P(1), P(2)}, b[] = {P(0), P(3)};
+        s.add(a, 3, 2);
+        const int bid = s.add(b, 2, 2);
+        e.set(N(0));
+        if (e.propagate(s, {N(0)}) != -1) return fail("shared/move: conflict");
+        if (e.trail != std::vector<std::pair<int, int>>{{P(3), bid}})
+            return fail("shared/move: the entry after a moved watch was not visited");
+    }
+
+    // Shared watch list, keep path: C = {0,1} with 1 already true when 0 goes
+    // false keeps its watch on 0 (D = {0,4}, behind it, forces 4). After
+    // undoing both rounds, ~0 alone must make C force 1.
+    {
+        ClauseStore s;
+        s.init(8, 100);
+        Env e(8);
+        const int c[] = {P(0), P(1)}, d[] = {P(0), P(4)};
+        const int cid = s.add(c, 2, 2);
+        const int did = s.add(d, 2, 2);
+        e.set(P(1));
+        if (e.propagate(s, {P(1)}) != -1 || !e.trail.empty()) return fail("shared/keep: round 1");
+        const std::size_t m1 = e.mark();
+        e.set(N(0));
+        if (e.propagate(s, {N(0)}) != -1) return fail("shared/keep: conflict");
+        if (e.trail != std::vector<std::pair<int, int>>{{P(4), did}}) return fail("shared/keep: D not forced");
+        e.revert_to(m1);
+        e.revert_to(0);
+        e.set(N(0));
+        if (e.propagate(s, {N(0)}) != -1) return fail("shared/keep: conflict after revert");
+        if (e.trail != std::vector<std::pair<int, int>>{{P(1), cid}, {P(4), did}})
+            return fail("shared/keep: a kept watch was lost (C did not force 1)");
+    }
+
+    // Shared watch list, conflict path: E = {0,5} and F = {0,6} watch 0, E
+    // first. ~0 with ~5 already set: E is the conflict. After a revert, ~0
+    // alone must still reach F, the entry behind the conflict.
+    {
+        ClauseStore s;
+        s.init(8, 100);
+        Env e(8);
+        const int ec[] = {P(0), P(5)}, fc[] = {P(0), P(6)};
+        const int eid = s.add(ec, 2, 2);
+        const int fid = s.add(fc, 2, 2);
+        e.set(N(0));
+        e.set(N(5));
+        if (e.propagate(s, {N(0), N(5)}) != eid) return fail("shared/conflict: E not the conflict");
+        e.revert_to(0);
+        e.set(N(0));
+        if (e.propagate(s, {N(0)}) != -1) return fail("shared/conflict: conflict after revert");
+        if (e.trail != std::vector<std::pair<int, int>>{{P(5), eid}, {P(6), fid}})
+            return fail("shared/conflict: an entry behind the conflict was lost");
+    }
+
+    // Partial revert: G = {0,1,2}, H = {~2,3}. Round 1 sets ~0 (G moves its
+    // watch to 2); round 2 sets ~1 (G forces 2, H forces 3). Undo round 2
+    // only, keeping ~0, then propagate ~3: H forces ~2, G forces 1. Undo that
+    // and replay round 2: the same trail as the first time.
+    {
+        ClauseStore s;
+        s.init(8, 100);
+        Env e(8);
+        const int g[] = {P(0), P(1), P(2)}, h[] = {N(2), P(3)};
+        const int gid = s.add(g, 3, 2);
+        const int hid = s.add(h, 2, 2);
+        e.set(N(0));
+        if (e.propagate(s, {N(0)}) != -1 || !e.trail.empty()) return fail("partial: round 1");
+        const std::size_t m1 = e.mark();
+        const std::vector<std::pair<int, int>> round2 = {{P(2), gid}, {P(3), hid}};
+        e.set(N(1));
+        if (e.propagate(s, {N(1)}) != -1 || e.trail != round2) return fail("partial: round 2");
+        e.revert_to(m1);
+        if (e.val[0] != 0 || e.val[1] != -1 || e.val[2] != -1 || e.val[3] != -1 || !e.trail.empty())
+            return fail("partial: revert_to did not undo exactly round 2");
+        e.set(N(3));
+        if (e.propagate(s, {N(3)}) != -1) return fail("partial: conflict after the partial revert");
+        if (e.trail != std::vector<std::pair<int, int>>{{N(2), hid}, {P(1), gid}})
+            return fail("partial: wrong propagation after the partial revert");
+        e.revert_to(m1);
+        e.set(N(1));
+        if (e.propagate(s, {N(1)}) != -1 || e.trail != round2) return fail("partial: replayed round 2 differs");
+        // and a full falsification of G after the partial revert is its conflict
+        e.revert_to(m1);
+        e.set(N(1));
+        e.set(N(2));
+        if (e.propagate(s, {N(1), N(2)}) != gid) return fail("partial: all-false G not the conflict");
     }
 
     // A unit clause added while its cell is free forces it on the next call,

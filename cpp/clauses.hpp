@@ -54,6 +54,15 @@ public:
     template <class Assigned, class Force>
     int propagate(const int* newly_true, int n_new, Assigned assigned, Force force);
 
+    // The clause's literals, *n of them. lits[0] and lits[1] are the watches.
+    // The order is add's order only until propagate first visits the clause:
+    // a visit swaps literals inside the clause (the false watch to index 1, a
+    // replacement watch from index >= 2 into index 1). A literal the clause
+    // forced is at lits[0] and stays there for as long as it is true, so while
+    // the clause is a reason on a trail lits[0] is the literal it forced and
+    // lits[1..] are its antecedents' negations: a visit with lits[0] true
+    // keeps the clause as it is, and only a revert of lits[0] ends that.
+    // reduce keeps the order.
     const int* lits(int id, int* n) const {
         *n = arena_[start_[id]];
         return &arena_[start_[id] + 1];

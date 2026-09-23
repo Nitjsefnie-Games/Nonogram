@@ -1,5 +1,6 @@
 #include "clauses.hpp"
 #include <algorithm>
+#include <cassert>
 #include <functional>
 
 void ClauseStore::init(int n_cells, std::size_t max_clauses) {
@@ -19,6 +20,10 @@ void ClauseStore::init(int n_cells, std::size_t max_clauses) {
 
 int ClauseStore::add(const int* lits, int n, int lbd) {
     if (n < 1) return -1;
+#ifndef NDEBUG
+    for (int a = 0; a < n; ++a)
+        for (int b = a + 1; b < n; ++b) assert((lits[a] >> 1) != (lits[b] >> 1) && "clause cells must be distinct");
+#endif
     int id;
     if (!free_.empty()) {
         id = free_.back();
