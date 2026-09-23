@@ -37,7 +37,10 @@ void solve(const std::vector<std::vector<int>>& rows,
 // commit) is analysed to a first-UIP clause, which is added to a clause
 // store; propagation to a fixpoint also runs unit propagation over those
 // clauses. Backtracking stays chronological, so the tree only loses
-// branches the clauses prove dead, and the count is unchanged. The stats
+// branches the clauses prove dead, and the count is unchanged. Inside a
+// region search (count mode, below) the clauses are not propagated, so a
+// region's cached count stays a function of its key; contradictions there
+// still learn. The stats
 // build (make stats) also turns it on with LEARN=1 in the environment, and
 // LEARN_CHECK=1 there checks every learnt clause against every solution
 // (bench/learn_check.sh); LEARN_MAX_CLAUSES caps the clause store (default

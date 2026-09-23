@@ -863,21 +863,27 @@ constexpr bool g_learn_check = false;
 std::vector<std::vector<int>> g_check_clauses;
 bool g_learn_check_inner = false;  // the check's own enumeration runs solve() without learning
 
-// Learning inside a region search. A learnt clause is implied, but one with a
-// literal off the region's lines can force or conflict inside the region's
-// search only when the outside has no completion in this context. The region
-// count is then 0 and the split node's product is right, but the region's
-// nodes would cache reduced counts under keys built from the region's lines
-// alone, which a later context with a feasible outside would read back. So
-// a clause force or conflict whose clause has a literal off the region's
-// lines bumps g_region_outside_events, and a region node whose subtree saw
-// one is not inserted into the state cache (lookups stay). The masks are the
-// active region's rows and the columns its rows had unknowns in at the split
-// (a cell is on the region's lines iff its row or its column is); empty
-// outside region searches. Written only when learning.
-std::vector<char> g_region_line_row, g_region_line_col;
-std::uint64_t g_region_outside_events = 0;
-std::uint64_t g_stat_region_inserts_skipped = 0;
+// No clause pass inside a region search (learning only). g_region_depth
+// counts the region searches active on the solve trail (a split's
+// per-region recursive call until it returns; nested splits stack), and
+// propagate_t skips clause propagation while it is positive, on the probe
+// trail too. A region's nodes cache their counts under keys built from the
+// region's lines, and a key is each line's DFA residual, so neither a cell
+// off the region nor a known cell on one of its lines is determined by the
+// key. A learnt clause is implied, so a force or conflict of one inside the
+// region is right for the split's product: it can happen only when the
+// outside has no completion in this context. But the region's nodes would
+// then cache counts pruned by that outside under keys a later context with
+// a feasible outside can hit. With no clause pass, a region's count is a
+// function of its key by construction. A line conflict inside a region
+// still learns (the derivation is sound anywhere: the entries below the
+// region root may carry R_CLAUSE reasons from the top level); the fresh and
+// unit clauses wait until the region search returns, and the entries it
+// added are reverted then, so clause_next (never advanced inside) resumes
+// at the split node's fixpoint. Top-level nodes need no such rule: with no
+// outside, every completion of the state is a puzzle solution, and an
+// implied clause prunes none. Written only when learning.
+int g_region_depth = 0;
 
 // An invariant the stats build checks (assert is compiled out of both
 // builds by -DNDEBUG); nothing in the release build.
@@ -1767,20 +1773,8 @@ std::vector<int> g_clause_lits;
 // trail is at its clause fixpoint whenever a probe starts, and the watch
 // lists are global, so the clauses the probe's cells make unit are found
 // like any other. Returns false on a conflict (g_conflict_clause set); the
-// caller then reverts the round, as after a line contradiction.
-// Whether clause `id` has a literal off the active region's lines (false
-// outside region searches).
-inline bool clause_leaves_region(int id, int W) {
-    if (g_region_line_row.empty()) return false;
-    int n = 0;
-    const int* l = g_clauses.lits(id, &n);
-    for (int i = 0; i < n; ++i) {
-        const int cell = l[i] >> 1;
-        if (!g_region_line_row[static_cast<std::size_t>(cell / W)] && !g_region_line_col[static_cast<std::size_t>(cell % W)]) return true;
-    }
-    return false;
-}
-
+// caller then reverts the round, as after a line contradiction. Never
+// called inside a region search (see g_region_depth).
 bool clause_pass(Picture& pic, Trail& trail) {
     if (g_clauses.size() == 0) {  // no units, no watches, nothing fresh
         trail.clause_next = trail.changed_cell_indices.size();
@@ -1812,7 +1806,6 @@ bool clause_pass(Picture& pic, Trail& trail) {
         // A unit clause is implied by the puzzle, so its literal is true at
         // level 0 wherever it is forced; conflict analysis then drops it.
         const std::uint16_t level = g_clauses.is_unit(id) ? 0 : trail.level;
-        if (clause_leaves_region(id, W)) ++g_region_outside_events;
         trail.push(trail_pack(r, c), Reason{R_CLAUSE, 0, level, static_cast<std::uint32_t>(id)});
         if (g_debug_stats) ++g_stat_clause_forced;
         if (g_memo_enabled && trail.stamps) stamp_cell(r, c);
@@ -1823,7 +1816,6 @@ bool clause_pass(Picture& pic, Trail& trail) {
         g_conflict_clause = conflict;
         g_conflict_line = -1;
         if (g_debug_stats) ++g_stat_clause_conflicts;
-        if (clause_leaves_region(conflict, W)) ++g_region_outside_events;
         return false;
     }
     // The store visited every literal it forced within the call, so the
@@ -1839,13 +1831,13 @@ bool clause_pass(Picture& pic, Trail& trail) {
 // not seen, and drains again when the pass set cells, so the fixpoint is
 // closed under both. The pass runs for new entries, and for clauses added
 // since the store last examined its fresh list (a clause learnt at a
-// contradiction takes effect at the next propagation, on whichever trail
-// that is). That is nearly always the solve trail: the node that learnt
-// returns dead and its parent propagates its next branch value. After a
-// region search, the next region's root probes first, so a clause can be
-// examined, and given its watches, on a probe trail; a clause it forced
-// there is then unit on the solve trail without being re-examined, which
-// is the store's documented phase-1 limit (a missed propagation only).
+// contradiction takes effect at the next propagation). No pass runs inside
+// a region search, on either trail (see g_region_depth): a clause learnt
+// there waits for the search to return. So the propagation that first
+// examines a clause is always on the solve trail: the node that learnt
+// returns dead (a region loop breaks on it) and, once no region search is
+// active, the next propagation is a parent's next branch value, before any
+// node probes.
 template <bool FAST, int KW, bool LEARN>
 bool propagate_t(const std::vector<const LineSpec*>& mapped_rows,
                  const std::vector<const LineSpec*>& mapped_cols,
@@ -1859,6 +1851,7 @@ bool propagate_t(const std::vector<const LineSpec*>& mapped_rows,
         if constexpr (!LEARN) {
             return true;
         } else {
+            if (g_region_depth > 0) return true;  // region searches run no clause pass
             if (trail.clause_next >= trail.changed_cell_indices.size() && !g_clauses.has_fresh()) return true;
             if (!clause_pass(pic, trail)) return false;  // sets g_conflict_clause
         }
@@ -2583,14 +2576,6 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
 
     state.result = 0;  // every early return below is a dead branch
     const char* region = state.region_row.empty() ? nullptr : state.region_row.data();
-    // Learning: a region node is cached only if no clause from outside the
-    // region acted in its subtree (see g_region_outside_events).
-    const std::uint64_t region_events_at_entry = g_learn_mode ? g_region_outside_events : 0;
-    auto region_insert_ok = [&]() {
-        if (!g_learn_mode || region == nullptr || g_region_outside_events == region_events_at_entry) return true;
-        if (g_debug_stats) ++g_stat_region_inserts_skipped;
-        return false;
-    };
     int n_unknown = pic.unknown_count;
     if (region) {
         n_unknown = 0;
@@ -2820,11 +2805,6 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             const double mass_at_split = g_explored_mass;
             std::vector<char> saved_region = state.region_row;
             std::vector<std::uint64_t> saved_region_bits = state.region_bits;
-            std::vector<char> saved_line_row, saved_line_col;
-            if (g_learn_mode) {
-                saved_line_row = g_region_line_row;
-                saved_line_col = g_region_line_col;
-            }
             const std::vector<std::uint64_t> comps(comp_rows.begin(), comp_rows.end());
             const double scale_at_split = g_mass_scale;
             g_mass_scale = scale_at_split / static_cast<double>(roots);
@@ -2839,26 +2819,18 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 state.region_row.assign(static_cast<std::size_t>(H), 0);
                 for (int r = 0; r < H; ++r) state.region_row[static_cast<std::size_t>(r)] = static_cast<char>((comp[r >> 6] >> (r & 63)) & 1);
                 state.region_bits.assign(comp, comp + row_words);
-                if (g_learn_mode) {
-                    // The region's lines: its rows, and the columns they have unknowns in.
-                    g_region_line_row = state.region_row;
-                    g_region_line_col.assign(static_cast<std::size_t>(W), 0);
-                    for (int r = 0; r < H; ++r) {
-                        if (!state.region_row[static_cast<std::size_t>(r)]) continue;
-                        for (int w = 0; w < kw; ++w) {
-                            std::uint64_t m = rk[r * kw + w] & kUnknownBits;
-                            while (m != 0) {
-                                g_region_line_col[static_cast<std::size_t>(32 * w + (__builtin_ctzll(m) >> 1))] = 1;
-                                m &= m - 1;
-                            }
-                        }
-                    }
-                }
                 ++state.region_calls;
                 const std::size_t mark = trail.changed_cell_indices.size();
                 const int saved_unknown_count = pic.unknown_count;
                 state.path_push(region_char);
+                if (g_learn_mode) ++g_region_depth;  // no clause pass inside (see g_region_depth)
                 if (!solve_backtrack(mapped_rows, mapped_cols, pic, state, on_solution, trail)) return false;
+                if (g_learn_mode) {
+                    --g_region_depth;
+                    // The pass never saw the region's entries, which the
+                    // revert below drops, so it resumes at this node's fixpoint.
+                    STATS_CHECK(trail.clause_next <= mark);
+                }
                 state.path_pop();
                 total *= state.result;
                 revert_branch(pic, trail, mark, saved_unknown_count);
@@ -2866,14 +2838,10 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             }
             state.region_row = saved_region;
             state.region_bits = saved_region_bits;
-            if (g_learn_mode) {
-                g_region_line_row.swap(saved_line_row);
-                g_region_line_col.swap(saved_line_col);
-            }
             state.result = total;
             g_mass_scale = scale_at_split;
             g_explored_mass = mass_at_split + g_half_pow[static_cast<std::size_t>(state.branch_depth)] * scale_at_split;
-            if (cache_this_node && region_insert_ok()) {
+            if (cache_this_node) {
                 if (state.state_cache.insert(state_key, total, __rdtsc() - tsc_at_entry)) ++state.state_evictions;
             }
             return true;
@@ -3025,8 +2993,9 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             }
             if (pxs[row * W + col] != UNKNOWN) continue;  // settled by an earlier commit this pass
             // A probe's clause pass sees only the probe's cells, so the node
-            // must be at its clause fixpoint (see clause_pass).
-            if (g_learn_mode) STATS_CHECK(trail.clause_next == trail.changed_cell_indices.size());
+            // must be at its clause fixpoint (see clause_pass); inside a
+            // region search neither trail runs a pass (see g_region_depth).
+            if (g_learn_mode) STATS_CHECK(g_region_depth > 0 || trail.clause_next == trail.changed_cell_indices.size());
 
             // Each value is skipped only when a bound proves it consistent
             // (bound set) AND below the best score. A skipped value is never
@@ -3253,7 +3222,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
     }
     state.result = subtree_total;
     g_counted_so_far -= subtree_total;  // the parent adds it back as one finished child
-    if (cache_this_node && region_insert_ok()) {
+    if (cache_this_node) {
         if (state.state_cache.insert(state_key, subtree_total, __rdtsc() - tsc_at_entry)) ++state.state_evictions;
     }
 
@@ -3431,8 +3400,7 @@ void solve(const std::vector<std::vector<int>>& rows,
         g_conflict_line = -1;
         g_conflict_line_is_col = false;
         g_check_clauses.clear();
-        g_region_line_row.clear();
-        g_region_line_col.clear();
+        g_region_depth = 0;
     }
     std::size_t budget = 1024ULL * 1024ULL * 1024ULL;  // 1 GB default
     const char* env = std::getenv("LINE_CACHE_BUDGET_MB");
@@ -3602,11 +3570,11 @@ void solve(const std::vector<std::vector<int>>& rows,
                      static_cast<unsigned long long>(g_stat_probe_skips));
         std::fprintf(stderr, "cache-stats: solutions_found=%d skip_probing=%d\n", state.solutions_found, static_cast<int>(state.skip_probing));
         if (g_learn_mode)
-            std::fprintf(stderr, "cache-stats: learn conflicts=%llu clauses=%llu avg-len=%.1f forced-by-clauses=%llu clause-conflicts=%llu deleted=%llu region-inserts-skipped=%llu\n",
+            std::fprintf(stderr, "cache-stats: learn conflicts=%llu clauses=%llu avg-len=%.1f forced-by-clauses=%llu clause-conflicts=%llu deleted=%llu\n",
                          static_cast<unsigned long long>(g_stat_conflicts), static_cast<unsigned long long>(g_stat_learnt),
                          g_stat_learnt ? static_cast<double>(g_stat_learnt_lits) / static_cast<double>(g_stat_learnt) : 0.0,
                          static_cast<unsigned long long>(g_stat_clause_forced), static_cast<unsigned long long>(g_stat_clause_conflicts),
-                         static_cast<unsigned long long>(g_stat_learnt_deleted), static_cast<unsigned long long>(g_stat_region_inserts_skipped));
+                         static_cast<unsigned long long>(g_stat_learnt_deleted));
         std::fprintf(stderr, "cache-stats: probe memo checked=%llu answered=%llu (PROBE_MEMO=1)\n",
                      static_cast<unsigned long long>(g_stat_memo_checked), static_cast<unsigned long long>(g_stat_memo_valid));
         std::fprintf(stderr, "cache-stats: latched subtrees dead[log2 size:count]:");
