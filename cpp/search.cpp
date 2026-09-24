@@ -602,6 +602,11 @@ public:
     static std::uint16_t full_tag(std::uint16_t tag, std::uint64_t h) {
         return static_cast<std::uint16_t>(~(tag | ((h >> 58) << 10)));
     }
+    // The same from the tag's complement: the tag is below 1024, so bits
+    // 10-15 of ~tag are set and the or-and-complement is one xor.
+    static std::uint16_t full_tag_n(std::uint16_t ntag, std::uint64_t h) {
+        return static_cast<std::uint16_t>(ntag ^ ((h >> 58) << 10));
+    }
 
     // On a miss, remembers the empty slot it stopped at so the insert that
     // follows need not hash and walk the probe sequence a second time.
@@ -618,7 +623,7 @@ public:
     void prefetch(std::uint64_t h) const { __builtin_prefetch(slot(h & mask_)); }
     template <int KW>
     unsigned char* find(const std::uint64_t* key, std::uint16_t tag, std::uint64_t h) {
-        return find<KW>(view(), key, tag, h);
+        return find<KW>(view(), key, static_cast<std::uint16_t>(~tag), h);
     }
 
     // The table's geometry, copied into a drain's locals: the drain stores
@@ -638,12 +643,13 @@ public:
         const int shift = KW > 0 ? (KW <= 2 ? 5 : 6) : v.shift;
         __builtin_prefetch(v.base + ((h & v.mask) << shift));
     }
+    // ntag: the line's complemented tag (the low 16 bits of g_row_tag / g_col_tag).
     template <int KW>
-    unsigned char* find(const View& v, const std::uint64_t* key, std::uint16_t tag, std::uint64_t h) {
+    unsigned char* find(const View& v, const std::uint64_t* key, std::uint16_t ntag, std::uint64_t h) {
         const std::size_t hdr = KW > 0 ? 8 * static_cast<std::size_t>(KW) : v.hdr;
         const int shift = KW > 0 ? (KW <= 2 ? 5 : 6) : v.shift;  // as init() sets it
         std::size_t idx = h & v.mask;
-        tag = full_tag(tag, h);
+        const std::uint16_t tag = full_tag_n(ntag, h);
         for (;;) {
             if (g_debug_stats) ++g_stat_probe_steps;
             unsigned char* s = v.base + (idx << shift);
@@ -699,10 +705,14 @@ public:
     // KW = 0 reads the word count from kw_ (insert and grow, off the hot
     // path); a positive KW is a compile-time count and the same value.
     // The tag's contribution to the hash: a multiply that perturbs every
-    // bit. Kept per line (g_row_tagmul / g_col_tagmul) so the drain's
+    // bit. Kept per line (g_row_tag / g_col_tag) so the drain's
     // hash-ahead loads it instead of loading the tag, materialising the
     // constant and multiplying, under its register pressure.
-    static std::uint64_t tag_mul(std::uint16_t tag) { return static_cast<std::uint64_t>(tag) * 0x9E3779B97F4A7C15ULL; }
+    // The low 16 bits are the tag's complement (see g_row_tag), the upper
+    // 48 the multiply's; the hash mixes the whole word.
+    static std::uint64_t tag_mul(std::uint16_t tag) {
+        return ((static_cast<std::uint64_t>(tag) * 0x9E3779B97F4A7C15ULL) & ~0xFFFFULL) | static_cast<std::uint16_t>(~tag);
+    }
     template <int KW = 0>
     std::uint64_t hash(const std::uint64_t* key, std::uint16_t tag) const {
         return hash_tm<KW>(key, tag_mul(tag));
@@ -819,11 +829,14 @@ constexpr std::uint64_t kUnknownBits = 0xAAAAAAAAAAAAAAAAULL;
 // Tag per row / per column (spec id * 2 + orientation bit), precomputed in
 // solve() so the hit path reads one uint16 instead of dereferencing the
 // LineSpec for its id -- a dependent load ahead of the hash.
-std::vector<std::uint16_t> g_row_tags;
-std::vector<std::uint16_t> g_col_tags;
-// FastLineCache::tag_mul of each line's tag (see hash_tm).
-std::vector<std::uint64_t> g_row_tagmul;
-std::vector<std::uint64_t> g_col_tagmul;
+// Per line, what the drain's lookup needs of the tag, in one word:
+// FastLineCache::tag_mul(tag), whose low 16 bits are the tag's complement
+// (from which the slot's stored tag word is one xor, full_tag_n) and whose
+// upper bits perturb the hash. One array, one base pointer, scaled
+// addressing: two arrays held two registers in a loop that spills, and a
+// 16-byte record cost the 3-word drain a shift per index.
+std::vector<std::uint64_t> g_row_tag;
+std::vector<std::uint64_t> g_col_tag;
 // What settling a cell of line i to value v xors into the cell's cross
 // line's key: (UNKNOWN ^ v) << 2 * (i & 31), at [2 * i + v]. The same for a
 // row and a column of the same index, so one table serves both. Written
@@ -833,18 +846,12 @@ std::vector<std::uint64_t> g_cross_xor;
 
 // Each line's tag (its spec id, columns flagged) and the tag's hash multiply.
 void set_line_tags(const std::vector<const LineSpec*>& mapped_rows, const std::vector<const LineSpec*>& mapped_cols) {
-    g_row_tags.resize(mapped_rows.size());
-    g_row_tagmul.resize(mapped_rows.size());
-    for (std::size_t i = 0; i < mapped_rows.size(); ++i) {
-        g_row_tags[i] = static_cast<std::uint16_t>(mapped_rows[i]->id * 2);
-        g_row_tagmul[i] = FastLineCache::tag_mul(g_row_tags[i]);
-    }
-    g_col_tags.resize(mapped_cols.size());
-    g_col_tagmul.resize(mapped_cols.size());
-    for (std::size_t i = 0; i < mapped_cols.size(); ++i) {
-        g_col_tags[i] = static_cast<std::uint16_t>(mapped_cols[i]->id * 2 + g_tag_col_bit);
-        g_col_tagmul[i] = FastLineCache::tag_mul(g_col_tags[i]);
-    }
+    g_row_tag.resize(mapped_rows.size());
+    for (std::size_t i = 0; i < mapped_rows.size(); ++i)
+        g_row_tag[i] = FastLineCache::tag_mul(static_cast<std::uint16_t>(mapped_rows[i]->id * 2));
+    g_col_tag.resize(mapped_cols.size());
+    for (std::size_t i = 0; i < mapped_cols.size(); ++i)
+        g_col_tag[i] = FastLineCache::tag_mul(static_cast<std::uint16_t>(mapped_cols[i]->id * 2 + g_tag_col_bit));
     const std::size_t lines = std::max(mapped_rows.size(), mapped_cols.size());
     g_cross_xor.resize(2 * lines);
     for (std::size_t i = 0; i < lines; ++i) {
@@ -1705,19 +1712,19 @@ inline BatchResult solve_one_batch(const std::vector<const LineSpec*>& mapped,
                                    std::uint64_t h,
                                    FastLineCache::View& v,
                                    const std::uint64_t* keys,
-                                   const std::uint16_t* tags) {
+                                   const std::uint64_t* tagrec) {
     if (!FAST) {
         return solve_one_batch_legacy(*mapped[index], index, is_col, pic);
     }
 
     const int kw = KW > 0 ? KW : pic.key_words;
     const std::uint64_t* key = keys + static_cast<std::size_t>(index) * kw;
-    const std::uint16_t tag = tags[static_cast<std::size_t>(index)];
+    const std::uint16_t ntag = static_cast<std::uint16_t>(tagrec[static_cast<std::size_t>(index)]);
 
     if (g_debug_stats) ++g_stat_lookups;
-    unsigned char* s = g_fast_cache.find<KW>(v, key, tag, h);
+    unsigned char* s = g_fast_cache.find<KW>(v, key, ntag, h);
     if (s == nullptr) {
-        s = solve_one_batch_miss(*mapped[index], index, is_col, pic, key, tag);
+        s = solve_one_batch_miss(*mapped[index], index, is_col, pic, key, static_cast<std::uint16_t>(~ntag & 0x3FF));
         v = g_fast_cache.view();  // the insert may have grown the table
     }
 
@@ -1930,8 +1937,7 @@ inline bool solve_lines(const std::vector<const LineSpec*>& mapped,
     // 90 x 69 count run the slot load was the top stall of the drain.
     const int kw = KW > 0 ? KW : pic.key_words;
     const std::uint64_t* keys = is_row ? pic.row_keys.data() : pic.col_keys.data();
-    const std::uint16_t* tags = (is_row ? g_row_tags : g_col_tags).data();
-    const std::uint64_t* tagmul = (is_row ? g_row_tagmul : g_col_tagmul).data();
+    const std::uint64_t* tagrec = (is_row ? g_row_tag : g_col_tag).data();
     // The queue's cursor and the cache's geometry live in locals for the
     // drain: the dirty-flag and pixel byte stores below alias every object
     // in memory, so anything read through a pointer or a global would be
@@ -1942,17 +1948,17 @@ inline bool solve_lines(const std::vector<const LineSpec*>& mapped,
     std::size_t qh = queue.head();
     const std::size_t qt = queue.tail();
     std::uint64_t h = 0;
-    if (FAST && qh < qt) h = g_fast_cache.hash_tm<KW>(keys + static_cast<std::size_t>(qbuf[qh]) * kw, tagmul[qbuf[qh]]);
+    if (FAST && qh < qt) h = g_fast_cache.hash_tm<KW>(keys + static_cast<std::size_t>(qbuf[qh]) * kw, tagrec[qbuf[qh]]);
     while (qh < qt) {
         const int index = qbuf[qh++];
         dirty[index] = 0;
         std::uint64_t next_h = 0;
         if (FAST && qh < qt) {
             const int nx = qbuf[qh];
-            next_h = g_fast_cache.hash_tm<KW>(keys + static_cast<std::size_t>(nx) * kw, tagmul[nx]);
+            next_h = g_fast_cache.hash_tm<KW>(keys + static_cast<std::size_t>(nx) * kw, tagrec[nx]);
             FastLineCache::prefetch<KW>(v, next_h);
         }
-        BatchResult r = solve_one_batch<FAST, KW>(mapped, index, !is_row, pic, h, v, keys, tags);
+        BatchResult r = solve_one_batch<FAST, KW>(mapped, index, !is_row, pic, h, v, keys, tagrec);
         h = next_h;
         if (!r.success) {
             queue.set_head(qh);  // the failed line is popped, as before
