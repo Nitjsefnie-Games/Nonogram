@@ -27,6 +27,14 @@ struct LineSpec {
     std::size_t len_states = 0;
     std::size_t n_words = 0;
     int id = -1;  // index in the solve()'s spec pool; identifies the clue in cache keys
+    // The per-cell-value transition tables of the DFA sweeps, by value
+    // (EMPTY, FULL, UNKNOWN) and state word, for clues of up to four
+    // words: stay = {em, 0, em}, step = {em, fm, sv}. Built here once so
+    // the residual key's sweeps (millions of calls per count) read them
+    // instead of assembling them on the stack per call.
+    static constexpr std::size_t kTableWords = 4;
+    std::uint64_t stay[3][kTableWords] = {};
+    std::uint64_t step[3][kTableWords] = {};
 };
 
 LineSpec make_line_spec(const std::vector<int>& clue);

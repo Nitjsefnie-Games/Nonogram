@@ -109,6 +109,14 @@ LineSpec make_line_spec(const std::vector<int>& clue) {
             spec.full_mask[w] |= bit;
         }
     }
+    for (std::size_t w = 0; w < spec.n_words && w < LineSpec::kTableWords; ++w) {
+        spec.stay[EMPTY][w] = spec.empty_mask[w];
+        spec.stay[FULL][w] = 0;
+        spec.stay[UNKNOWN][w] = spec.empty_mask[w];
+        spec.step[EMPTY][w] = spec.empty_mask[w];
+        spec.step[FULL][w] = spec.full_mask[w];
+        spec.step[UNKNOWN][w] = spec.state_valid[w];
+    }
     return spec;
 }
 

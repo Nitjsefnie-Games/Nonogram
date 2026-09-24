@@ -1515,12 +1515,12 @@ inline void residual_sweeps(const LineSpec& spec, const std::int8_t* cells, std:
     // then branch-free on the (data-dependent) cell values.
     //   forward:  next = (cur & stay[v]) | ((cur << 1) & step[v])
     //   backward: prev = (cur & stay[v]) | ((cur & step[v]) >> 1)
-    std::uint64_t stay[3][NW], step[3][NW];
-    for (int w = 0; w < NW; ++w) {
-        const std::uint64_t em = spec.empty_mask[static_cast<std::size_t>(w)];
-        stay[EMPTY][w] = em; stay[FULL][w] = 0; stay[UNKNOWN][w] = em;
-        step[EMPTY][w] = em; step[FULL][w] = spec.full_mask[static_cast<std::size_t>(w)]; step[UNKNOWN][w] = spec.state_valid[static_cast<std::size_t>(w)];
-    }
+    // The tables live in the spec (LineSpec::stay / step): built per call
+    // on the stack they were 22 million instructions of easy_medium/12130's
+    // 3.2 million calls.
+    static_assert(NW <= static_cast<int>(LineSpec::kTableWords), "the spec's tables cover the fast widths");
+    const auto& stay = spec.stay;
+    const auto& step = spec.step;
     if (fwd_from == 0) {
         for (int w = 0; w < NW; ++w) fwd[w] = 0;
         fwd[0] = 1;
@@ -1555,8 +1555,13 @@ inline void residual_sweeps(const LineSpec& spec, const std::int8_t* cells, std:
 
 // KW: the key word count (1..4 compile-time, else 0 for the runtime
 // count), so the loops over the words fold for the common one-word case.
+// Kept out of line: five instantiations inlined into residual_key made
+// one 50 KB function that cost easy_medium/12130 0.9% more than the
+// separate ones (measured both ways, 2026-09-24), and which shape the
+// compiler picks flips with the instantiation's size.
 template <int KW>
-inline StateTable::Key residual_key_t(StateTable::Key seed, const LineSpec& spec, const std::int8_t* cells, std::size_t stride,
+__attribute__((noinline))
+StateTable::Key residual_key_t(StateTable::Key seed, const LineSpec& spec, const std::int8_t* cells, std::size_t stride,
                                       std::size_t n, const std::uint64_t* words, int kw_runtime, ResidualMemo& memo) {
     namespace wy = ankerl::unordered_dense::detail::wyhash;
     const int kw = KW > 0 ? KW : kw_runtime;
@@ -1602,6 +1607,15 @@ inline StateTable::Key residual_key_t(StateTable::Key seed, const LineSpec& spec
         ha = wy::mix(ha ^ bwd[w], 0xE7037ED1A0B428DBULL); hb = wy::mix(hb ^ bwd[w], 0x8EBC6AF09C88C6E3ULL);
     }
     // The cells from fu to lu: the key words with the digits outside zeroed.
+    if (KW == 1) {
+        // One word, fu <= lu <= 31: the two shifts are in range and the
+        // generic loop's word-boundary tests fold to nothing (they were
+        // 70 million instructions of easy_medium/12130).
+        const std::uint64_t mask = (~0ULL << (2 * fu)) & (~0ULL >> (2 * (31 - lu)));
+        const std::uint64_t v = words[0] & mask;
+        ha = wy::mix(ha ^ v, 0xE7037ED1A0B428DBULL);
+        hb = wy::mix(hb ^ v, 0x8EBC6AF09C88C6E3ULL);
+    } else
     for (int w = 0; w < kw; ++w) {
         const std::size_t lo = 32 * static_cast<std::size_t>(w), hi = lo + 31;
         std::uint64_t mask = ~0ULL;
