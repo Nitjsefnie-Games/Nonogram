@@ -65,5 +65,5 @@ pgo-clean:
 test: $(TESTS:tests/%.cpp=tests/%)
 	for t in $(TESTS:tests/%.cpp=tests/%); do ./$$t || exit 1; done
 tests/%: tests/%.cpp lines.cpp picture.cpp clauses.cpp $(wildcard *.hpp)
-	$(CXX) $(CXXFLAGS) $(LDFLAGS) -I. -o $@ $< lines.cpp picture.cpp clauses.cpp
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -DNONOGRAM_STATS -I. -o $@ $< lines.cpp picture.cpp clauses.cpp
 .PHONY: test

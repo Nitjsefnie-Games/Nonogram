@@ -433,7 +433,7 @@ static_assert(sizeof(ProbeMemoPair) == 64, "a cell's memo pair must be one cache
 constexpr int kMemoWords = 3;
 #ifdef NONOGRAM_STATS
 const bool g_probe_memo = std::getenv("PROBE_MEMO") != nullptr;
-bool g_memo_enabled = false;              // this puzzle fits the memo: fast mode, H + W <= 192
+bool g_memo_enabled = false;              // this puzzle fits the memo: fast mode, H + W <= 192, not --learn
 #else
 constexpr bool g_probe_memo = false;
 constexpr bool g_memo_enabled = false;    // every memo hook folds away
@@ -449,13 +449,6 @@ inline void memo_next_gen() {
         std::fill(g_line_stamp.begin(), g_line_stamp.end(), 0u);
         g_gen = 1;
     }
-}
-// Every memo stops being valid: a probe answer recorded before a clause was
-// learnt may be one the clause would now change (the stamps see only line
-// changes). Stamps every line with a generation no memo has yet.
-inline void memo_invalidate_all() {
-    memo_next_gen();
-    std::fill(g_line_stamp.begin(), g_line_stamp.end(), g_gen);
 }
 inline void stamp_cell(int row, int col) {
     if (g_memo_enabled) {
@@ -2115,7 +2108,6 @@ int analyze_conflict(const Trail& trail, const Trail* solve_trail, const Picture
     const int id = g_clauses.add(learnt.data(), static_cast<int>(learnt.size()), lbd + 1);
     if (g_debug_stats) { ++g_stat_learnt; g_stat_learnt_lits += learnt.size(); }
     if (g_learn_check) g_check_clauses.push_back(learnt);
-    if (g_memo_enabled) memo_invalidate_all();
     return id;
 }
 
@@ -3580,7 +3572,13 @@ void solve(const std::vector<std::vector<int>>& rows,
         for (int c = 0; c < W; ++c) trail.dirty_cols[static_cast<std::size_t>(c)] = c;
     }
 #ifdef NONOGRAM_STATS
-    g_memo_enabled = g_probe_memo && g_fast_mode && H + W <= 64 * kMemoWords;
+    // Never under learning: a memo stays valid while no line in `touched`
+    // (the lines of the cells the probe set) has changed, but the probe's
+    // clause pass also reads cells on lines it never touched. A clause
+    // (not(a) or z) with a true forces z, the probe contradicts, and at a
+    // later node where a has been reverted the memo still replays the
+    // contradiction and the other value is committed: a wrong forced cell.
+    g_memo_enabled = g_probe_memo && g_fast_mode && H + W <= 64 * kMemoWords && !g_learn_mode;
 #endif
     if (g_memo_enabled) {
         g_memo_H = H;
@@ -3673,7 +3671,13 @@ void solve(const std::vector<std::vector<int>>& rows,
             *out_strategy = Strategy::BASIC;
         }
     }
-    if (g_learn_check && g_learn_mode && !g_learn_check_inner) learn_check(rows, cols);
+    // After a stop the inner enumeration would stop at once (g_stop_requested
+    // stays set) and would reset g_explored_mass and g_stop_path, which main
+    // prints on the stop path.
+    if (g_learn_check && g_learn_mode && !g_learn_check_inner) {
+        if (g_stop_requested) std::fprintf(stderr, "learn-check: skipped (stopped)\n");
+        else learn_check(rows, cols);
+    }
 }
 
 double explored_fraction() { return g_explored_mass; }
@@ -3736,6 +3740,8 @@ double estimate_solutions(const std::vector<std::vector<int>>& rows,
         Picture pic(H, W);
         Trail trail;
         trail.W = W;  // learning's propagation pushes onto it (see Trail::push)
+        // Unreachable today (--estimate never calls solve(), which alone sets
+        // g_learn_mode); kept so learning's propagation finds cell_pos sized.
         if (g_learn_mode) trail.cell_pos.assign(static_cast<std::size_t>(H) * static_cast<std::size_t>(W), UINT32_MAX);
         double est = estimate_dive(mapped_rows, mapped_cols, pic, trail, rng);
         sum += est;

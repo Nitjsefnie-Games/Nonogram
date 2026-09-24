@@ -359,7 +359,8 @@ int main(int argc, char** argv) {
     const bool count_mode = !print_progress && !have_max && !anytime;
     std::string count_str;
     if (count_mode) set_progress_interval(60.0);
-    solve(clues.rows, clues.cols, callback, &strategy, anytime, balance_k, count_mode, &count_str, learn);
+    // --learn is a count-mode flag: the enumerating runs ignore it.
+    solve(clues.rows, clues.cols, callback, &strategy, anytime, balance_k, count_mode, &count_str, learn && count_mode);
 
     auto end = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(end - start).count();

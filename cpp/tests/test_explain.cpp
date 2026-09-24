@@ -80,11 +80,11 @@ int main() {
     // Long lines with dense clues (blocks up to 8, filled until the line is
     // nearly full). The automaton has 1 + sum(blocks) + #blocks states, at
     // most n + 2: most 40-80-cell lines stay within one word (64 states) and
-    // some reach two (65-128 states); the 130-160-cell lines need three
-    // words, the general routine. The asserts below keep both of those
-    // covered. The content is a third of the
-    // cells of a random solution, and in a quarter of the lines one of the
-    // revealed cells flipped, so both deductions and conflicts come up.
+    // some reach two (65-128 states); most of the 130-160-cell lines need
+    // three words, the general routine. The asserts below keep both of
+    // those covered. The content is a third of the cells of a random
+    // solution, and in a quarter of the lines one of the revealed cells
+    // flipped, so both deductions and conflicts come up.
     int by_words[4] = {0, 0, 0, 0};  // lines per automaton width: 1, 2, 3+ words
     for (int iter = 0; iter < 400; ++iter) {
         const int n = iter < 350 ? 40 + static_cast<int>(rng() % 41)     // 40-80 cells
