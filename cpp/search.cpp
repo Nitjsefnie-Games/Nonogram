@@ -1783,8 +1783,8 @@ std::vector<int> g_clause_lits;
 // this pass may force not(y) on the probe trail or report the clause as a
 // conflict; both are correct, the clause being implied. Returns false on a
 // conflict (g_conflict_clause set); the caller then reverts the round, as
-// after a line contradiction. Never
-// called inside a region search (see g_region_depth).
+// after a line contradiction. Never called inside a region search (see
+// g_region_depth).
 bool clause_pass(Picture& pic, Trail& trail) {
     if (g_clauses.size() == 0) {  // no units, no watches, nothing fresh
         trail.clause_next = trail.changed_cell_indices.size();

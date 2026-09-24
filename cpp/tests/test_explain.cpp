@@ -78,8 +78,11 @@ int main() {
         if (!check_line(line, spec, checked, conflicts)) return 1;
     }
     // Long lines with dense clues (blocks up to 8, filled until the line is
-    // nearly full), so the automaton needs two words (65-128 states) and,
-    // above 126 cells, the general routine. The content is a third of the
+    // nearly full). The automaton has 1 + sum(blocks) + #blocks states, at
+    // most n + 2: most 40-80-cell lines stay within one word (64 states) and
+    // some reach two (65-128 states); the 130-160-cell lines need three
+    // words, the general routine. The asserts below keep both of those
+    // covered. The content is a third of the
     // cells of a random solution, and in a quarter of the lines one of the
     // revealed cells flipped, so both deductions and conflicts come up.
     int by_words[4] = {0, 0, 0, 0};  // lines per automaton width: 1, 2, 3+ words
@@ -114,6 +117,11 @@ int main() {
             line[i] = line[i] == FULL ? EMPTY : FULL;
         }
         if (!check_line(line, spec, checked, conflicts)) return 1;
+    }
+    if (by_words[2] == 0 || by_words[3] == 0) {
+        std::printf("FAIL long lines did not reach the 2-word and general paths (%d 2-word, %d 3+-word)\n",
+                    by_words[2], by_words[3]);
+        return 1;
     }
     std::printf("ok: %d deductions, %d conflicts explained (long lines: %d 1-word, %d 2-word, %d 3+-word)\n",
                 checked, conflicts, by_words[1], by_words[2], by_words[3]);
