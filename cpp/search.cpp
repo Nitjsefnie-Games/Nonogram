@@ -1447,9 +1447,13 @@ inline std::uint64_t suffix_digits(int w, std::size_t p) {
 
 // fwd holds the forward state set after cells [0, fwd_from) on entry and
 // after [0, fu) on exit; bwd the backward set before cells [bwd_from, n)
-// on entry and before [lu, n) on exit.
+// on entry and before [lu, n) on exit. Cell i is cells[i * stride]: a
+// column is read in place (stride W) rather than gathered, since the
+// resumed sweeps touch a few cells of it while the gather copied every
+// cell (hard/3867: 154 million instructions in line_cells, 2.6%).
 template <int NW>
-inline void residual_sweeps(const LineSpec& spec, const std::int8_t* cells, std::size_t n, std::size_t fu, std::size_t lu,
+inline void residual_sweeps(const LineSpec& spec, const std::int8_t* cells, std::size_t stride, std::size_t n,
+                            std::size_t fu, std::size_t lu,
                             std::uint64_t* fwd, std::uint64_t* bwd, std::size_t fwd_from, std::size_t bwd_from) {
     // Per-cell-value mask tables, as in the line solver: the sweeps are
     // then branch-free on the (data-dependent) cell values.
@@ -1466,7 +1470,7 @@ inline void residual_sweeps(const LineSpec& spec, const std::int8_t* cells, std:
         fwd[0] = 1;
     }
     for (std::size_t i = fwd_from; i < fu; ++i) {
-        const int v = cells[i];
+        const int v = cells[i * stride];
         std::uint64_t carry = 0;
         for (int w = 0; w < NW; ++w) {
             const std::uint64_t cur = fwd[w];
@@ -1481,7 +1485,7 @@ inline void residual_sweeps(const LineSpec& spec, const std::int8_t* cells, std:
         if (spec.len_states >= 2) bwd[(spec.len_states - 2) / 64] |= 1ULL << ((spec.len_states - 2) % 64);
     }
     for (std::size_t i = bwd_from; i > lu; ) {
-        const int v = cells[--i];
+        const int v = cells[--i * stride];
         std::uint64_t carry = 0;
         for (int w = NW - 1; w >= 0; --w) {
             const std::uint64_t cur = bwd[w];
@@ -1493,9 +1497,13 @@ inline void residual_sweeps(const LineSpec& spec, const std::int8_t* cells, std:
     }
 }
 
-inline StateTable::Key residual_key(StateTable::Key seed, const LineSpec& spec, const std::int8_t* cells, std::size_t n,
-                                    const std::uint64_t* words, int kw, ResidualMemo& memo) {
+// KW: the key word count (1..4 compile-time, else 0 for the runtime
+// count), so the loops over the words fold for the common one-word case.
+template <int KW>
+inline StateTable::Key residual_key_t(StateTable::Key seed, const LineSpec& spec, const std::int8_t* cells, std::size_t stride,
+                                      std::size_t n, const std::uint64_t* words, int kw_runtime, ResidualMemo& memo) {
     namespace wy = ankerl::unordered_dense::detail::wyhash;
+    const int kw = KW > 0 ? KW : kw_runtime;
     // First and last unknown cell from the packed key.
     std::size_t fu = 0, lu = 0;
     for (int w = 0; w < kw; ++w) {
@@ -1524,10 +1532,10 @@ inline StateTable::Key residual_key(StateTable::Key seed, const LineSpec& spec, 
         }
     }
     const int nw = static_cast<int>(spec.n_words);
-    if (nw == 1) residual_sweeps<1>(spec, cells, n, fu, lu1, fwd, bwd, fwd_from, bwd_from);
-    else if (nw == 2) residual_sweeps<2>(spec, cells, n, fu, lu1, fwd, bwd, fwd_from, bwd_from);
-    else if (nw == 3) residual_sweeps<3>(spec, cells, n, fu, lu1, fwd, bwd, fwd_from, bwd_from);
-    else residual_sweeps<4>(spec, cells, n, fu, lu1, fwd, bwd, fwd_from, bwd_from);
+    if (nw == 1) residual_sweeps<1>(spec, cells, stride, n, fu, lu1, fwd, bwd, fwd_from, bwd_from);
+    else if (nw == 2) residual_sweeps<2>(spec, cells, stride, n, fu, lu1, fwd, bwd, fwd_from, bwd_from);
+    else if (nw == 3) residual_sweeps<3>(spec, cells, stride, n, fu, lu1, fwd, bwd, fwd_from, bwd_from);
+    else residual_sweeps<4>(spec, cells, stride, n, fu, lu1, fwd, bwd, fwd_from, bwd_from);
     memo.fu = static_cast<std::uint32_t>(fu);
     memo.lu = static_cast<std::uint32_t>(lu1);
     for (int w = 0; w < kw; ++w) memo.key[w] = words[w];
@@ -1548,6 +1556,17 @@ inline StateTable::Key residual_key(StateTable::Key seed, const LineSpec& spec, 
         hb = wy::mix(hb ^ v, 0x8EBC6AF09C88C6E3ULL);
     }
     return StateTable::Key{ha, hb};
+}
+
+inline StateTable::Key residual_key(StateTable::Key seed, const LineSpec& spec, const std::int8_t* cells, std::size_t stride,
+                                    std::size_t n, const std::uint64_t* words, int kw, ResidualMemo& memo) {
+    switch (kw) {
+        case 1: return residual_key_t<1>(seed, spec, cells, stride, n, words, kw, memo);
+        case 2: return residual_key_t<2>(seed, spec, cells, stride, n, words, kw, memo);
+        case 3: return residual_key_t<3>(seed, spec, cells, stride, n, words, kw, memo);
+        case 4: return residual_key_t<4>(seed, spec, cells, stride, n, words, kw, memo);
+        default: return residual_key_t<0>(seed, spec, cells, stride, n, words, kw, memo);
+    }
 }
 
 BatchResult solve_one_batch_legacy(const LineSpec& spec,
@@ -2360,7 +2379,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         for (int r : trail.dirty_rows) {
             gk.a ^= rh[r].a; gk.b -= rh[r].b;
             rh[r] = uir[r] > 0 ? residual_key(state.row_seed[static_cast<std::size_t>(r)], *mapped_rows[static_cast<std::size_t>(r)],
-                                              px + static_cast<std::size_t>(r) * W, static_cast<std::size_t>(W),
+                                              px + static_cast<std::size_t>(r) * W, 1, static_cast<std::size_t>(W),
                                               rk + static_cast<std::size_t>(r) * kw, kw, state.row_memo[static_cast<std::size_t>(r)])
                                : StateTable::Key{0, 0};
             gk.a ^= rh[r].a; gk.b += rh[r].b;
@@ -2370,9 +2389,9 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         for (int c : trail.dirty_cols) {
             gk.a ^= ch[c].a; gk.b -= ch[c].b;
             if (uic[c] > 0) {
-                std::size_t n;
-                const std::int8_t* cells = line_cells(c, true, pic, n);
-                ch[c] = residual_key(state.col_seed[static_cast<std::size_t>(c)], *mapped_cols[static_cast<std::size_t>(c)], cells, n,
+                // The column read in place (stride W), not gathered.
+                ch[c] = residual_key(state.col_seed[static_cast<std::size_t>(c)], *mapped_cols[static_cast<std::size_t>(c)],
+                                     px + static_cast<std::size_t>(c), static_cast<std::size_t>(W), static_cast<std::size_t>(H),
                                      ck + static_cast<std::size_t>(c) * kw, kw, state.col_memo[static_cast<std::size_t>(c)]);
             } else {
                 ch[c] = StateTable::Key{0, 0};
