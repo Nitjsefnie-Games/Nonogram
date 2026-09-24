@@ -695,13 +695,21 @@ public:
 
     // KW = 0 reads the word count from kw_ (insert and grow, off the hot
     // path); a positive KW is a compile-time count and the same value.
+    // The tag's contribution to the hash: a multiply that perturbs every
+    // bit. Kept per line (g_row_tagmul / g_col_tagmul) so the drain's
+    // hash-ahead loads it instead of loading the tag, materialising the
+    // constant and multiplying, under its register pressure.
+    static std::uint64_t tag_mul(std::uint16_t tag) { return static_cast<std::uint64_t>(tag) * 0x9E3779B97F4A7C15ULL; }
     template <int KW = 0>
     std::uint64_t hash(const std::uint64_t* key, std::uint16_t tag) const {
+        return hash_tm<KW>(key, tag_mul(tag));
+    }
+    // With the tag's multiply already done (t = tag_mul(tag)).
+    template <int KW = 0>
+    std::uint64_t hash_tm(const std::uint64_t* key, std::uint64_t t) const {
         namespace wy = ankerl::unordered_dense::detail::wyhash;
         const int kw = KW > 0 ? KW : kw_;
-        // One 64x64->128 multiply-fold covers the common <= 2-word key; the
-        // tag is folded in by a cheap multiply so it perturbs every bit.
-        const std::uint64_t t = static_cast<std::uint64_t>(tag) * 0x9E3779B97F4A7C15ULL;
+        // One 64x64->128 multiply-fold covers the common <= 2-word key.
         if (kw <= 2) {
             const std::uint64_t k1 = (kw == 2) ? key[1] : 0;
             return wy::mix(key[0] ^ t, k1 ^ 0xE7037ED1A0B428DBULL);
@@ -810,6 +818,25 @@ constexpr std::uint64_t kUnknownBits = 0xAAAAAAAAAAAAAAAAULL;
 // LineSpec for its id -- a dependent load ahead of the hash.
 std::vector<std::uint16_t> g_row_tags;
 std::vector<std::uint16_t> g_col_tags;
+// FastLineCache::tag_mul of each line's tag (see hash_tm).
+std::vector<std::uint64_t> g_row_tagmul;
+std::vector<std::uint64_t> g_col_tagmul;
+
+// Each line's tag (its spec id, columns flagged) and the tag's hash multiply.
+void set_line_tags(const std::vector<const LineSpec*>& mapped_rows, const std::vector<const LineSpec*>& mapped_cols) {
+    g_row_tags.resize(mapped_rows.size());
+    g_row_tagmul.resize(mapped_rows.size());
+    for (std::size_t i = 0; i < mapped_rows.size(); ++i) {
+        g_row_tags[i] = static_cast<std::uint16_t>(mapped_rows[i]->id * 2);
+        g_row_tagmul[i] = FastLineCache::tag_mul(g_row_tags[i]);
+    }
+    g_col_tags.resize(mapped_cols.size());
+    g_col_tagmul.resize(mapped_cols.size());
+    for (std::size_t i = 0; i < mapped_cols.size(); ++i) {
+        g_col_tags[i] = static_cast<std::uint16_t>(mapped_cols[i]->id * 2 + g_tag_col_bit);
+        g_col_tagmul[i] = FastLineCache::tag_mul(g_col_tags[i]);
+    }
+}
 
 // LINE_CACHE_LEGACY=1 forces the string-keyed cache (the fallback for lines
 // longer than kMaxFastCells) on every puzzle; used to differential-test the two.
@@ -1828,6 +1855,7 @@ inline bool solve_lines(const std::vector<const LineSpec*>& mapped,
     const int kw = KW > 0 ? KW : pic.key_words;
     const std::uint64_t* keys = is_row ? pic.row_keys.data() : pic.col_keys.data();
     const std::uint16_t* tags = (is_row ? g_row_tags : g_col_tags).data();
+    const std::uint64_t* tagmul = (is_row ? g_row_tagmul : g_col_tagmul).data();
     // The queue's cursor and the cache's geometry live in locals for the
     // drain: the dirty-flag and pixel byte stores below alias every object
     // in memory, so anything read through a pointer or a global would be
@@ -1838,14 +1866,14 @@ inline bool solve_lines(const std::vector<const LineSpec*>& mapped,
     std::size_t qh = queue.head();
     const std::size_t qt = queue.tail();
     std::uint64_t h = 0;
-    if (FAST && qh < qt) h = g_fast_cache.hash<KW>(keys + static_cast<std::size_t>(qbuf[qh]) * kw, tags[qbuf[qh]]);
+    if (FAST && qh < qt) h = g_fast_cache.hash_tm<KW>(keys + static_cast<std::size_t>(qbuf[qh]) * kw, tagmul[qbuf[qh]]);
     while (qh < qt) {
         const int index = qbuf[qh++];
         dirty[index] = 0;
         std::uint64_t next_h = 0;
         if (FAST && qh < qt) {
             const int nx = qbuf[qh];
-            next_h = g_fast_cache.hash<KW>(keys + static_cast<std::size_t>(nx) * kw, tags[nx]);
+            next_h = g_fast_cache.hash_tm<KW>(keys + static_cast<std::size_t>(nx) * kw, tagmul[nx]);
             FastLineCache::prefetch<KW>(v, next_h);
         }
         BatchResult r = solve_one_batch<FAST, KW>(mapped, index, !is_row, pic, h, v, keys, tags);
@@ -3146,12 +3174,7 @@ void solve(const std::vector<std::vector<int>>& rows,
     std::vector<const LineSpec*> mapped_cols;
     mapped_cols.reserve(cols.size());
     for (const auto& clue : cols) mapped_cols.push_back(get_spec(clue));
-    g_row_tags.resize(mapped_rows.size());
-    for (std::size_t i = 0; i < mapped_rows.size(); ++i)
-        g_row_tags[i] = static_cast<std::uint16_t>(mapped_rows[i]->id * 2);
-    g_col_tags.resize(mapped_cols.size());
-    for (std::size_t i = 0; i < mapped_cols.size(); ++i)
-        g_col_tags[i] = static_cast<std::uint16_t>(mapped_cols[i]->id * 2 + g_tag_col_bit);
+    set_line_tags(mapped_rows, mapped_cols);
 
     SolveState state;
     state.keep_probing = anytime;
@@ -3342,12 +3365,7 @@ double estimate_solutions(const std::vector<std::vector<int>>& rows,
     std::vector<const LineSpec*> mapped_cols;
     mapped_cols.reserve(cols.size());
     for (const auto& clue : cols) mapped_cols.push_back(get_spec(clue));
-    g_row_tags.resize(mapped_rows.size());
-    for (std::size_t i = 0; i < mapped_rows.size(); ++i)
-        g_row_tags[i] = static_cast<std::uint16_t>(mapped_rows[i]->id * 2);
-    g_col_tags.resize(mapped_cols.size());
-    for (std::size_t i = 0; i < mapped_cols.size(); ++i)
-        g_col_tags[i] = static_cast<std::uint16_t>(mapped_cols[i]->id * 2 + g_tag_col_bit);
+    set_line_tags(mapped_rows, mapped_cols);
 
     std::mt19937_64 rng(seed);
     double sum = 0.0;
