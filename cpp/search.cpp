@@ -1478,7 +1478,12 @@ inline std::uint64_t suffix_digits(int w, std::size_t p) {
 // column is read in place (stride W) rather than gathered, since the
 // resumed sweeps touch a few cells of it while the gather copied every
 // cell (hard/3867: 154 million instructions in line_cells, 2.6%).
+// Pinned inline: the four instantiations are called from one place each
+// (the width dispatch in residual_key), and the compiler's own choice flips
+// with unrelated edits -- one build had residual_sweeps<1> out of line, at
+// 12 arguments per call, easy_medium/12130 +1.6% (+111 million).
 template <int NW>
+__attribute__((always_inline))
 inline void residual_sweeps(const LineSpec& spec, const std::int8_t* cells, std::size_t stride, std::size_t n,
                             std::size_t fu, std::size_t lu,
                             std::uint64_t* fwd, std::uint64_t* bwd, std::size_t fwd_from, std::size_t bwd_from) {
