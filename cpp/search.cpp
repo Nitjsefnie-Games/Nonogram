@@ -2497,8 +2497,18 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
     const char* region = state.region_row.empty() ? nullptr : state.region_row.data();
     int n_unknown = pic.unknown_count;
     if (region) {
+        // The region's rows that still have unknowns (bucket 0 of the trail
+        // is the rows without), not every row: the row-by-row sum was 34
+        // million instructions of hard/3867 at 150k nodes.
         n_unknown = 0;
-        for (int r = 0; r < H; ++r) if (region[r]) n_unknown += uir[r];
+        const std::uint64_t* zero_rows = trail.row_bucket.data();
+        for (int wd = 0; wd < trail.row_words; ++wd) {
+            std::uint64_t m = state.region_bits[static_cast<std::size_t>(wd)] & ~zero_rows[wd];
+            while (m != 0) {
+                n_unknown += uir[64 * wd + __builtin_ctzll(m)];
+                m &= m - 1;
+            }
+        }
     }
     if (n_unknown == 0) {
         state.result = 1;
