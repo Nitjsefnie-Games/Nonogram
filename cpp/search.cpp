@@ -2595,8 +2595,31 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             std::uint64_t* comp = comp_rows.data() + static_cast<std::size_t>(roots) * row_words;
             comp[wd0] |= 1ULL << (r0 & 63);
             ++roots;
-            for (int w = 0; w < kw; ++w) cm[w] = rk[r0 * kw + w] & kUnknownBits;
             bool grew = true;
+            if (kw == 1) {
+                // One key word per row: the column mask is a register and
+                // the join test one and. The runtime-count word loops
+                // below cost easy_medium/12130 (every row one word) 60 of
+                // the closure's 180 million instructions.
+                std::uint64_t cm0 = rk[r0] & kUnknownBits;
+                while (grew) {
+                    grew = false;
+                    for (int wd = wd0; wd < row_words; ++wd) {
+                        std::uint64_t m = left[wd];
+                        while (m != 0) {
+                            const int r = 64 * wd + __builtin_ctzll(m);
+                            m &= m - 1;
+                            const std::uint64_t k0 = rk[r];
+                            if ((k0 & cm0) == 0) continue;
+                            cm0 |= k0 & kUnknownBits;
+                            left[wd] &= ~(1ULL << (r & 63));
+                            comp[wd] |= 1ULL << (r & 63);
+                            grew = true;
+                        }
+                    }
+                }
+            } else {
+            for (int w = 0; w < kw; ++w) cm[w] = rk[r0 * kw + w] & kUnknownBits;
             while (grew) {
                 grew = false;
                 for (int wd = wd0; wd < row_words; ++wd) {
@@ -2614,6 +2637,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                         grew = true;
                     }
                 }
+            }
             }
         }
         if (g_debug_stats && !state.used_backtrack && !region) {
