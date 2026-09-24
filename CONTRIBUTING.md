@@ -126,11 +126,17 @@ Two counters are far less noisy than wall time and settle most decisions:
 perf stat -e instructions:u,branch-misses:u ./solver <puzzle> --anytime --max 100000
 ```
 
-Instructions retired repeat to well under 0.1% run to run, with one
-exception: on a count run set `STATE_CACHE_YIELD=0` (as `nodes.py`
+Instructions retired repeat to well under 0.1% run to run, with two
+exceptions. On a count run set `STATE_CACHE_YIELD=0` (as `nodes.py`
 does), because the state cache's yield gate reads cycle counters and a
 puzzle where it fires (easy_medium/12130) drifts about 1% between two
-runs of the same binary. Cycles and wall time still have the last word,
+runs of the same binary. And run the count under `setarch x86_64 -R`
+(address-space randomisation off): 12130's count also depends on where
+the stack lands, by up to 1.2% between two runs of one binary with the
+tree, every stats counter and the solution count unchanged (a 1000-byte
+environment string reproduces the shift exactly; the loop whose cost
+moves with the stack's alignment has not been identified). With both,
+the three benchmark puzzles repeat to 7 digits. Cycles and wall time still have the last word,
 because most of the anytime hot path is memory latency that no
 instruction count sees. Small changes also move code layout enough to
 swing plain `-O3` builds by a few percent, so treat a wall difference
