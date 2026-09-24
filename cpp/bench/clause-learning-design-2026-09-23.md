@@ -195,3 +195,28 @@ orders of magnitude smaller than ours and this design proceeds as written. If
 both time out in the counting phase, phase 1 is still worth its measurement
 (it can only shrink the tree) but phase 2 should not be started without a
 new signal.
+
+## Post-implementation corrections (2026-09-24)
+
+- §2, region split: "a clause spanning two regions can never become unit
+  inside one of them" is false. The state cache keys a region node on its
+  lines' DFA residuals, which do not determine the known cells' values, so a
+  clause action inside a region search can cache a count under a key that
+  does not determine it. Fixed by running no clause pass inside region
+  searches (commit c207b8a8a); cost under learning 7382 129,308 -> 134,958
+  nodes, 23210 10,482,310 -> 10,535,389.
+- §3.5, "the tree can only shrink (same decisions, more forced cells)" is
+  false: the min-balanced heuristic reads the picture, so clause-forced cells
+  change which cell it branches on. The corpus loses 26.4% of its nodes
+  (3867 excluded) but easy_medium/8424 (56,306 -> 84,799), easy_large/12534
+  (7,297 -> 15,525), easy_large/32291 (+11) and easy_large/11820 (+1) grow.
+  The probing-yield watchdog was measured as the cause and rejected.
+- §3.4 as the plan built it: unit learned clauses were to be watched with
+  their literal duplicated (`lits[1] = lits[0]`). The store instead keeps
+  unit clauses on a unit list that every propagate call re-forces; their
+  cells sit at level 0.
+- §5 gate 1: "no puzzle with more nodes" is a measurement, not a gate (see
+  §3.5 above). `mismatches=0` is the exactness gate.
+
+The numbers and the shipping verdict (`--learn` stays a flag) are in
+CONTRIBUTING.md, "The C++ solver".

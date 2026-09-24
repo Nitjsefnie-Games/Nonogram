@@ -225,6 +225,107 @@ no `Found` line, so a `timeout 300 ./solver puzzle` still says how far it
 got, and two binaries can be compared on a puzzle that neither finishes by
 the fraction each reaches in the same time.
 
+**`--learn`** (count mode; off by default). The search learns a 1UIP
+clause over cell literals (`cell*2 + (value==FULL)`) from every
+contradiction the solve trail commits to and from every contradicting
+probe. The clauses live in a two-watched-literal store (`cpp/clauses.hpp`)
+and propagate inside the fixpoint loop alongside line propagation (a clause
+pass after each line drain); a line's deductions are explained lazily, by
+re-running the line automaton on the content it saw (`explain_deduction` /
+`explain_conflict` in `lines.cpp`). Backtracking stays chronological, and
+the DFS, probing, region split and state cache are untouched. A probe's
+contradiction clause becomes the reason of the forced commit of the other
+value.
+
+Phase 1's limits, each with its reason:
+
+- **Chronological backtracking**: there is no backjump, so a learned clause
+  prunes the tree but never redirects the search.
+- **No clause propagation inside region searches**: the state cache keys a
+  region node on its lines' DFA residuals, which do not determine the known
+  cells' values, so any clause action inside a region could cache a count
+  under a key that does not determine it. The design's claim that a clause
+  spanning two regions can never become unit inside one was false; it was
+  found in review and fixed by disabling the pass there, at a measured cost
+  under learning of 7382 129,308 -> 134,958 nodes and 23210 10,482,310 ->
+  10,535,389.
+- **No re-assertion after a revert**: a non-unit learned clause that is unit
+  again after a chronological revert is not re-asserted until one of its
+  watched literals is re-assigned, which only misses a propagation.
+- **Unit clauses** are re-forced from the store's unit list on every pass,
+  because a one-literal clause has no second literal to watch; their cells
+  sit at level 0.
+- **Probe clauses that miss the pixel**: 11.3% of probe-learned clauses on
+  7382 (3,033 of 26,749) end on a forced probe-trail literal rather than
+  the probe pixel, so those commits carry no reason; that is sound, and
+  resolving past the 1UIP to the pixel would fix it (recorded, not built).
+- **The tree does not only shrink**: learned clauses change which cell the
+  min-balanced heuristic branches on, so the corpus loses nodes overall but
+  easy_medium/8424 (56,306 -> 84,799), easy_large/12534 (7,297 -> 15,525),
+  easy_large/32291 (+11) and easy_large/11820 (+1) gain. The probing-yield
+  watchdog was measured as the cause and rejected: feeding it clause
+  conflicts or clause-forced cells changed nothing, and disabling it under
+  learning fixed three of those but grew five others and raised corpus
+  probes from 179.6 million to 9.26 billion.
+
+| knob | what it changes |
+|---|---|
+| `--learn` | the mode itself, in count mode |
+| `LEARN=1` | stats build only: the same as `--learn`, so `bench/nodes.py --env LEARN=1` gates the mode |
+| `LEARN_MAX_CLAUSES=n` | the clause store's size (default 50000; every build): `reduce()` between subtrees deletes the worst half by lbd, then activity, and never a clause that is a reason or one propagation has not examined yet |
+| `LEARN_CHECK=1` | stats build: records every learned clause and checks each against every solution of a puzzle with at most 10,000 solutions, enumerated by a second, learning-off solve. `bench/learn_check.sh` runs it over the small buckets and fails on any `clause violated` line: 0 violations over easy_small, easy_medium, medium and easy_large |
+| `DEBUG_CACHE_STATS=1` | adds a `cache-stats: learn conflicts= clauses= avg-len= forced-by-clauses= clause-conflicts= deleted= probe-conflicts-learned= probe-uip-elsewhere=` line |
+
+The corpus gate under learning, `bench/nodes.py ./solver-stats --env
+STATE_CACHE_YIELD=0 --env LEARN=1 --timeout 3600` on build 42636e3c7, totals
+96,627,580 nodes and 74,235,479 probes with `mismatches=1`: the one mismatch
+is hard/3867's timeout, and every other puzzle counts exactly. Excluding
+3867 that is nodes -26.4% and probes -58.7% against the reference
+(208,538,669 nodes, 712,729,214 probes over 9,867 puzzles); 3867 itself is
+unverified under learning (stopped at 74.96% after 72 minutes). The gate
+needs `--timeout 3600` because 23210 takes 1,651 s and 38332 1,189 s under
+learning (both exact). The off path costs `MAX_NODES=150000 ./solver
+../nonograms/hard/3867` 6,258,221,545 -> 6,283,610,134 instructions
+(+0.41%), with the tree bit-identical and the off gate at 0 mismatches.
+Instructions with `--learn` (release build, one core):
+
+| run | off | `--learn` | ratio |
+|---|---|---|---|
+| hard/3867, `MAX_NODES=150000` | 6,283,610,134 | 188,610,523,766 | 30.0x |
+| easy_large/7382 | 29,818,408,184 | 285,879,083,746 | 9.59x |
+| easy_medium/12130 | 8,380,855,300 | 72,406,952,389 | 8.64x |
+| hard/23210 | 394,964,416,746 | 5,877,227,717,081 | 14.9x |
+
+Within 3867's budget the clauses never force a cell, because every conflict
+there is inside a region search. The partially solved sweep, 300 s on one
+core, explored fraction / solutions counted:
+
+| puzzle | baseline (6b570c1b3) | committed-conflict learning | plus probe learning |
+|---|---|---|---|
+| 9892 | 50.037% / 722 million | 50.026% / 847,057 | 50.048% / 248,857,346 |
+| 12548 | 0.000016% / 2.2 million | 0.0000207% / 2,192,128 | 0.0000767% / 30,481,024 |
+| 19080 | ~0% / 61 billion | ~0% / 998,944,030 | ~0% / 990,753,501 |
+| 20058 | ~0% / 1.6 billion | ~0% / 250,294,287 | ~0% / 229,666,805 |
+| 13480 | 10.55% / 13.3 billion | 10.547% / 351,219,980 | 8.594% / 79,012,143 |
+
+`--learn` stays a flag and does not ship as the default. Every corpus
+puzzle measured pays 9 to 30 times the instructions, the 300 s sweep gains
+no explored fraction that matters (12548's rises from 0.000016% to
+0.0000767% and its count from 2.2 million to 30.5 million, while the counts
+of the other four fall by a factor of 3 on 9892 and of 7 to 170 on the
+rest), and four corpus puzzles gain nodes, two of them by half or more. The tree reduction (-26%
+nodes, -59% probes) shows that the clauses prune; the instruction counts
+show that phase 1 pays for them with an average learned clause of 70
+literals and a line-automaton rerun per explained trail entry. The levers,
+in the order the reviews ranked them: recursive minimisation of learned
+clauses (design §3.4), sharing one line-content build across the entries of
+a line during analysis, resolving probe clauses past the 1UIP to the pixel,
+skipping the analysis inside region searches (sound, not tree-neutral), and
+an empty-store early-out in the clause pass. Phase 2 (backjumping,
+activity-based decisions) has no signal behind it yet. The design and its
+post-implementation corrections are in
+`cpp/bench/clause-learning-design-2026-09-23.md`.
+
 ## House style
 
 - **Python** — numpy arrays over Python lists in anything the solver
