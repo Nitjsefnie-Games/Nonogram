@@ -1776,9 +1776,14 @@ std::vector<int> g_clause_lits;
 // trail is at its clause fixpoint whenever a probe starts, and the watch
 // lists are global, so the clauses the probe's cells make unit are found
 // like any other. The one fresh clause a probe can meet is the one its
-// cell's other probe just learnt, which the probe pixel satisfies (see
-// probe_cell_t). Returns false on a conflict (g_conflict_clause set); the
-// caller then reverts the round, as after a line contradiction. Never
+// cell's other probe just learnt (see probe_cell_t). When that clause's
+// asserting literal is the other probe's pixel, this probe's pixel
+// satisfies it. When it is a literal y the other probe forced, the clause
+// is not(y) or not(a1) or ... with every ai true on the solve trail, so
+// this pass may force not(y) on the probe trail or report the clause as a
+// conflict; both are correct, the clause being implied. Returns false on a
+// conflict (g_conflict_clause set); the caller then reverts the round, as
+// after a line contradiction. Never
 // called inside a region search (see g_region_depth).
 bool clause_pass(Picture& pic, Trail& trail) {
     if (g_clauses.size() == 0) {  // no units, no watches, nothing fresh
@@ -1839,14 +1844,19 @@ bool clause_pass(Picture& pic, Trail& trail) {
 // contradiction takes effect at the next propagation). No pass runs inside
 // a region search, on either trail (see g_region_depth): a clause learnt
 // there waits for the search to return. So the propagation that first
-// examines a clause is on the solve trail, or is a probe's that the clause
-// cannot act in. A clause learnt at a committed contradiction: the node
-// that learnt returns dead (a region loop breaks on it) and, once no region
-// search is active, the next propagation is a parent's next branch value,
-// before any node probes. A clause a probe learnt (probe_cell_t) asserts
-// the probed cell's other value: the cell's other probe, if it runs, sets
-// that value, and the forced commit's propagation holds it too; when both
-// probes contradict, the node returns dead as above.
+// examines a clause is on the solve trail, or is a probe's. A clause learnt
+// at a committed contradiction: the node that learnt returns dead (a region
+// loop breaks on it) and, once no region search is active, the next
+// propagation is a parent's next branch value, before any node probes. A
+// clause a probe learnt (probe_cell_t) whose asserting literal is the probe
+// pixel asserts the probed cell's other value: the cell's other probe, if
+// it runs, sets that value, so the clause cannot act in it, and the forced
+// commit's propagation holds it too; when both probes contradict, the node
+// returns dead as above. When the asserting literal is instead a literal y
+// the probe forced, the clause is not(y) or not(a1) or ... with every ai
+// true on the solve trail: the other probe's clause pass may force not(y)
+// on its trail or report the clause as a conflict, both correct, the
+// clause being implied.
 template <bool FAST, int KW, bool LEARN>
 bool propagate_t(const std::vector<const LineSpec*>& mapped_rows,
                  const std::vector<const LineSpec*>& mapped_cols,

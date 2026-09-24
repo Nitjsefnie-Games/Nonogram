@@ -422,14 +422,14 @@ void solve_line_batch(const std::int8_t* line, std::size_t n,
 
 
 namespace {
-bool line_forces(std::int8_t* buf, std::size_t n, const LineSpec& spec, int pos, std::int8_t val) {
+bool line_forces(const std::int8_t* buf, std::size_t n, const LineSpec& spec, int pos, std::int8_t val) {
     static thread_local LineSolveResult r;
     solve_line_batch(buf, n, spec, r, true);
     if (r.total == 0) return false;
     for (int d : r.deductions) if (deduce_pos(d) == pos && deduce_val(d) == val) return true;
     return false;
 }
-bool line_unsat(std::int8_t* buf, std::size_t n, const LineSpec& spec) {
+bool line_unsat(const std::int8_t* buf, std::size_t n, const LineSpec& spec) {
     static thread_local LineSolveResult r;
     solve_line_batch(buf, n, spec, r, true);
     return r.total == 0;
@@ -453,7 +453,8 @@ int explain_greedy(const std::int8_t* line, std::size_t n, int pos, int* out, Ho
         std::abort();
     }
 #endif
-    std::vector<int> known;
+    static thread_local std::vector<int> known;
+    known.clear();
     for (int i = 0; i < static_cast<int>(n); ++i) if (buf[i] != UNKNOWN && i != pos) known.push_back(i);
     std::sort(known.begin(), known.end(), [pos](int a, int b) {
         const int da = std::abs(a - pos), db = std::abs(b - pos);
@@ -471,8 +472,8 @@ int explain_greedy(const std::int8_t* line, std::size_t n, int pos, int* out, Ho
 }  // namespace
 
 int explain_deduction(const std::int8_t* line, std::size_t n, const LineSpec& spec, int pos, std::int8_t val, int* out) {
-    return explain_greedy(line, n, pos, out, [&](std::int8_t* b) { return line_forces(b, n, spec, pos, val); });
+    return explain_greedy(line, n, pos, out, [&](const std::int8_t* b) { return line_forces(b, n, spec, pos, val); });
 }
 int explain_conflict(const std::int8_t* line, std::size_t n, const LineSpec& spec, int* out) {
-    return explain_greedy(line, n, -1, out, [&](std::int8_t* b) { return line_unsat(b, n, spec); });
+    return explain_greedy(line, n, -1, out, [&](const std::int8_t* b) { return line_unsat(b, n, spec); });
 }

@@ -145,6 +145,13 @@ int main() {
         }
     }
 
+    // The three shared-watch-list cases below (and their exact trail
+    // comparisons) rely on the store visiting a watch list in add order, which
+    // it does today but does not promise: "A first", "C ... D behind it", "E
+    // first" are how each case reaches the path it names. If the order
+    // changes, rebuild the cases so each still reaches its path; comparing
+    // the trails as sets would keep them passing without testing that path.
+    //
     // Shared watch list, move path: A = {0,1,2} and B = {0,3} both watch 0,
     // A first. Setting ~0 moves A's watch to 2; B must still be visited and
     // force 3.

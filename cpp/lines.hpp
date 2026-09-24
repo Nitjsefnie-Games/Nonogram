@@ -39,6 +39,7 @@ void solve_line_batch(const std::int8_t* line, std::size_t n,
                       const LineSpec& spec, LineSolveResult& out,
                       bool has_unknown = true);
 
+// Neither is re-entrant (static thread-local scratch): never call one from inside its own predicate.
 // Positions (ascending) of a subset of the line's known cells that alone
 // forces cell `pos` to `val`; returns the count. `line` must currently
 // force pos = val (pos is UNKNOWN in it). out has room for n ints.
