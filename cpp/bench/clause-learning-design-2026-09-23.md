@@ -220,6 +220,9 @@ new signal.
   their literal duplicated (`lits[1] = lits[0]`). The store instead keeps
   unit clauses on a unit list that every propagate call re-forces; their
   cells sit at level 0.
+- §3.4's recursive minimisation and §4's `LEARN_MIN_LBD_KEEP` were never
+  built: the plan omitted them. Minimisation is a listed lever in
+  CONTRIBUTING; the knob does not exist.
 - §5 gate 1: "no puzzle with more nodes" is a measurement, not a gate (see
   §3.5 above). `mismatches=0` is the exactness gate.
 
