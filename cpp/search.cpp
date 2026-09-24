@@ -1951,6 +1951,11 @@ inline bool solve_lines(const std::vector<const LineSpec*>& mapped,
     if (FAST && qh < qt) h = g_fast_cache.hash_tm<KW>(keys + static_cast<std::size_t>(qbuf[qh]) * kw, tagrec[qbuf[qh]]);
     while (qh < qt) {
         const int index = qbuf[qh++];
+        // Cleared per pop. Clearing the drained range after the loop
+        // instead (to take the flag buffer out of the loop's live set) was
+        // measured: the loop spilled as before and the epilogue loop was
+        // vectorised into 130 more instructions of drain, +3.2% / +4.4% /
+        // +3.7% on hard/3867, easy_medium/12130, easy_large/7382.
         dirty[index] = 0;
         std::uint64_t next_h = 0;
         if (FAST && qh < qt) {
