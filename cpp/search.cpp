@@ -27,6 +27,7 @@
 #include <functional>
 #include <list>
 #include <map>
+#include <new>
 #include <random>
 #include <string>
 #include <string_view>
@@ -839,8 +840,71 @@ void reset_line_cache(int height, int width, std::size_t budget_bytes, bool rese
 // commingle with the outer trail.
 // ---------------------------------------------------------------------------
 
+// The cell trail's storage: the std::vector<int> subset the trail uses, plus
+// append(n), which grows by n entries and hands back the pointer to write
+// them through. write_intersection appends once per line: a bounds check
+// and a pointer bump, no zeroing of the new entries (vector::resize
+// memsets them) and no per-cell size bookkeeping (vector::push_back).
+class CellTrail {
+public:
+    CellTrail() = default;
+    ~CellTrail() { std::free(buf_); }
+    CellTrail(const CellTrail&) = delete;
+    CellTrail& operator=(const CellTrail&) = delete;
+
+    std::size_t size() const { return static_cast<std::size_t>(end_ - buf_); }
+    std::size_t capacity() const { return static_cast<std::size_t>(cap_ - buf_); }
+    int* data() { return buf_; }
+    const int* data() const { return buf_; }
+    int* begin() { return buf_; }
+    int* end() { return end_; }
+    const int* begin() const { return buf_; }
+    const int* end() const { return end_; }
+    void clear() { end_ = buf_; }
+    void reserve(std::size_t n) { if (n > capacity()) grow(n); }
+    // New entries (if any) are indeterminate.
+    void resize(std::size_t n) { if (n > capacity()) grow(n); end_ = buf_ + n; }
+    void push_back(int v) {
+        if (end_ == cap_) grow(capacity() + 1);
+        *end_++ = v;
+    }
+    // No capacity check: a trail never holds more entries than the picture
+    // has cells (every entry is a distinct cell settled since the trail's
+    // base, unset when it is popped), and every Trail is reserved to H * W
+    // before its first append (solve's trail at its setup, the probe trail
+    // per probe, the estimate dive's per dive). The stats build verifies.
+    int* append(std::size_t n) {
+        int* const p = end_;
+#ifdef NONOGRAM_STATS
+        if (static_cast<std::size_t>(cap_ - p) < n) {
+            std::fprintf(stderr, "CellTrail::append: %zu entries past the reserved capacity\n", n);
+            std::abort();
+        }
+#endif
+        end_ = p + n;
+        return p;
+    }
+
+private:
+    // Doubling growth to at least `want` entries; the entries stay in place.
+    __attribute__((noinline)) void grow(std::size_t want) {
+        const std::size_t n = size();
+        std::size_t cap = std::max(want, 2 * capacity());
+        if (cap < 64) cap = 64;
+        int* const nb = static_cast<int*>(std::realloc(buf_, cap * sizeof(int)));
+        if (nb == nullptr) throw std::bad_alloc();
+        buf_ = nb;
+        end_ = nb + n;
+        cap_ = nb + cap;
+    }
+
+    int* buf_ = nullptr;
+    int* end_ = nullptr;
+    int* cap_ = nullptr;
+};
+
 struct Trail {
-    std::vector<int> changed_cell_indices;  // packed (row, col); see trail_pack
+    CellTrail changed_cell_indices;  // packed (row, col); see trail_pack
     // Per-row / per-col UNKNOWN counts at the last branch node, maintained
     // from this trail alone: the node entry subtracts every entry pushed
     // since `counted` (cells settled by branch pixels, commits and real
@@ -1587,46 +1651,130 @@ inline BatchResult solve_one_batch(const std::vector<const LineSpec*>& mapped,
 // recorded index back to UNKNOWN.
 // ---------------------------------------------------------------------------
 
-template <typename Iter, typename Pos, typename Val>
+// Everything the per-cell loop touches lives in locals, and what is the
+// same for every cell of the line is done once: the pixel and dirty-flag
+// byte stores alias every object, so a value read through pic or the trail
+// was reloaded after each of them (the width, the pixel, key, dirty and
+// queue buffers, the key word count and the queue tail: eight loads per
+// cell), the line's offsets were multiplied out per cell, unknown_count was
+// decremented in memory per cell and each trail entry went through
+// std::vector::push_back -- 54 instructions per settled cell, 12.6% of the
+// hard/3867 budget. Now the trail grows once per line (no zeroing, no
+// bounds check: see CellTrail::append) and is written through a pointer,
+// the cross queue's tail is a local written back at the end (the queue
+// never grows from its own side during the write), unknown_count is
+// subtracted once, and the line's own key word and shift on the cross keys
+// are computed once. KW and IS_ROW are compile-time (solve_lines' own
+// parameters): a runtime key word count made the compiler version the loop
+// on kw == 1 and spill, and most lines settle only a few cells, so the
+// per-call cost matters as much as the per-cell cost.
+template <int KW, bool IS_ROW, typename Iter, typename Pos, typename Val>
+__attribute__((noinline))
+void write_intersection_many(Iter first, Iter last, Pos pos_of, Val val_of,
+                             int line_index, Picture& pic, Trail& trail);
+
+// No UNKNOWN re-check anywhere below: the cache entry was computed for
+// exactly the line's current content (that is its key), and the line DP
+// only emits deductions for cells that are UNKNOWN in that content.
+template <int KW, bool IS_ROW, typename Iter, typename Pos, typename Val>
 inline void write_intersection_impl(Iter first, Iter last, Pos pos_of, Val val_of,
-                                    int line_index, Picture& pic, bool is_row, Trail& trail) {
-    // No UNKNOWN re-check: the cache entry was computed for exactly the
-    // line's current content (that is its key), and the line DP only emits
-    // deductions for cells that are UNKNOWN in that content.
-    if (is_row) {
-        const int row = line_index;
-        for (; first != last; ++first) {
-            const int col = pos_of(*first);
-            pic.set_known(row, col, val_of(*first));
-            pic.mark_col_dirty(col);
-            trail.changed_cell_indices.push_back(trail_pack(row, col));
-            if (g_memo_enabled && trail.stamps) stamp_cell(row, col);
-        }
-    } else {
-        const int col = line_index;
-        for (; first != last; ++first) {
-            const int row = pos_of(*first);
-            pic.set_known(row, col, val_of(*first));
-            pic.mark_row_dirty(row);
-            trail.changed_cell_indices.push_back(trail_pack(row, col));
-            if (g_memo_enabled && trail.stamps) stamp_cell(row, col);
-        }
+                                    int line_index, Picture& pic, Trail& trail) {
+    if (last - first != 1) {
+        write_intersection_many<KW, IS_ROW>(first, last, pos_of, val_of, line_index, pic, trail);
+        return;
     }
+    // One cell, the most common case: straight-line code that needs no
+    // saved registers, where the loop below keeps ten values live and
+    // spends 59 instructions per call on its frame and setup.
+    const std::size_t kw = KW > 0 ? static_cast<std::size_t>(KW) : static_cast<std::size_t>(pic.key_words);
+    const std::size_t li = static_cast<std::size_t>(line_index);
+    const std::size_t W = static_cast<std::size_t>(pic.width());
+    const int pos = pos_of(*first);
+    const std::int8_t v = val_of(*first);
+    const std::uint64_t x = static_cast<std::uint64_t>(static_cast<int>(UNKNOWN) ^ static_cast<int>(v));
+    const std::size_t p = static_cast<std::size_t>(pos);
+    pic.pixels.data()[IS_ROW ? li * W + p : p * W + li] = v;
+    (IS_ROW ? pic.row_keys : pic.col_keys).data()[li * kw + (KW == 1 ? 0 : p >> 5)] ^=
+        x << (KW == 1 ? 2 * pos : 2 * (pos & 31));
+    (IS_ROW ? pic.col_keys : pic.row_keys).data()[p * kw + (KW == 1 ? 0 : li >> 5)] ^=
+        x << (2 * (line_index & 31));
+    std::uint8_t* const dirty = (IS_ROW ? pic.col_dirty : pic.row_dirty).data();
+    (IS_ROW ? pic.col_queue : pic.row_queue).push_back_if(pos, !dirty[pos]);
+    dirty[pos] = 1;
+    const int row = IS_ROW ? line_index : pos;
+    const int col = IS_ROW ? pos : line_index;
+    *trail.changed_cell_indices.append(1) = trail_pack(row, col);
+    if (g_memo_enabled && trail.stamps) stamp_cell(row, col);
+    --pic.unknown_count;
 }
 
-void write_intersection(const BatchResult& r, int line_index, Picture& pic, bool is_row, Trail& trail) {
-    if (r.n8 != BatchResult::kLegacy) {
+template <int KW, bool IS_ROW, typename Iter, typename Pos, typename Val>
+void write_intersection_many(Iter first, Iter last, Pos pos_of, Val val_of,
+                             int line_index, Picture& pic, Trail& trail) {
+    const std::size_t n = static_cast<std::size_t>(last - first);
+    const std::size_t kw = KW > 0 ? static_cast<std::size_t>(KW) : static_cast<std::size_t>(pic.key_words);
+    int* tp = trail.changed_cell_indices.append(n);
+    const bool stamp = g_memo_enabled && trail.stamps;
+    const std::size_t li = static_cast<std::size_t>(line_index);
+    // This line's word and shift in the cross-direction keys.
+    const std::size_t lw = KW == 1 ? 0 : li >> 5;
+    const int lsh = 2 * (line_index & 31);
+    // The line's base in pixels (rows are contiguous, columns strided by W),
+    // in its own keys, and the cross direction's key base, dirty flags and
+    // queue.
+    const std::size_t W = static_cast<std::size_t>(pic.width());
+    std::int8_t* const px = pic.pixels.data() + (IS_ROW ? li * W : li);
+    std::uint64_t* const own = (IS_ROW ? pic.row_keys : pic.col_keys).data() + li * kw;
+    std::uint64_t* const cross = (IS_ROW ? pic.col_keys : pic.row_keys).data() + lw;
+    std::uint8_t* const dirty = (IS_ROW ? pic.col_dirty : pic.row_dirty).data();
+    FifoQueue& queue = IS_ROW ? pic.col_queue : pic.row_queue;
+    int* const qbuf = queue.data();
+    int* qp = qbuf + queue.tail();  // one cursor, not a buffer and a tail
+    // Not unrolled: most lines settle one or two cells, and the loop is
+    // register-tight (the 3-word instantiation spilled three values per
+    // cell when unrolled by two).
+#pragma GCC unroll 1
+    for (; first != last; ++first, ++tp) {
+        const int pos = pos_of(*first);  // the cell's index along this line
+        const std::int8_t v = val_of(*first);
+        const std::uint64_t x = static_cast<std::uint64_t>(static_cast<int>(UNKNOWN) ^ static_cast<int>(v));
+        px[IS_ROW ? static_cast<std::size_t>(pos) : static_cast<std::size_t>(pos) * W] = v;
+        // KW == 1: every line is at most 32 cells, so pos >> 5 is 0 and
+        // pos & 31 is pos.
+        own[KW == 1 ? 0 : pos >> 5] ^= x << (KW == 1 ? 2 * pos : 2 * (pos & 31));
+        cross[static_cast<std::size_t>(pos) * kw] ^= x << lsh;
+        *qp = pos;
+        qp += !dirty[pos];
+        dirty[pos] = 1;
+        const int row = IS_ROW ? line_index : pos;
+        const int col = IS_ROW ? pos : line_index;
+        *tp = trail_pack(row, col);
+        if (stamp) stamp_cell(row, col);
+    }
+    queue.set_tail(static_cast<std::size_t>(qp - qbuf));
+    pic.unknown_count -= static_cast<int>(n);
+}
+
+// FAST: the deductions are the fast cache's packed bytes (bit 7 = value,
+// bits 0-6 = position); else the legacy cache's encoded ints. Never inlined
+// into the drain: as a template it was, and the drain loop's own locals
+// (cache view, queue cursor, key and tag pointers) then spilled around the
+// write -- the drain grew by more than the write saved.
+template <bool FAST, int KW, bool IS_ROW>
+__attribute__((noinline))
+void write_intersection(const BatchResult& r, int line_index, Picture& pic, Trail& trail) {
+    if (FAST) {
         const std::uint8_t* d = static_cast<const std::uint8_t*>(r.ded);
-        write_intersection_impl(d, d + r.n8,
-                                [](std::uint8_t b) { return static_cast<int>(b & 0x7F); },
-                                [](std::uint8_t b) { return static_cast<std::int8_t>(b >> 7); },
-                                line_index, pic, is_row, trail);
+        write_intersection_impl<KW, IS_ROW>(d, d + r.n8,
+                                            [](std::uint8_t b) { return static_cast<int>(b & 0x7F); },
+                                            [](std::uint8_t b) { return static_cast<std::int8_t>(b >> 7); },
+                                            line_index, pic, trail);
     } else {
         const auto* v = static_cast<const std::vector<int>*>(r.ded);
-        write_intersection_impl(v->begin(), v->end(),
-                                [](int enc) { return deduce_pos(enc); },
-                                [](int enc) { return deduce_val(enc); },
-                                line_index, pic, is_row, trail);
+        write_intersection_impl<KW, IS_ROW>(v->data(), v->data() + v->size(),
+                                            [](int enc) { return deduce_pos(enc); },
+                                            [](int enc) { return deduce_val(enc); },
+                                            line_index, pic, trail);
     }
 }
 
@@ -1679,7 +1827,8 @@ inline bool solve_lines(const std::vector<const LineSpec*>& mapped,
             return false;
         }
         if (r.n8 > 0 || (r.n8 == BatchResult::kLegacy && r.ded != nullptr)) {
-            write_intersection(r, index, pic, is_row, trail);
+            if (is_row) write_intersection<FAST, KW, true>(r, index, pic, trail);
+            else write_intersection<FAST, KW, false>(r, index, pic, trail);
         }
     }
     queue.reset();
@@ -1794,6 +1943,29 @@ struct ProbeBounds {
 };
 std::uint64_t g_stat_probe_skips = 0;  // probes the bounds made unnecessary
 
+// Returns the cells of the trail entries [first, last) to UNKNOWN, newest
+// first: Picture::unset per cell with everything in locals. Per cell the
+// member version reloaded the width, the key word count and the pixel and
+// key buffers after the pixel byte store (36 instructions per cell in
+// revert_branch's loop, five of them reloads).
+inline void unset_cells(Picture& pic, const int* first, const int* last) {
+    const std::size_t W = static_cast<std::size_t>(pic.width());
+    const std::size_t kw = static_cast<std::size_t>(pic.key_words);
+    std::int8_t* const px = pic.pixels.data();
+    std::uint64_t* const rk = pic.row_keys.data();
+    std::uint64_t* const ck = pic.col_keys.data();
+    while (last != first) {
+        const int e = *--last;
+        const std::size_t row = static_cast<std::size_t>(trail_row(e));
+        const std::size_t col = static_cast<std::size_t>(trail_col(e));
+        std::int8_t& cell = px[row * W + col];
+        const std::uint64_t x = static_cast<std::uint64_t>(static_cast<int>(UNKNOWN) ^ static_cast<int>(cell));
+        rk[row * kw + (col >> 5)] ^= x << (2 * (col & 31));
+        ck[col * kw + (row >> 5)] ^= x << (2 * (row & 31));
+        cell = UNKNOWN;
+    }
+}
+
 // RAII guard that snapshots a small amount of Picture state at construction
 // and restores pic to its entry state on destruction by walking the trail.
 struct ProbeGuard {
@@ -1813,10 +1985,7 @@ struct ProbeGuard {
         // Walk trail in reverse and restore each cell to UNKNOWN. We bypass
         // Picture::set_pixel because it only adjusts unknown_count for the
         // UNKNOWN -> value direction.
-        for (auto it = trail.changed_cell_indices.rbegin();
-             it != trail.changed_cell_indices.rend(); ++it) {
-            pic.unset(trail_row(*it), trail_col(*it));
-        }
+        unset_cells(pic, trail.changed_cell_indices.begin(), trail.changed_cell_indices.end());
         pic.unknown_count = saved_unknown_count;
 
         // Drain any pending queue entries and clear their dirty flags.
@@ -1850,6 +2019,8 @@ ProbeResult probe_cell(int row,
     // and reuse its capacity — no per-probe heap allocation.
     static thread_local Trail trail;
     trail.changed_cell_indices.clear();
+    // write_intersection appends unchecked (see CellTrail::append).
+    trail.changed_cell_indices.reserve(static_cast<std::size_t>(pic.height()) * static_cast<std::size_t>(pic.width()));
     // A valid memo answers the probe (see ProbeMemo).
     ProbeMemo* memo = nullptr;
     if (g_memo_enabled) {
@@ -2057,17 +2228,20 @@ void revert_branch(Picture& pic,
     const std::size_t n = trail.changed_cell_indices.size();
     const std::size_t split = std::max(mark, std::min(n, trail.counted));
     if (g_memo_enabled && n > mark) memo_next_gen();  // a revert changes its lines too
-    for (std::size_t i = n; i > split; ) {
-        const int e = tr[--i];
-        pic.unset(trail_row(e), trail_col(e));
-        stamp_cell(trail_row(e), trail_col(e));
+    // The stamps and the per-line counts do not depend on the pixels, so
+    // each range is unset in one pass (unset_cells) after its bookkeeping.
+    if (g_memo_enabled) {
+        for (std::size_t i = n; i > mark; ) {
+            const int e = tr[--i];
+            stamp_cell(trail_row(e), trail_col(e));
+        }
     }
+    unset_cells(pic, tr + split, tr + n);
     for (std::size_t i = split; i > mark; ) {
         const int e = tr[--i];
         trail.unsettle(trail_row(e), trail_col(e));
-        pic.unset(trail_row(e), trail_col(e));
-        stamp_cell(trail_row(e), trail_col(e));
     }
+    unset_cells(pic, tr + mark, tr + split);
     if (n > mark) trail.changed_cell_indices.resize(mark);
     if (trail.counted > mark) trail.counted = mark;
     pic.unknown_count = saved_unknown_count;
@@ -2926,7 +3100,8 @@ void solve(const std::vector<std::vector<int>>& rows,
     // The stats build's BRANCH_K knob is the same switch, for bench/nodes.py.
     state.balance_k = g_branch_k_set ? g_branch_k : balance_k;
     Trail trail;
-    // Reserve enough headroom that the trail rarely reallocates.
+    // Every cell at most once on the trail, and write_intersection appends
+    // unchecked (see CellTrail::append): reserve the whole picture.
     trail.changed_cell_indices.reserve(static_cast<std::size_t>(H) * static_cast<std::size_t>(W));
     trail.row_unknown.assign(static_cast<std::size_t>(H), W);
     trail.col_unknown.assign(static_cast<std::size_t>(W), H);
@@ -3116,6 +3291,8 @@ double estimate_solutions(const std::vector<std::vector<int>>& rows,
     for (long d = 0; d < n_dives; ++d) {
         Picture pic(H, W);
         Trail trail;
+        // write_intersection appends unchecked (see CellTrail::append).
+        trail.changed_cell_indices.reserve(static_cast<std::size_t>(H) * static_cast<std::size_t>(W));
         double est = estimate_dive(mapped_rows, mapped_cols, pic, trail, rng);
         sum += est;
         if (est > 0.0) { ++hits; if (est > maxw) maxw = est; }

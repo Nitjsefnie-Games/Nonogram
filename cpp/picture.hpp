@@ -30,6 +30,11 @@ public:
     std::size_t head() const { return head_; }
     std::size_t tail() const { return tail_; }
     void set_head(std::size_t h) { head_ = h; }
+    // A bulk enqueue that keeps its own cursor (write_intersection): the
+    // buffer and tail read once, push_back_if's write-then-advance done on
+    // locals per cell, and the tail written back once at the end.
+    int* data() { return buf_.data(); }
+    void set_tail(std::size_t t) { tail_ = t; }
     // Call once the queue has been drained (empty() is true) to reclaim the
     // buffer; kept out of pop_front so the drain loop pays no per-pop check.
     void reset() { tail_ = 0; head_ = 0; }
