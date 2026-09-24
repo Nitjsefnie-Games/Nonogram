@@ -1607,8 +1607,13 @@ BatchResult solve_one_batch_legacy(const LineSpec& spec,
                                                       const std::uint64_t* key,
                                                       std::uint16_t tag) {
     if (g_debug_stats) ++g_stat_misses;
-    std::size_t line_n;
-    const std::int8_t* line = line_cells(index, is_col, pic, line_n);
+    // A column is read in place at stride W (no gather), and the line
+    // solver takes its unknown mask from the packed key.
+    const std::size_t W = static_cast<std::size_t>(pic.width());
+    const std::int8_t* px = pic.pixels.data();
+    const std::int8_t* line = is_col ? px + static_cast<std::size_t>(index) : px + static_cast<std::size_t>(index) * W;
+    const std::size_t stride = is_col ? W : 1;
+    const std::size_t line_n = is_col ? static_cast<std::size_t>(pic.height()) : W;
     static thread_local LineSolveResult res;  // capacity reused across misses
     // UNKNOWN is digit 2 (0b10) in the packed key, so the line has an
     // unknown cell iff some cell's high bit is set. A fully known line only
@@ -1616,7 +1621,7 @@ BatchResult solve_one_batch_legacy(const LineSpec& spec,
     std::uint64_t any = 0;
     for (int w = 0; w < pic.key_words; ++w) any |= key[w];
     const bool has_unknown = (any & kUnknownBits) != 0;
-    solve_line_batch(line, line_n, spec, res, has_unknown);
+    solve_line_batch(line, stride, line_n, key, spec, res, has_unknown);
     return g_fast_cache.insert(key, tag, res);
 }
 
@@ -1704,7 +1709,11 @@ inline void write_intersection_impl(Iter first, Iter last, Pos pos_of, Val val_o
     }
     // One cell, the most common case: straight-line code that needs no
     // saved registers, where the loop below keeps ten values live and
-    // spends 59 instructions per call on its frame and setup.
+    // spends 59 instructions per call on its frame and setup. (Inlining
+    // it into the drain was measured: the drain's own live values spill
+    // around it and the call's cost comes back as spills, +0.6% on
+    // easy_medium/12130 for the 1-word drain, +1.5% on hard/3867 for the
+    // 3-word one.)
     const std::size_t kw = KW > 0 ? static_cast<std::size_t>(KW) : static_cast<std::size_t>(pic.key_words);
     const std::size_t li = static_cast<std::size_t>(line_index);
     const std::size_t W = static_cast<std::size_t>(pic.width());

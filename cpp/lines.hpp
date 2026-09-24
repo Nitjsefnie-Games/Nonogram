@@ -38,3 +38,10 @@ LineSpec make_line_spec(const std::vector<int>& clue);
 void solve_line_batch(const std::int8_t* line, std::size_t n,
                       const LineSpec& spec, LineSolveResult& out,
                       bool has_unknown = true);
+// Cell p is line[p * stride], so a column is read in place; key is the
+// line's packed key (2 bits per cell, digit 2 = UNKNOWN, one word per 32
+// cells), which supplies the unknown mask without a pass over the cells.
+void solve_line_batch(const std::int8_t* line, std::size_t stride, std::size_t n,
+                      const std::uint64_t* key,
+                      const LineSpec& spec, LineSolveResult& out,
+                      bool has_unknown);

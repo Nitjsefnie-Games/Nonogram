@@ -1,6 +1,8 @@
 #include "lines.hpp"
 #include "types.hpp"
 
+#include <x86intrin.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstddef>
@@ -68,6 +70,18 @@ struct LineScratch {
 
 thread_local LineScratch g_scratch;
 
+// The 32 odd bits of a packed key word (one per cell: set iff UNKNOWN)
+// gathered into the low 32 bits.
+inline std::uint64_t unknown_bits32(std::uint64_t word) {
+#if defined(__BMI2__)
+    return _pext_u64(word, 0xAAAAAAAAAAAAAAAAULL);
+#else
+    std::uint64_t m = 0;
+    for (int i = 0; i < 32; ++i) m |= ((word >> (2 * i + 1)) & 1ULL) << i;
+    return m;
+#endif
+}
+
 } // namespace
 
 LineSpec make_line_spec(const std::vector<int>& clue) {
@@ -102,7 +116,12 @@ LineSpec make_line_spec(const std::vector<int>& clue) {
 // and carry-propagating shifts of the general routine; shifts are plain <<1/>>1.
 // Behavior is identical to the general path for n_words == 1.
 namespace {
-void solve_line_batch_1w(const std::int8_t* line, std::size_t n,
+// Cell p is line[p * stride] (a column read in place has stride W). key,
+// when given, is the line's packed key (2 bits per cell, digit 2 =
+// UNKNOWN), the source of the unknown mask; else the mask is built from
+// the cell bytes.
+void solve_line_batch_1w(const std::int8_t* line, std::size_t stride, std::size_t n,
+                         const std::uint64_t* key,
                          const LineSpec& spec, LineSolveResult& result,
                          bool has_unknown) {
     const std::size_t len_states = spec.len_states;
@@ -128,7 +147,7 @@ void solve_line_batch_1w(const std::int8_t* line, std::size_t n,
     fwd[0] = 1ULL;
     for (std::size_t p = 0; p < n; ++p) {
         const std::uint64_t cur = fwd[p];
-        const int v = line[p];
+        const int v = line[p * stride];
         fwd[p + 1] = (cur & stay[v]) | ((cur << 1) & step[v]);
     }
 
@@ -158,30 +177,41 @@ void solve_line_batch_1w(const std::int8_t* line, std::size_t n,
     std::uint64_t cur = accept;
     bwd[n] = cur;
     for (std::size_t pi = n; pi-- > 0; ) {
-        const int v = line[pi];
+        const int v = line[pi * stride];
         cur = (cur & stay[v]) | ((cur & step[v]) >> 1);
         bwd[pi] = cur;
     }
 
     int* out = g_scratch.ded_buf(n);
     std::size_t k = 0;
-    // The unknown mask of the line's next 64 cells, from 8 cells at a time:
-    // a cell is UNKNOWN (2) iff its byte XOR 2 is zero; the exact zero-byte
-    // test leaves 0x80 in each such byte and 0 elsewhere, and the multiply
-    // gathers those eight bits into the top byte in cell order.
+    // The unknown mask of the line's next 64 cells. From the packed key:
+    // the odd bit of each cell's digit is set iff the cell is UNKNOWN, and
+    // pext gathers the 32 odd bits of a key word into 32 mask bits. From
+    // the bytes (no key): 8 cells at a time, a cell is UNKNOWN (2) iff its
+    // byte XOR 2 is zero; the exact zero-byte test leaves 0x80 in each such
+    // byte and 0 elsewhere, and the multiply gathers those eight bits into
+    // the top byte in cell order.
     for (std::size_t base = 0; base < n; base += 64) {
         const std::size_t end = std::min(n, base + 64);
         std::uint64_t um = 0;
-        std::size_t p = base;
-        for (; p + 8 <= end; p += 8) {
-            std::uint64_t x;
-            std::memcpy(&x, line + p, 8);
-            const std::uint64_t t = x ^ 0x0202020202020202ULL;
-            const std::uint64_t nz = (((t & 0x7F7F7F7F7F7F7F7FULL) + 0x7F7F7F7F7F7F7F7FULL) | t) & 0x8080808080808080ULL;
-            const std::uint64_t z = nz ^ 0x8080808080808080ULL;
-            um |= ((z * 0x0002040810204081ULL) >> 56) << (p - base);
+        if (key != nullptr) {
+            const std::size_t w = base / 32;
+            um = unknown_bits32(key[w]);
+            if (end > base + 32) um |= unknown_bits32(key[w + 1]) << 32;
+        } else if (stride == 1) {
+            std::size_t p = base;
+            for (; p + 8 <= end; p += 8) {
+                std::uint64_t x;
+                std::memcpy(&x, line + p, 8);
+                const std::uint64_t t = x ^ 0x0202020202020202ULL;
+                const std::uint64_t nz = (((t & 0x7F7F7F7F7F7F7F7FULL) + 0x7F7F7F7F7F7F7F7FULL) | t) & 0x8080808080808080ULL;
+                const std::uint64_t z = nz ^ 0x8080808080808080ULL;
+                um |= ((z * 0x0002040810204081ULL) >> 56) << (p - base);
+            }
+            for (; p < end; ++p) um |= static_cast<std::uint64_t>(line[p] == UNKNOWN) << (p - base);
+        } else {
+            for (std::size_t p = base; p < end; ++p) um |= static_cast<std::uint64_t>(line[p * stride] == UNKNOWN) << (p - base);
         }
-        for (; p < end; ++p) um |= static_cast<std::uint64_t>(line[p] == UNKNOWN) << (p - base);
         while (um != 0) {
             const std::size_t pos = base + static_cast<std::size_t>(__builtin_ctzll(um));
             um &= um - 1;
@@ -279,6 +309,13 @@ void solve_line_batch_2w(const std::int8_t* line, std::size_t n,
 void solve_line_batch(const std::int8_t* line, std::size_t n,
                       const LineSpec& spec, LineSolveResult& result,
                       bool has_unknown) {
+    solve_line_batch(line, 1, n, nullptr, spec, result, has_unknown);
+}
+
+void solve_line_batch(const std::int8_t* line, std::size_t stride, std::size_t n,
+                      const std::uint64_t* key,
+                      const LineSpec& spec, LineSolveResult& result,
+                      bool has_unknown) {
     const std::size_t len_states = spec.len_states;
     const std::size_t n_words = spec.n_words;
 
@@ -291,8 +328,16 @@ void solve_line_batch(const std::int8_t* line, std::size_t n,
     }
 
     if (n_words == 1) {
-        solve_line_batch_1w(line, n, spec, result, has_unknown);
+        solve_line_batch_1w(line, stride, n, key, spec, result, has_unknown);
         return;
+    }
+    // The wider paths read a contiguous line: a strided one is gathered.
+    if (stride != 1) {
+        static thread_local std::vector<std::int8_t> gathered;
+        gathered.resize(n);
+        std::int8_t* g = gathered.data();
+        for (std::size_t p = 0; p < n; ++p) g[p] = line[p * stride];
+        line = g;
     }
     if (n_words == 2) {
         solve_line_batch_2w(line, n, spec, result, has_unknown);
