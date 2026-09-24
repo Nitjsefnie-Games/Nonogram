@@ -126,17 +126,15 @@ Two counters are far less noisy than wall time and settle most decisions:
 perf stat -e instructions:u,branch-misses:u ./solver <puzzle> --anytime --max 100000
 ```
 
-Instructions retired repeat to well under 0.1% run to run, with two
-exceptions. On a count run set `STATE_CACHE_YIELD=0` (as `nodes.py`
-does), because the state cache's yield gate reads cycle counters and a
-puzzle where it fires (easy_medium/12130) drifts about 1% between two
-runs of the same binary. And run the count under `setarch x86_64 -R`
-(address-space randomisation off): 12130's count also depends on where
-the stack lands, by up to 1.2% between two runs of one binary with the
-tree, every stats counter and the solution count unchanged (a 1000-byte
-environment string reproduces the shift exactly; the loop whose cost
-moves with the stack's alignment has not been identified). With both,
-the three benchmark puzzles repeat to 7 digits. Cycles and wall time still have the last word,
+Instructions retired repeat to 7 digits run to run with one proviso: on
+a count run set `STATE_CACHE_YIELD=0` (as `nodes.py` does), because the
+state cache's yield gate decides on measured cycles, and on a puzzle
+where it fires (easy_medium/12130) its decisions, the tree and the
+count move with anything that moves the cycles, by 1-2% between two runs
+of one binary, even with the stack's placement alone (address-space
+randomisation, or the length of the environment). The override is read
+in every build; it was once read by the stats build only, so release
+counts taken with it drifted regardless. Cycles and wall time still have the last word,
 because most of the anytime hot path is memory latency that no
 instruction count sees. Small changes also move code layout enough to
 swing plain `-O3` builds by a few percent, so treat a wall difference
@@ -205,7 +203,7 @@ with the numbers that kept it out of the shipped build:
 | `DEBUG_IMPL=1/2` | implication graph with contrapositive edges: count / act |
 | `NO_STATE_CACHE=1` | count mode without the region state cache (the count of a region's state, keyed by its line keys, reused when another branch order reaches it; it also serves the region split, so a split-off region seen before is a hit at its search's root) |
 | `STATE_CACHE_PROBE_ONLY=1` | key and look up every node but never take a hit: the instruction delta against `NO_STATE_CACHE=1` is the cache's own cost |
-| `STATE_CACHE_YIELD=<x>` | the state cache's per-node-size gate: a size bucket stops using the cache while the cycles its hits save fall below x times the cycles its lookups cost (default 1). The gate and the table's eviction read cycle counters, so a long run's tree is not bit-for-bit reproducible; on the corpus neither fires and two `nodes.py` runs agree on every puzzle (checked 2026-09-18), and `0` makes the gate inert for a strictly deterministic tree |
+| `STATE_CACHE_YIELD=<x>` | the state cache's per-node-size gate: a size bucket stops using the cache while the cycles its hits save fall below x times the cycles its lookups cost (default 0.5). The gate and the table's eviction read cycle counters, so a long run's tree is not bit-for-bit reproducible; on the corpus neither fires and two `nodes.py` runs agree on every puzzle (checked 2026-09-18), and `0` makes the gate inert for a strictly deterministic tree. Unlike the other knobs it is read by the shipped build too, so a release binary's count can be taken with the gate inert |
 | `DEBUG_CACHE_STATS=1` | the counters themselves, including the latched dead/live subtree histogram and the state cache's lookups, hits and evictions |
 
 Measured on the partially solved class (explored fraction and count after

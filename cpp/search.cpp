@@ -373,12 +373,7 @@ const bool g_state_cache_probe_only = std::getenv("STATE_CACHE_PROBE_ONLY") != n
 // NO_PROBE_SKIP=1 probes every cell both ways even when an earlier probe
 // of the pass bounds the result (see ProbeBounds), for measuring the skip.
 const bool g_no_probe_skip = std::getenv("NO_PROBE_SKIP") != nullptr;
-// STATE_CACHE_YIELD=<x> overrides the per-bucket gate's threshold (nodes
-// saved per lookup below which a node-size bucket stops using the cache;
-// 0 never gates).
-const double g_state_cache_yield = std::getenv("STATE_CACHE_YIELD") ? std::atof(std::getenv("STATE_CACHE_YIELD")) : 0.5;
 #else
-constexpr double g_state_cache_yield = 0.5;
 constexpr bool g_no_state_cache = false;
 constexpr bool g_state_cache_probe_only = false;
 constexpr bool g_no_probe_skip = false;
@@ -394,6 +389,14 @@ constexpr bool g_early_solve = false;
 constexpr std::size_t g_probe_window = 100;
 constexpr double g_probe_thresh = 0.01;
 #endif
+// STATE_CACHE_YIELD=<x> overrides the state cache's per-bucket gate
+// threshold (cycles saved per lookup below which a node-size bucket stops
+// using the cache; 0 never gates). Read in every build, not only the stats
+// one: the gate decides on measured cycles, so a release binary's tree,
+// and with it an instruction count, moves with anything that moves the
+// cycles (on easy_medium/12130 by 1.2% with the stack's placement alone),
+// and the override is what makes a count reproducible.
+const double g_state_cache_yield = std::getenv("STATE_CACHE_YIELD") ? std::atof(std::getenv("STATE_CACHE_YIELD")) : 0.5;
 std::uint64_t g_stat_probe_pairs = 0, g_stat_probe_hits = 0;  // probe pairs, and those with a contradiction
 
 // Probe memo. A probe (cell, value) at one node solved a set of lines --
