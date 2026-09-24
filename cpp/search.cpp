@@ -2602,15 +2602,31 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
     std::int8_t best_first_val = FULL;
 
     // Neighbor score: count of filled (non-UNKNOWN) orthogonal neighbours,
-    // out-of-bounds counting as 1. Computed on demand only for the unknown
-    // cells we actually score (mirrors the old get_neighbor_scores values).
-    auto neighbor_score = [&](int r, int c) -> int {
-        int s = 0;
-        s += (r == 0)     ? 1 : (px[(r - 1) * W + c] != UNKNOWN);
-        s += (r == H - 1) ? 1 : (px[(r + 1) * W + c] != UNKNOWN);
-        s += (c == 0)     ? 1 : (px[r * W + (c - 1)] != UNKNOWN);
-        s += (c == W - 1) ? 1 : (px[r * W + (c + 1)] != UNKNOWN);
-        return s;
+    // out-of-bounds counting as 1. Read from the packed row keys, whose
+    // unknown bits the scans below already walk: for the unknown cell at
+    // odd bit `bit` of row r's word w, the up and down neighbours are the
+    // same bit of the rows above and below, the left and right neighbours
+    // the bits two below and above (carried in from the adjacent words at
+    // the word edges). A neighbour outside the picture reads 0, i.e.
+    // filled, as before; the key bits past the last column are 0. Four
+    // shifts per cell instead of four pixel loads with bounds tests
+    // (easy_medium/12130: 163 million instructions, 2.1%).
+    struct NeighborMasks { std::uint64_t up, dn, lf, rt; };
+    auto neighbor_masks = [&](int r, int w) -> NeighborMasks {
+        const std::uint64_t* row = rk + static_cast<std::size_t>(r) * kw;
+        const std::uint64_t m = row[w] & kUnknownBits;
+        const std::uint64_t prev = w > 0 ? row[w - 1] & kUnknownBits : 0;
+        const std::uint64_t next = w + 1 < kw ? row[w + 1] & kUnknownBits : 0;
+        NeighborMasks nm;
+        nm.up = r > 0 ? rk[static_cast<std::size_t>(r - 1) * kw + w] & kUnknownBits : 0;
+        nm.dn = r + 1 < H ? rk[static_cast<std::size_t>(r + 1) * kw + w] & kUnknownBits : 0;
+        nm.lf = (m << 2) | (prev >> 62);
+        nm.rt = (m >> 2) | (next << 62);
+        return nm;
+    };
+    auto neighbor_score = [](const NeighborMasks& nm, int bit) -> int {
+        return 4 - static_cast<int>(((nm.up >> bit) & 1) + ((nm.dn >> bit) & 1) +
+                                    ((nm.lf >> bit) & 1) + ((nm.rt >> bit) & 1));
     };
 
     // Composite key: ascending line_constraint (uir[r] + uic[c]), then
@@ -2647,16 +2663,19 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                     const int uir_r = uir[r];
                     for (int w = 0; w < kw; ++w) {
                         std::uint64_t m = rk[r * kw + w] & kUnknownBits;
+                        if (m == 0) continue;
+                        const NeighborMasks nm = neighbor_masks(r, w);
                         while (m != 0) {
-                            const int c = 32 * w + (__builtin_ctzll(m) >> 1);
+                            const int bit = __builtin_ctzll(m);
+                            const int c = 32 * w + (bit >> 1);
                             m &= m - 1;
                             // The key is (line constraint, -neighbours) in
                             // lexicographic order, so a cell whose line
                             // constraint alone loses needs no neighbour
-                            // count (four pixel loads and branches).
+                            // count.
                             const int lc = uir_r + uic[c];
                             if (have && lc > best_key.first) continue;
-                            const std::pair<int, int> key(lc, -neighbor_score(r, c));
+                            const std::pair<int, int> key(lc, -neighbor_score(nm, bit));
                             if (!have || key < best_key || (key == best_key && r < best_row)) {
                                 best_key = key;
                                 best_row = r;
@@ -2688,12 +2707,15 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             if (region && !region[r]) continue;
             for (int w = 0; w < kw; ++w) {
                 std::uint64_t m = rk[r * kw + w] & kUnknownBits;
+                if (m == 0) continue;
+                const NeighborMasks nm = neighbor_masks(r, w);
                 while (m != 0) {
-                    const int c = 32 * w + (__builtin_ctzll(m) >> 1);
+                    const int bit = __builtin_ctzll(m);
+                    const int c = 32 * w + (bit >> 1);
                     m &= m - 1;
                     unknown_coords.emplace_back(r, c);
                     int lc = uir[r] + uic[c];
-                    int e = lc * 5 + (4 - neighbor_score(r, c));
+                    int e = lc * 5 + (4 - neighbor_score(nm, bit));
                     enc.push_back(e);
                     if (e > max_enc) max_enc = e;
                 }
