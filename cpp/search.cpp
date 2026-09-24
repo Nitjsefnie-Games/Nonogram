@@ -254,6 +254,7 @@ constexpr bool g_debug_stats = false;
 #endif
 std::uint64_t g_stat_lookups = 0;
 std::uint64_t g_stat_misses = 0;
+std::uint64_t g_stat_probe_steps = 0;  // slots visited by line-cache lookups (probe length)
 std::uint64_t g_stat_probes = 0;
 std::uint64_t g_stat_ded_hist[kMaxFastCells + 1] = {};
 std::uint64_t g_stat_unsat = 0, g_stat_noded = 0, g_stat_ded = 0;  // lookup outcomes
@@ -613,14 +614,39 @@ public:
     void prefetch(std::uint64_t h) const { __builtin_prefetch(slot(h & mask_)); }
     template <int KW>
     unsigned char* find(const std::uint64_t* key, std::uint16_t tag, std::uint64_t h) {
-        std::size_t idx = h & mask_;
+        return find<KW>(view(), key, tag, h);
+    }
+
+    // The table's geometry, copied into a drain's locals: the drain stores
+    // bytes (dirty flags, pixels) through char pointers, which alias every
+    // member, so read through `this` the base, mask and shift are reloaded
+    // after every store. A View changes only when insert() grows the table;
+    // the drain refreshes it after every miss.
+    struct View {
+        unsigned char* base;
+        std::size_t mask;
+        int shift;
+        std::size_t hdr;
+    };
+    View view() const { return View{buf_.p, mask_, static_cast<int>(slot_shift_), hdr_}; }
+    template <int KW>
+    static void prefetch(const View& v, std::uint64_t h) {
+        const int shift = KW > 0 ? (KW <= 2 ? 5 : 6) : v.shift;
+        __builtin_prefetch(v.base + ((h & v.mask) << shift));
+    }
+    template <int KW>
+    unsigned char* find(const View& v, const std::uint64_t* key, std::uint16_t tag, std::uint64_t h) {
+        const std::size_t hdr = KW > 0 ? 8 * static_cast<std::size_t>(KW) : v.hdr;
+        const int shift = KW > 0 ? (KW <= 2 ? 5 : 6) : v.shift;  // as init() sets it
+        std::size_t idx = h & v.mask;
         tag = full_tag(tag, h);
         for (;;) {
-            unsigned char* s = slot(idx);
-            const std::uint16_t t = load_u16(s + hdr_);
+            if (g_debug_stats) ++g_stat_probe_steps;
+            unsigned char* s = v.base + (idx << shift);
+            const std::uint16_t t = load_u16(s + hdr);
             if (t == kEmptyStored) { miss_slot_ = s; miss_tag_ = tag; return nullptr; }
             if (t == tag && keys_equal<KW>(s, key)) return s;
-            idx = (idx + 1) & mask_;
+            idx = (idx + 1) & v.mask;
         }
     }
 
@@ -679,9 +705,18 @@ public:
             const std::uint64_t k1 = (kw == 2) ? key[1] : 0;
             return wy::mix(key[0] ^ t, k1 ^ 0xE7037ED1A0B428DBULL);
         }
-        std::uint64_t h = wy::mix(t, 0xA0761D6478BD642FULL);
-        for (int w = 0; w < kw; ++w) h = wy::mix(h ^ key[w], 0xE7037ED1A0B428DBULL);
-        return h;
+        // Three and four words: fold the words with plain multiplies (each
+        // spreads its input upward) and mix once at the end, which folds the
+        // high half back down over every index and tag bit. One 128-bit
+        // multiply instead of four or five.
+        // One multiplier for every word: each extra 64-bit constant is a
+        // movabs the drain re-materialises per lookup under its register
+        // pressure.
+        std::uint64_t x = (key[0] ^ t) * 0xE7037ED1A0B428DBULL;
+        x = (x ^ key[1]) * 0xE7037ED1A0B428DBULL;
+        x = (x ^ key[2]) * 0xE7037ED1A0B428DBULL;
+        if (kw == 4) x = (x ^ key[3]) * 0xE7037ED1A0B428DBULL;
+        return wy::mix(x, 0xA0761D6478BD642FULL);
     }
 
     template <int KW = 0>
@@ -1509,23 +1544,26 @@ inline BatchResult solve_one_batch(const std::vector<const LineSpec*>& mapped,
                                    int index,
                                    bool is_col,
                                    Picture& pic,
-                                   std::uint64_t h) {
+                                   std::uint64_t h,
+                                   FastLineCache::View& v,
+                                   const std::uint64_t* keys,
+                                   const std::uint16_t* tags) {
     if (!FAST) {
         return solve_one_batch_legacy(*mapped[index], index, is_col, pic);
     }
 
     const int kw = KW > 0 ? KW : pic.key_words;
-    const std::uint64_t* key =
-        (is_col ? pic.col_keys.data() : pic.row_keys.data()) + static_cast<std::size_t>(index) * kw;
-    const std::uint16_t tag = (is_col ? g_col_tags : g_row_tags)[static_cast<std::size_t>(index)];
+    const std::uint64_t* key = keys + static_cast<std::size_t>(index) * kw;
+    const std::uint16_t tag = tags[static_cast<std::size_t>(index)];
 
     if (g_debug_stats) ++g_stat_lookups;
-    unsigned char* s = g_fast_cache.find<KW>(key, tag, h);
+    unsigned char* s = g_fast_cache.find<KW>(v, key, tag, h);
     if (s == nullptr) {
         s = solve_one_batch_miss(*mapped[index], index, is_col, pic, key, tag);
+        v = g_fast_cache.view();  // the insert may have grown the table
     }
 
-    const std::size_t hdr = g_fast_cache.header_offset();
+    const std::size_t hdr = KW > 0 ? 8 * static_cast<std::size_t>(KW) : v.hdr;
     const std::uint8_t flags = s[hdr + 3];
     if (g_debug_stats) ++g_stat_probe_cur;
     if (!(flags & kFlagSat)) {
@@ -1605,7 +1643,7 @@ inline bool solve_lines(const std::vector<const LineSpec*>& mapped,
                         bool is_row,
                         Trail& trail) {
     auto& queue = is_row ? pic.row_queue : pic.col_queue;
-    auto& dirty = is_row ? pic.row_dirty : pic.col_dirty;
+    std::uint8_t* const dirty = (is_row ? pic.row_dirty : pic.col_dirty).data();
     // Draining rows changes only the current row's key and column keys
     // (and vice versa), so the next queued line's key is already what its
     // lookup will hash: it is hashed one line ahead, its slot prefetched
@@ -1614,21 +1652,30 @@ inline bool solve_lines(const std::vector<const LineSpec*>& mapped,
     const int kw = KW > 0 ? KW : pic.key_words;
     const std::uint64_t* keys = is_row ? pic.row_keys.data() : pic.col_keys.data();
     const std::uint16_t* tags = (is_row ? g_row_tags : g_col_tags).data();
+    // The queue's cursor and the cache's geometry live in locals for the
+    // drain: the dirty-flag and pixel byte stores below alias every object
+    // in memory, so anything read through a pointer or a global would be
+    // reloaded after each of them (eight loads per lookup on the 3-word
+    // drain). The queue never grows during its own drain.
+    FastLineCache::View v = g_fast_cache.view();
+    const int* qbuf = queue.data();
+    std::size_t qh = queue.head();
+    const std::size_t qt = queue.tail();
     std::uint64_t h = 0;
-    if (FAST && !queue.empty()) h = g_fast_cache.hash<KW>(keys + static_cast<std::size_t>(queue.front()) * kw, tags[queue.front()]);
-    while (!queue.empty()) {
-        const int index = queue.front();
-        queue.pop_front();
+    if (FAST && qh < qt) h = g_fast_cache.hash<KW>(keys + static_cast<std::size_t>(qbuf[qh]) * kw, tags[qbuf[qh]]);
+    while (qh < qt) {
+        const int index = qbuf[qh++];
         dirty[index] = 0;
         std::uint64_t next_h = 0;
-        if (FAST && !queue.empty()) {
-            const int nx = queue.front();
+        if (FAST && qh < qt) {
+            const int nx = qbuf[qh];
             next_h = g_fast_cache.hash<KW>(keys + static_cast<std::size_t>(nx) * kw, tags[nx]);
-            g_fast_cache.prefetch(next_h);
+            FastLineCache::prefetch<KW>(v, next_h);
         }
-        BatchResult r = solve_one_batch<FAST, KW>(mapped, index, !is_row, pic, h);
+        BatchResult r = solve_one_batch<FAST, KW>(mapped, index, !is_row, pic, h, v, keys, tags);
         h = next_h;
         if (!r.success) {
+            queue.set_head(qh);  // the failed line is popped, as before
             return false;
         }
         if (r.n8 > 0 || (r.n8 == BatchResult::kLegacy && r.ded != nullptr)) {
@@ -2965,9 +3012,10 @@ void solve(const std::vector<std::vector<int>>& rows,
     }
 
     if (g_debug_stats) {
-        std::fprintf(stderr, "cache-stats: lookups=%llu misses=%llu probes=%llu\ncache-stats: deductions-per-entry histogram:",
+        std::fprintf(stderr, "cache-stats: lookups=%llu misses=%llu slot-steps=%llu probes=%llu\ncache-stats: deductions-per-entry histogram:",
                      static_cast<unsigned long long>(g_stat_lookups),
                      static_cast<unsigned long long>(g_stat_misses),
+                     static_cast<unsigned long long>(g_stat_probe_steps),
                      static_cast<unsigned long long>(g_stat_probes));
         for (int i = 0; i <= kMaxFastCells; ++i) {
             if (g_stat_ded_hist[i]) std::fprintf(stderr, " %d:%llu", i, static_cast<unsigned long long>(g_stat_ded_hist[i]));

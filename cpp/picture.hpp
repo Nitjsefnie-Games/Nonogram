@@ -22,6 +22,14 @@ public:
     bool empty() const { return head_ >= tail_; }
     int front() const { return buf_[head_]; }
     void pop_front() { ++head_; }
+    // A drain that keeps its own cursor: read the buffer and bounds once,
+    // walk locals, and write the head back only on an early exit. The
+    // queue never grows during its own drain (a row drain enqueues columns
+    // only), so the tail read at the start stays the bound.
+    const int* data() const { return buf_.data(); }
+    std::size_t head() const { return head_; }
+    std::size_t tail() const { return tail_; }
+    void set_head(std::size_t h) { head_ = h; }
     // Call once the queue has been drained (empty() is true) to reclaim the
     // buffer; kept out of pop_front so the drain loop pays no per-pop check.
     void reset() { tail_ = 0; head_ = 0; }
