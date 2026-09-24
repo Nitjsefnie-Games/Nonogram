@@ -210,7 +210,12 @@ new signal.
   change which cell it branches on. The corpus loses 26.4% of its nodes
   (3867 excluded) but easy_medium/8424 (56,306 -> 84,799), easy_large/12534
   (7,297 -> 15,525), easy_large/32291 (+11) and easy_large/11820 (+1) grow.
-  The probing-yield watchdog was measured as the cause and rejected.
+  The probing-yield watchdog was ruled out as the cause on the
+  committed-conflict build (1b7389cae, where the growers were 8424, 12534
+  and 12130): feeding it clause conflicts or clause-forced cells changed
+  nothing, and disabling it under learning fixed those three but grew five
+  others and raised that build's corpus probes from 179.6 million to 9.26
+  billion.
 - §3.4 as the plan built it: unit learned clauses were to be watched with
   their literal duplicated (`lits[1] = lits[0]`). The store instead keeps
   unit clauses on a unit list that every propagate call re-forces; their

@@ -263,10 +263,11 @@ Phase 1's limits, each with its reason:
   min-balanced heuristic branches on, so the corpus loses nodes overall but
   easy_medium/8424 (56,306 -> 84,799), easy_large/12534 (7,297 -> 15,525),
   easy_large/32291 (+11) and easy_large/11820 (+1) gain. The probing-yield
-  watchdog was measured as the cause and rejected: feeding it clause
-  conflicts or clause-forced cells changed nothing, and disabling it under
-  learning fixed three of those but grew five others and raised corpus
-  probes from 179.6 million to 9.26 billion.
+  watchdog was ruled out as the cause on the committed-conflict build
+  (1b7389cae, where the growers were 8424, 12534 and 12130): feeding it
+  clause conflicts or clause-forced cells changed nothing, and disabling it
+  under learning fixed those three but grew five others and raised that
+  build's corpus probes from 179.6 million to 9.26 billion.
 
 | knob | what it changes |
 |---|---|
@@ -309,19 +310,19 @@ core, explored fraction / solutions counted:
 | 13480 | 10.55% / 13.3 billion | 10.547% / 351,219,980 | 8.594% / 79,012,143 |
 
 `--learn` stays a flag and does not ship as the default. Every corpus
-puzzle measured pays 9 to 30 times the instructions, the 300 s sweep gains
-no explored fraction that matters (12548's rises from 0.000016% to
+puzzle measured pays 8.6 to 30 times the instructions, the 300 s sweep
+gains no explored fraction that matters (12548's rises from 0.000016% to
 0.0000767% and its count from 2.2 million to 30.5 million, while the counts
 of the other four fall by a factor of 3 on 9892 and of 7 to 170 on the
-rest), and four corpus puzzles gain nodes, two of them by half or more. The tree reduction (-26%
-nodes, -59% probes) shows that the clauses prune; the instruction counts
-show that phase 1 pays for them with an average learned clause of 70
-literals and a line-automaton rerun per explained trail entry. The levers,
-in the order the reviews ranked them: recursive minimisation of learned
-clauses (design §3.4), sharing one line-content build across the entries of
-a line during analysis, resolving probe clauses past the 1UIP to the pixel,
-skipping the analysis inside region searches (sound, not tree-neutral), and
-an empty-store early-out in the clause pass. Phase 2 (backjumping,
+rest), and four corpus puzzles gain nodes, two of them by half or more.
+The tree reduction (-26% nodes, -59% probes) shows that the clauses prune;
+the instruction counts show that phase 1 pays for them with an average
+learned clause of 70 literals and a line-automaton rerun per explained
+trail entry. The levers, in the order the reviews ranked them: recursive
+minimisation of learned clauses (design §3.4), sharing one line-content
+build across the entries of a line during analysis, resolving probe
+clauses past the 1UIP to the pixel, and skipping the analysis inside
+region searches (sound, not tree-neutral). Phase 2 (backjumping,
 activity-based decisions) has no signal behind it yet. The design and its
 post-implementation corrections are in
 `cpp/bench/clause-learning-design-2026-09-23.md`.
