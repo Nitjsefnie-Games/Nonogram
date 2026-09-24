@@ -821,6 +821,12 @@ std::vector<std::uint16_t> g_col_tags;
 // FastLineCache::tag_mul of each line's tag (see hash_tm).
 std::vector<std::uint64_t> g_row_tagmul;
 std::vector<std::uint64_t> g_col_tagmul;
+// What settling a cell of line i to value v xors into the cell's cross
+// line's key: (UNKNOWN ^ v) << 2 * (i & 31), at [2 * i + v]. The same for a
+// row and a column of the same index, so one table serves both. Written
+// per cell by write_intersection_many, which loads it by the value instead
+// of shifting, so its loop holds no shift count.
+std::vector<std::uint64_t> g_cross_xor;
 
 // Each line's tag (its spec id, columns flagged) and the tag's hash multiply.
 void set_line_tags(const std::vector<const LineSpec*>& mapped_rows, const std::vector<const LineSpec*>& mapped_cols) {
@@ -835,6 +841,12 @@ void set_line_tags(const std::vector<const LineSpec*>& mapped_rows, const std::v
     for (std::size_t i = 0; i < mapped_cols.size(); ++i) {
         g_col_tags[i] = static_cast<std::uint16_t>(mapped_cols[i]->id * 2 + g_tag_col_bit);
         g_col_tagmul[i] = FastLineCache::tag_mul(g_col_tags[i]);
+    }
+    const std::size_t lines = std::max(mapped_rows.size(), mapped_cols.size());
+    g_cross_xor.resize(2 * lines);
+    for (std::size_t i = 0; i < lines; ++i) {
+        g_cross_xor[2 * i] = static_cast<std::uint64_t>(UNKNOWN ^ EMPTY) << (2 * (i & 31));
+        g_cross_xor[2 * i + 1] = static_cast<std::uint64_t>(UNKNOWN ^ FULL) << (2 * (i & 31));
     }
 }
 
@@ -991,6 +1003,15 @@ struct Trail {
 // Trail entries carry (row, col) rather than a linear index so a revert can
 // update the packed line keys without a division to recover the row.
 inline int trail_pack(int row, int col) { return (row << 16) | col; }
+
+// x << (n mod 64). The shift instruction masks its count to six bits by
+// itself; spelling the mask in C++ left the compiler an `and` per cell in
+// the write loops (it does not fold the mask into shlx's count).
+inline std::uint64_t shl_mod64(std::uint64_t x, std::uint64_t n) {
+    std::uint64_t r;
+    asm("shlx %2, %1, %0" : "=r"(r) : "r"(x), "r"(n));
+    return r;
+}
 inline int trail_row(int e) { return e >> 16; }
 inline int trail_col(int e) { return e & 0xFFFF; }
 
@@ -1778,38 +1799,64 @@ void write_intersection_many(Iter first, Iter last, Pos pos_of, Val val_of,
     const std::size_t li = static_cast<std::size_t>(line_index);
     // This line's word and shift in the cross-direction keys.
     const std::size_t lw = KW == 1 ? 0 : li >> 5;
-    const int lsh = 2 * (line_index & 31);
     // The line's base in pixels (rows are contiguous, columns strided by W),
     // in its own keys, and the cross direction's key base, dirty flags and
     // queue.
     const std::size_t W = static_cast<std::size_t>(pic.width());
     std::int8_t* const px = pic.pixels.data() + (IS_ROW ? li * W : li);
-    std::uint64_t* const own = (IS_ROW ? pic.row_keys : pic.col_keys).data() + li * kw;
-    std::uint64_t* const cross = (IS_ROW ? pic.col_keys : pic.row_keys).data() + lw;
+    std::uint64_t* own = (IS_ROW ? pic.row_keys : pic.col_keys).data() + li * kw;
+    std::uint64_t* cross = (IS_ROW ? pic.col_keys : pic.row_keys).data() + lw;
+    // One register each: left to itself the compiler keeps the key
+    // vector's base and the line's word offset apart and adds them per
+    // cell, and the two offsets were what the 2-word loop spilled.
+    asm("" : "+r"(own), "+r"(cross));
     std::uint8_t* const dirty = (IS_ROW ? pic.col_dirty : pic.row_dirty).data();
     FifoQueue& queue = IS_ROW ? pic.col_queue : pic.row_queue;
     int* const qbuf = queue.data();
     int* qp = qbuf + queue.tail();  // one cursor, not a buffer and a tail
+    // The trail entry's fixed half (trail_pack: row << 16 | col).
+    const unsigned lpack = IS_ROW ? static_cast<unsigned>(line_index) << 16 : static_cast<unsigned>(line_index);
+    // The cross key's xor for each value (see g_cross_xor): a load indexed
+    // by the value instead of a shift, so the loop holds no shift count
+    // and has a register for the cross word offset. Copied to the stack,
+    // whose base is free to address; a pointer into the global table cost
+    // a register and put two values per cell back on the stack.
+    std::uint64_t xcross[2];
+    std::memcpy(xcross, g_cross_xor.data() + 2 * li, sizeof xcross);
     // Not unrolled: most lines settle one or two cells, and the loop is
     // register-tight (the 3-word instantiation spilled three values per
-    // cell when unrolled by two).
+    // cell when unrolled by two). Everything below is unsigned so that no
+    // sign extension is emitted: the position is 7 bits and the value one.
 #pragma GCC unroll 1
     for (; first != last; ++first, ++tp) {
-        const int pos = pos_of(*first);  // the cell's index along this line
-        const std::int8_t v = val_of(*first);
-        const std::uint64_t x = static_cast<std::uint64_t>(static_cast<int>(UNKNOWN) ^ static_cast<int>(v));
-        px[IS_ROW ? static_cast<std::size_t>(pos) : static_cast<std::size_t>(pos) * W] = v;
-        // KW == 1: every line is at most 32 cells, so pos >> 5 is 0 and
-        // pos & 31 is pos.
-        own[KW == 1 ? 0 : pos >> 5] ^= x << (KW == 1 ? 2 * pos : 2 * (pos & 31));
-        cross[static_cast<std::size_t>(pos) * kw] ^= x << lsh;
-        *qp = pos;
-        qp += !dirty[pos];
-        dirty[pos] = 1;
-        const int row = IS_ROW ? line_index : pos;
-        const int col = IS_ROW ? pos : line_index;
-        *tp = trail_pack(row, col);
-        if (stamp) stamp_cell(row, col);
+        const unsigned pos = static_cast<unsigned>(pos_of(*first));  // the cell's index along this line
+        // The value as a word, not a byte: val_of's byte type had the
+        // compiler compute in 8 bits and widen again before the shift.
+        const unsigned v = static_cast<unsigned>(val_of(*first));
+        const std::size_t p = pos;
+        // UNKNOWN ^ v with v in {EMPTY, FULL} = {0, 1}: 2 | v.
+        const std::uint64_t x = v | 2u;
+        px[IS_ROW ? p : p * W] = static_cast<std::int8_t>(v);
+        // The key shift 2 * (pos & 31) is 2 * pos mod 64 (shl_mod64), and
+        // 2 * pos is also the cross key's word offset when KW == 2.
+        std::size_t pos2 = 2 * p;
+        // Opaque, so the cross index below reuses the register rather
+        // than recomputing the offset from pos with a copy and a shift.
+        if (KW == 2) asm("" : "+r"(pos2));
+        own[KW == 1 ? 0 : p >> 5] ^= shl_mod64(x, pos2);
+        cross[KW == 2 ? pos2 : p * kw] ^= xcross[v];
+        *qp = static_cast<int>(pos);
+        // The flags are only ever 0 or 1 (every writer stores a literal),
+        // so 1 - dirty is d ^ 1: a load and a xor, not a compare and a set.
+        std::size_t d = dirty[p];
+        asm("" : "+r"(d));  // as for v: the xor stays a word operation
+        dirty[p] = 1;
+        qp += d ^ 1;
+        // A row entry is an add (one lea, pos stays live for the flags), a
+        // column entry a shift and an or.
+        *tp = static_cast<int>(IS_ROW ? lpack + pos : (pos << 16) | lpack);
+        if (stamp) stamp_cell(IS_ROW ? line_index : static_cast<int>(pos),
+                              IS_ROW ? static_cast<int>(pos) : line_index);
     }
     queue.set_tail(static_cast<std::size_t>(qp - qbuf));
     pic.unknown_count -= static_cast<int>(n);
@@ -1827,7 +1874,14 @@ void write_intersection(const BatchResult& r, int line_index, Picture& pic, Trai
         const std::uint8_t* d = static_cast<const std::uint8_t*>(r.ded);
         write_intersection_impl<KW, IS_ROW>(d, d + r.n8,
                                             [](std::uint8_t b) { return static_cast<int>(b & 0x7F); },
-                                            [](std::uint8_t b) { return static_cast<std::int8_t>(b >> 7); },
+                                            [](std::uint8_t b) {
+                                                // A word copy behind a barrier: the compiler
+                                                // otherwise shifts the byte in 8 bits and
+                                                // widens the result again for the key xor.
+                                                unsigned w = b;
+                                                asm("" : "+r"(w));
+                                                return w >> 7;
+                                            },
                                             line_index, pic, trail);
     } else {
         const auto* v = static_cast<const std::vector<int>*>(r.ded);
