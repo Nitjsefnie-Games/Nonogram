@@ -837,6 +837,10 @@ constexpr std::uint64_t kUnknownBits = 0xAAAAAAAAAAAAAAAAULL;
 // 16-byte record cost the 3-word drain a shift per index.
 std::vector<std::uint64_t> g_row_tag;
 std::vector<std::uint64_t> g_col_tag;
+// Per line (rows, then columns at H + c), the line solver's sweep memo
+// (LineSweepMemo) and the arena its state arrays live in.
+std::vector<LineSweepMemo> g_line_memo;
+std::vector<std::uint64_t> g_line_memo_arena;
 // What settling a cell of line i to value v xors into the cell's cross
 // line's key: (UNKNOWN ^ v) << 2 * (i & 31), at [2 * i + v]. The same for a
 // row and a column of the same index, so one table serves both. Written
@@ -852,6 +856,21 @@ void set_line_tags(const std::vector<const LineSpec*>& mapped_rows, const std::v
     g_col_tag.resize(mapped_cols.size());
     for (std::size_t i = 0; i < mapped_cols.size(); ++i)
         g_col_tag[i] = FastLineCache::tag_mul(static_cast<std::uint16_t>(mapped_cols[i]->id * 2 + g_tag_col_bit));
+    // The sweep memos: a row has W cells, a column H, n + 1 words of
+    // forward and of backward states each. Invalid until the line's first
+    // solve; content-checked against the key after that.
+    const std::size_t H = mapped_rows.size(), W = mapped_cols.size();
+    g_line_memo.assign(H + W, LineSweepMemo{});
+    g_line_memo_arena.assign(2 * (H * (W + 1) + W * (H + 1)), 0);
+    std::uint64_t* p = g_line_memo_arena.data();
+    for (std::size_t i = 0; i < H; ++i) {
+        g_line_memo[i].fwd = p; p += W + 1;
+        g_line_memo[i].bwd = p; p += W + 1;
+    }
+    for (std::size_t i = 0; i < W; ++i) {
+        g_line_memo[H + i].fwd = p; p += H + 1;
+        g_line_memo[H + i].bwd = p; p += H + 1;
+    }
     const std::size_t lines = std::max(mapped_rows.size(), mapped_cols.size());
     g_cross_xor.resize(2 * lines);
     for (std::size_t i = 0; i < lines; ++i) {
@@ -1698,7 +1717,9 @@ BatchResult solve_one_batch_legacy(const LineSpec& spec,
     std::uint64_t any = 0;
     for (int w = 0; w < pic.key_words; ++w) any |= key[w];
     const bool has_unknown = (any & kUnknownBits) != 0;
-    solve_line_batch(line, stride, line_n, key, spec, res, has_unknown);
+    LineSweepMemo* const memo = &g_line_memo[is_col ? static_cast<std::size_t>(pic.height()) + static_cast<std::size_t>(index)
+                                                    : static_cast<std::size_t>(index)];
+    solve_line_batch(line, stride, line_n, key, spec, res, has_unknown, memo);
     return g_fast_cache.insert(key, tag, res);
 }
 

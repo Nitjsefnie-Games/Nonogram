@@ -131,7 +131,7 @@ namespace {
 void solve_line_batch_1w(const std::int8_t* line, std::size_t stride, std::size_t n,
                          const std::uint64_t* key,
                          const LineSpec& spec, LineSolveResult& result,
-                         bool has_unknown) {
+                         bool has_unknown, LineSweepMemo* memo) {
     const std::size_t len_states = spec.len_states;
     const std::uint64_t sv = spec.state_valid[0];
     const std::uint64_t em = spec.empty_mask[0];
@@ -142,6 +142,31 @@ void solve_line_batch_1w(const std::int8_t* line, std::size_t stride, std::size_
 
     g_scratch.ensure(n + 1, 1);
     std::uint64_t* fwd = g_scratch.forward.data();
+    std::uint64_t* bwd = g_scratch.backward.data();
+    // With a memo the states live in the line's own arrays, and the sweeps
+    // resume past the cells unchanged since the line's last solve: fwd[p]
+    // depends on the cells before p, so it holds for p up to the first
+    // changed cell (and the memo's fv); bwd[p] on the cells from p on, so
+    // it holds from one past the last changed cell (and the memo's bv).
+    std::size_t fwd_from = 0, bwd_from = n;
+    const std::size_t kwords = (n + 31) / 32;
+    if (memo != nullptr && key != nullptr) {
+        fwd = memo->fwd;
+        bwd = memo->bwd;
+        if (memo->valid) {
+            std::size_t first_diff = n, last_diff1 = 0;  // last_diff1: one past the last changed cell
+            for (std::size_t w = 0; w < kwords; ++w) {
+                const std::uint64_t d = key[w] ^ memo->key[w];
+                if (d) { first_diff = 32 * w + (static_cast<std::size_t>(__builtin_ctzll(d)) >> 1); break; }
+            }
+            for (std::size_t w = kwords; w-- > 0; ) {
+                const std::uint64_t d = key[w] ^ memo->key[w];
+                if (d) { last_diff1 = 32 * w + (63 - static_cast<std::size_t>(__builtin_clzll(d))) / 2 + 1; break; }
+            }
+            fwd_from = std::min<std::size_t>(memo->fv, first_diff);
+            bwd_from = std::max<std::size_t>(memo->bv, last_diff1);
+        }
+    }
 
     // Per-cell-value mask tables make both DP sweeps branch-free: the cell
     // values along a line are data-dependent and mispredict badly otherwise.
@@ -152,21 +177,60 @@ void solve_line_batch_1w(const std::int8_t* line, std::size_t stride, std::size_
     const std::uint64_t stay[3] = {em, 0, em};
     const std::uint64_t step[3] = {em, fm, sv};
 
-    fwd[0] = 1ULL;
-    for (std::size_t p = 0; p < n; ++p) {
+    std::uint64_t accept = 1ULL << (len_states - 1);
+    if (len_states >= 2) accept |= 1ULL << (len_states - 2);
+
+    // First and last unknown cell, from the key words or the bytes. A line
+    // is satisfiable iff some state at a position is reached by a valid
+    // prefix and completed by a valid suffix, at any position, so the
+    // forward sweep needs to reach only the last unknown cell and the
+    // backward one only the first: the known head and tail, most of a
+    // line by the time it is re-solved, are swept once each instead of
+    // twice, and the test is at lu + 1 rather than at n. A line without
+    // unknowns keeps the full forward sweep and the accept test.
+    std::size_t fu = n, lu = 0;
+    if (has_unknown) {
+        if (key != nullptr) {
+            const std::size_t kwords = (n + 31) / 32;
+            for (std::size_t w = 0; w < kwords; ++w) {
+                const std::uint64_t m = key[w] & 0xAAAAAAAAAAAAAAAAULL;
+                if (m) { fu = 32 * w + (static_cast<std::size_t>(__builtin_ctzll(m)) >> 1); break; }
+            }
+            for (std::size_t w = kwords; w-- > 0; ) {
+                const std::uint64_t m = key[w] & 0xAAAAAAAAAAAAAAAAULL;
+                if (m) { lu = 32 * w + (63 - static_cast<std::size_t>(__builtin_clzll(m))) / 2; break; }
+            }
+        } else {
+            for (std::size_t p = 0; p < n; ++p) if (line[p * stride] == UNKNOWN) { fu = p; break; }
+            for (std::size_t p = n; p-- > 0; ) if (line[p * stride] == UNKNOWN) { lu = p; break; }
+        }
+    }
+    if (fu >= n) {
+        // No unknown cell (or none promised): the whole line, validity only.
+        if (fwd_from == 0) fwd[0] = 1ULL;
+        for (std::size_t p = fwd_from; p < n; ++p) {
+            const std::uint64_t cur = fwd[p];
+            const int v = line[p * stride];
+            fwd[p + 1] = (cur & stay[v]) | ((cur << 1) & step[v]);
+        }
+        if (memo != nullptr && key != nullptr) {
+            memo->fv = static_cast<std::uint32_t>(n);
+            memo->bv = static_cast<std::uint32_t>(bwd_from);  // untouched, valid as far as it was
+            for (std::size_t w = 0; w < kwords; ++w) memo->key[w] = key[w];
+            memo->valid = true;
+        }
+        if ((fwd[n] & accept) == 0) {
+            return;  // unsat
+        }
+        result.total = 1;  // nothing to deduce
+        return;
+    }
+
+    if (fwd_from == 0) fwd[0] = 1ULL;
+    for (std::size_t p = fwd_from; p <= lu; ++p) {
         const std::uint64_t cur = fwd[p];
         const int v = line[p * stride];
         fwd[p + 1] = (cur & stay[v]) | ((cur << 1) & step[v]);
-    }
-
-    std::uint64_t accept = 1ULL << (len_states - 1);
-    if (len_states >= 2) accept |= 1ULL << (len_states - 2);
-    if ((fwd[n] & accept) == 0) {
-        return;  // unsat
-    }
-    if (!has_unknown) {
-        result.total = 1;  // nothing to deduce
-        return;
     }
 
     // Backward sweep, stored: bwd[p] is the state set before cell p, so a
@@ -181,13 +245,25 @@ void solve_line_batch_1w(const std::int8_t* line, std::size_t stride, std::size_
     // the sweep alone, on lines whose cells are mostly known by the time
     // they are re-solved (hard/3867: 2,970 instructions per line solve,
     // 23% of the budget, two thirds of it in that loop).
-    std::uint64_t* bwd = g_scratch.backward.data();
-    std::uint64_t cur = accept;
-    bwd[n] = cur;
-    for (std::size_t pi = n; pi-- > 0; ) {
+    if (bwd_from == n) bwd[n] = accept;
+    std::uint64_t cur = bwd[bwd_from];
+    for (std::size_t pi = bwd_from; pi-- > fu + 1; ) {
         const int v = line[pi * stride];
         cur = (cur & stay[v]) | ((cur & step[v]) >> 1);
         bwd[pi] = cur;
+    }
+    if (memo != nullptr && key != nullptr) {
+        // What the arrays now hold for this key: fwd up to lu + 1 (or
+        // further, where the resume point already was), bwd from fu + 1.
+        memo->fv = static_cast<std::uint32_t>(std::max<std::size_t>(fwd_from, lu + 1));
+        memo->bv = static_cast<std::uint32_t>(std::min<std::size_t>(bwd_from, fu + 1));
+        for (std::size_t w = 0; w < kwords; ++w) memo->key[w] = key[w];
+        memo->valid = true;
+    }
+    // Both sweeps meet at lu + 1: a state there reached from both ends is
+    // a satisfying line (the same test the full sweeps made at n).
+    if ((fwd[lu + 1] & bwd[lu + 1]) == 0) {
+        return;  // unsat
     }
 
     int* out = g_scratch.ded_buf(n);
@@ -323,7 +399,7 @@ void solve_line_batch(const std::int8_t* line, std::size_t n,
 void solve_line_batch(const std::int8_t* line, std::size_t stride, std::size_t n,
                       const std::uint64_t* key,
                       const LineSpec& spec, LineSolveResult& result,
-                      bool has_unknown) {
+                      bool has_unknown, LineSweepMemo* memo) {
     const std::size_t len_states = spec.len_states;
     const std::size_t n_words = spec.n_words;
 
@@ -336,7 +412,7 @@ void solve_line_batch(const std::int8_t* line, std::size_t stride, std::size_t n
     }
 
     if (n_words == 1) {
-        solve_line_batch_1w(line, stride, n, key, spec, result, has_unknown);
+        solve_line_batch_1w(line, stride, n, key, spec, result, has_unknown, memo);
         return;
     }
     // The wider paths read a contiguous line: a strided one is gathered.

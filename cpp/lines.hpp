@@ -39,6 +39,18 @@ struct LineSpec {
 
 LineSpec make_line_spec(const std::vector<int>& clue);
 
+// A line's last sweeps, so its next solve resumes them past the cells that
+// did not change (see solve_line_batch_1w): fwd is valid for positions
+// [0, fv] and bwd for [bv, n] under the key words kept here. The arrays
+// are per line, n + 1 words each, owned by the caller.
+struct LineSweepMemo {
+    std::uint64_t* fwd = nullptr;
+    std::uint64_t* bwd = nullptr;
+    std::uint64_t key[4] = {};
+    std::uint32_t fv = 0, bv = 0;
+    bool valid = false;
+};
+
 // Solves one line into `out` (cleared first; its capacity is reused across
 // calls so a miss performs no heap allocation).
 // has_unknown = false promises the line has no UNKNOWN cell; then only the
@@ -49,7 +61,9 @@ void solve_line_batch(const std::int8_t* line, std::size_t n,
 // Cell p is line[p * stride], so a column is read in place; key is the
 // line's packed key (2 bits per cell, digit 2 = UNKNOWN, one word per 32
 // cells), which supplies the unknown mask without a pass over the cells.
+// memo, when given with a key, resumes the one-word path's sweeps from the
+// line's previous solve.
 void solve_line_batch(const std::int8_t* line, std::size_t stride, std::size_t n,
                       const std::uint64_t* key,
                       const LineSpec& spec, LineSolveResult& out,
-                      bool has_unknown);
+                      bool has_unknown, LineSweepMemo* memo = nullptr);
