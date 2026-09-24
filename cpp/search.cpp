@@ -743,6 +743,23 @@ public:
 
     template <int KW = 0>
     bool keys_equal(const unsigned char* s, const std::uint64_t* key) const {
+        // Two words at a time in a vector register: a 16-byte load, an
+        // xor and a zero test where the scalar loop had two loads, two
+        // xors and an or (the 3-word compare was 6.8 instructions per
+        // lookup on hard/3867).
+        if (KW == 2 || KW == 3 || KW == 4) {
+            __m128i d = _mm_xor_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(s)),
+                                      _mm_loadu_si128(reinterpret_cast<const __m128i*>(key)));
+            if (KW == 4) {
+                d = _mm_or_si128(d, _mm_xor_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(s + 16)),
+                                                  _mm_loadu_si128(reinterpret_cast<const __m128i*>(key + 2))));
+            } else if (KW == 3) {
+                std::uint64_t v;
+                std::memcpy(&v, s + 16, 8);
+                d = _mm_or_si128(d, _mm_cvtsi64_si128(static_cast<long long>(v ^ key[2])));
+            }
+            return _mm_testz_si128(d, d) != 0;
+        }
         const int kw = KW > 0 ? KW : kw_;
         std::uint64_t diff = 0;
         for (int w = 0; w < kw; ++w) {
