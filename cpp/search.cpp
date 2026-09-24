@@ -2023,8 +2023,8 @@ bool propagate_t(const std::vector<const LineSpec*>& mapped_rows,
                  Picture& pic,
                  Trail& trail) {
     while (pic.has_dirty()) {
-        if (!solve_lines<FAST, KW>(mapped_rows, pic, true, trail)) return false;
-        if (!solve_lines<FAST, KW>(mapped_cols, pic, false, trail)) return false;
+        if (!pic.row_queue.empty() && !solve_lines<FAST, KW>(mapped_rows, pic, true, trail)) return false;
+        if (!pic.col_queue.empty() && !solve_lines<FAST, KW>(mapped_cols, pic, false, trail)) return false;
     }
     return true;
 }
