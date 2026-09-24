@@ -1948,9 +1948,14 @@ std::uint64_t g_stat_probe_skips = 0;  // probes the bounds made unnecessary
 // member version reloaded the width, the key word count and the pixel and
 // key buffers after the pixel byte store (36 instructions per cell in
 // revert_branch's loop, five of them reloads).
-inline void unset_cells(Picture& pic, const int* first, const int* last) {
+// KW: the key word count when it is 1..4, else 0 (runtime). With one word
+// every row and column index is below 32, so the word index and the
+// shift's mask fold away (easy_medium/12130: 27.9 million reverted cells,
+// 10.5% of the run in this loop).
+template <int KW>
+inline void unset_cells_t(Picture& pic, const int* first, const int* last) {
     const std::size_t W = static_cast<std::size_t>(pic.width());
-    const std::size_t kw = static_cast<std::size_t>(pic.key_words);
+    const std::size_t kw = KW > 0 ? static_cast<std::size_t>(KW) : static_cast<std::size_t>(pic.key_words);
     std::int8_t* const px = pic.pixels.data();
     std::uint64_t* const rk = pic.row_keys.data();
     std::uint64_t* const ck = pic.col_keys.data();
@@ -1960,9 +1965,19 @@ inline void unset_cells(Picture& pic, const int* first, const int* last) {
         const std::size_t col = static_cast<std::size_t>(trail_col(e));
         std::int8_t& cell = px[row * W + col];
         const std::uint64_t x = static_cast<std::uint64_t>(static_cast<int>(UNKNOWN) ^ static_cast<int>(cell));
-        rk[row * kw + (col >> 5)] ^= x << (2 * (col & 31));
-        ck[col * kw + (row >> 5)] ^= x << (2 * (row & 31));
+        rk[row * kw + (KW == 1 ? 0 : col >> 5)] ^= x << (KW == 1 ? 2 * col : 2 * (col & 31));
+        ck[col * kw + (KW == 1 ? 0 : row >> 5)] ^= x << (KW == 1 ? 2 * row : 2 * (row & 31));
         cell = UNKNOWN;
+    }
+}
+
+inline void unset_cells(Picture& pic, const int* first, const int* last) {
+    switch (pic.key_words) {
+        case 1: unset_cells_t<1>(pic, first, last); break;
+        case 2: unset_cells_t<2>(pic, first, last); break;
+        case 3: unset_cells_t<3>(pic, first, last); break;
+        case 4: unset_cells_t<4>(pic, first, last); break;
+        default: unset_cells_t<0>(pic, first, last); break;
     }
 }
 
