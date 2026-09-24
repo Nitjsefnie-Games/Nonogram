@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -141,36 +142,62 @@ void solve_line_batch_1w(const std::int8_t* line, std::size_t n,
         return;
     }
 
-    // Backward sweep fused with the deduction pass: at position p the sweep
-    // holds bwd[p+1] (cur) and fwd[p] is already stored, which is all a
-    // deduction needs, so the third pass over the line goes away. The
-    // backward state itself only needs to be kept in a register.
+    // Backward sweep, stored: bwd[p] is the state set before cell p, so a
+    // deduction at p needs fwd[p] and bwd[p + 1], both in memory.
     //
-    // Deductions are collected branch-free: every cell writes a candidate
-    // into the next slot of a scratch buffer and the cursor advances only
-    // for an UNKNOWN cell that is determined (exactly one of can_empty /
-    // can_full). The sweep runs high-to-low, so they land in descending
-    // position order and are copied out reversed into the ascending order
-    // consumers expect. (Sizing the result vector to n first zero-filled n
-    // ints per line solve: 4% of a 90 x 69 count run in memset.)
-    int* out = g_scratch.ded_buf(n);
-    std::size_t k = 0;
+    // The deduction test then runs over the UNKNOWN cells only, walking the
+    // set bits of the line's unknown mask in ascending order, so the
+    // deductions land in the order consumers expect with no reversal. The
+    // earlier form fused the test into the sweep and evaluated it for every
+    // cell branch-free (a candidate written per cell, the cursor advanced
+    // for a determined unknown): 29 instructions per cell against 6 for
+    // the sweep alone, on lines whose cells are mostly known by the time
+    // they are re-solved (hard/3867: 2,970 instructions per line solve,
+    // 23% of the budget, two thirds of it in that loop).
+    std::uint64_t* bwd = g_scratch.backward.data();
     std::uint64_t cur = accept;
+    bwd[n] = cur;
     for (std::size_t pi = n; pi-- > 0; ) {
         const int v = line[pi];
-        const std::uint64_t f = fwd[pi];
-        const std::uint64_t bw_empty = cur & em;
-        const std::uint64_t bw_full = cur & fm;
-        const int can_empty = (f & (bw_empty | (bw_empty >> 1))) != 0;
-        const int can_full = (f & (bw_full >> 1)) != 0;
-        // FULL iff can_full (when determined, exactly one is set).
-        out[k] = deduce_pack(static_cast<int>(pi), static_cast<std::int8_t>(can_full));
-        k += static_cast<std::size_t>((v == UNKNOWN) & (can_empty ^ can_full));
         cur = (cur & stay[v]) | ((cur & step[v]) >> 1);
+        bwd[pi] = cur;
     }
-    result.deductions.resize(k);
-    int* d = result.deductions.data();
-    for (std::size_t i = 0; i < k; ++i) d[i] = out[k - 1 - i];
+
+    int* out = g_scratch.ded_buf(n);
+    std::size_t k = 0;
+    // The unknown mask of the line's next 64 cells, from 8 cells at a time:
+    // a cell is UNKNOWN (2) iff its byte XOR 2 is zero; the exact zero-byte
+    // test leaves 0x80 in each such byte and 0 elsewhere, and the multiply
+    // gathers those eight bits into the top byte in cell order.
+    for (std::size_t base = 0; base < n; base += 64) {
+        const std::size_t end = std::min(n, base + 64);
+        std::uint64_t um = 0;
+        std::size_t p = base;
+        for (; p + 8 <= end; p += 8) {
+            std::uint64_t x;
+            std::memcpy(&x, line + p, 8);
+            const std::uint64_t t = x ^ 0x0202020202020202ULL;
+            const std::uint64_t nz = (((t & 0x7F7F7F7F7F7F7F7FULL) + 0x7F7F7F7F7F7F7F7FULL) | t) & 0x8080808080808080ULL;
+            const std::uint64_t z = nz ^ 0x8080808080808080ULL;
+            um |= ((z * 0x0002040810204081ULL) >> 56) << (p - base);
+        }
+        for (; p < end; ++p) um |= static_cast<std::uint64_t>(line[p] == UNKNOWN) << (p - base);
+        while (um != 0) {
+            const std::size_t pos = base + static_cast<std::size_t>(__builtin_ctzll(um));
+            um &= um - 1;
+            const std::uint64_t f = fwd[pos];
+            const std::uint64_t b = bwd[pos + 1];
+            const std::uint64_t bw_empty = b & em;
+            const std::uint64_t bw_full = b & fm;
+            const int can_empty = (f & (bw_empty | (bw_empty >> 1))) != 0;
+            const int can_full = (f & (bw_full >> 1)) != 0;
+            // FULL iff can_full (when determined, exactly one is set); the
+            // candidate is written branch-free and kept only when determined.
+            out[k] = deduce_pack(static_cast<int>(pos), static_cast<std::int8_t>(can_full));
+            k += static_cast<std::size_t>(can_empty ^ can_full);
+        }
+    }
+    result.deductions.assign(out, out + k);
     result.total = 1;
 }
 
