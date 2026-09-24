@@ -1820,10 +1820,8 @@ inline void write_intersection_impl(Iter first, Iter last, Pos pos_of, Val val_o
     const std::uint64_t x = static_cast<std::uint64_t>(static_cast<int>(UNKNOWN) ^ static_cast<int>(v));
     const std::size_t p = static_cast<std::size_t>(pos);
     pic.pixels.data()[IS_ROW ? li * W + p : p * W + li] = v;
-    (IS_ROW ? pic.row_keys : pic.col_keys).data()[li * kw + (KW == 1 ? 0 : p >> 5)] ^=
-        x << (KW == 1 ? 2 * pos : 2 * (pos & 31));
-    (IS_ROW ? pic.col_keys : pic.row_keys).data()[p * kw + (KW == 1 ? 0 : li >> 5)] ^=
-        x << (2 * (line_index & 31));
+    (IS_ROW ? pic.row_keys : pic.col_keys).data()[li * kw + (KW == 1 ? 0 : p >> 5)] ^= shl_mod64(x, 2 * p);
+    (IS_ROW ? pic.col_keys : pic.row_keys).data()[p * kw + (KW == 1 ? 0 : li >> 5)] ^= shl_mod64(x, 2 * li);
     std::uint8_t* const dirty = (IS_ROW ? pic.col_dirty : pic.row_dirty).data();
     (IS_ROW ? pic.col_queue : pic.row_queue).push_back_if(pos, !dirty[pos]);
     dirty[pos] = 1;
@@ -2124,13 +2122,16 @@ inline void unset_cells_t(Picture& pic, const int* first, const int* last) {
     std::uint64_t* const rk = pic.row_keys.data();
     std::uint64_t* const ck = pic.col_keys.data();
     while (last != first) {
-        const int e = *--last;
-        const std::size_t row = static_cast<std::size_t>(trail_row(e));
-        const std::size_t col = static_cast<std::size_t>(trail_col(e));
+        // Unsigned: the row is a logical shift with no sign extension after
+        // it, and the shift counts go to shlx unmasked (shl_mod64) -- the
+        // masks and the extension were 3 of the loop's 30 instructions.
+        const std::uint32_t e = static_cast<std::uint32_t>(*--last);
+        const std::size_t row = e >> 16;
+        const std::size_t col = e & 0xFFFFu;
         std::int8_t& cell = px[row * W + col];
         const std::uint64_t x = static_cast<std::uint64_t>(static_cast<int>(UNKNOWN) ^ static_cast<int>(cell));
-        rk[row * kw + (KW == 1 ? 0 : col >> 5)] ^= x << (KW == 1 ? 2 * col : 2 * (col & 31));
-        ck[col * kw + (KW == 1 ? 0 : row >> 5)] ^= x << (KW == 1 ? 2 * row : 2 * (row & 31));
+        rk[row * kw + (KW == 1 ? 0 : col >> 5)] ^= shl_mod64(x, 2 * col);
+        ck[col * kw + (KW == 1 ? 0 : row >> 5)] ^= shl_mod64(x, 2 * row);
         cell = UNKNOWN;
     }
 }
