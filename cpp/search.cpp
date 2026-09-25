@@ -1915,9 +1915,10 @@ inline BatchResult solve_one_batch(const std::vector<const LineSpec*>& mapped,
     }
     const int n = s[hdr + 2];
     if (g_debug_stats) { if (n == 0) ++g_stat_noded; else ++g_stat_ded; }
-    const std::uint8_t* ded = (flags & kFlagSpilled)
-        ? g_fast_cache.arena() + load_u32(s + hdr + 4)
-        : s + hdr + 4;
+    // Spilled deductions are rare (more than the slot's inline bytes):
+    // a branch, not a select that loads the arena's base on every hit.
+    const std::uint8_t* ded = s + hdr + 4;
+    if (__builtin_expect(flags & kFlagSpilled, 0)) ded = g_fast_cache.arena() + load_u32(s + hdr + 4);
     return BatchResult{ded, n, true};
 }
 
