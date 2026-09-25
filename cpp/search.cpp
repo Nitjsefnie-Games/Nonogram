@@ -745,9 +745,11 @@ public:
                 d = _mm_or_si128(d, _mm_xor_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(s + 16)),
                                                   _mm_loadu_si128(reinterpret_cast<const __m128i*>(key + 2))));
             } else if (KW == 3) {
-                std::uint64_t v;
-                std::memcpy(&v, s + 16, 8);
-                d = _mm_or_si128(d, _mm_cvtsi64_si128(static_cast<long long>(v ^ key[2])));
+                // Words 1 and 2 as a second, overlapping 16-byte compare:
+                // two loads and a xor where the word alone was a load, a
+                // xor and a move into the vector.
+                d = _mm_or_si128(d, _mm_xor_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(s + 8)),
+                                                  _mm_loadu_si128(reinterpret_cast<const __m128i*>(key + 1))));
             }
             return _mm_testz_si128(d, d) != 0;
         }
