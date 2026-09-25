@@ -151,9 +151,16 @@ void solve_line_batch_1w(const std::int8_t* line, std::size_t stride, std::size_
     result.deductions.clear();
     result.total = 0;
 
-    g_scratch.ensure(n + 1, 1);
-    std::uint64_t* fwd = g_scratch.forward.data();
-    std::uint64_t* bwd = g_scratch.backward.data();
+    // The scratch arrays serve a solve without a memo; with one the states
+    // live in the line's own arrays (below), and the scratch's seven size
+    // checks were 41 instructions of every miss (hard/3867: 19 million).
+    std::uint64_t* fwd = nullptr;
+    std::uint64_t* bwd = nullptr;
+    if (memo == nullptr || key == nullptr) {
+        g_scratch.ensure(n + 1, 1);
+        fwd = g_scratch.forward.data();
+        bwd = g_scratch.backward.data();
+    }
     // With a memo the states live in the line's own arrays, and the sweeps
     // resume past the cells unchanged since the line's last solve: fwd[p]
     // depends on the cells before p, so it holds for p up to the first
