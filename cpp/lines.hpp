@@ -35,6 +35,14 @@ struct LineSpec {
     static constexpr std::size_t kTableWords = 4;
     std::uint64_t stay[3][kTableWords] = {};
     std::uint64_t step[3][kTableWords] = {};
+    // Two known cells at a time, for a one-word clue: the transition of
+    // cell values (a, b) (a the lower index) composed, so that a sweep
+    // over known cells steps by pairs. Indexed by 2a + b:
+    //   forward:  next = (cur & pair[0][i]) | ((cur << 1) & pair[1][i]) | ((cur << 2) & pair[2][i])
+    //   backward: prev = (cur & pair[0][i]) | ((cur & pair[1][i]) >> 1) | ((cur & pair[2][i]) >> 2)
+    // with pair[0] = stay_a & stay_b, pair[1] = (step_a & stay_b) | ((stay_a << 1) & step_b),
+    // pair[2] = (step_a << 1) & step_b; the same table serves both directions.
+    std::uint64_t pair[3][4] = {};
 };
 
 LineSpec make_line_spec(const std::vector<int>& clue);

@@ -117,6 +117,17 @@ LineSpec make_line_spec(const std::vector<int>& clue) {
         spec.step[FULL][w] = spec.full_mask[w];
         spec.step[UNKNOWN][w] = spec.state_valid[w];
     }
+    if (spec.n_words == 1) {
+        for (int a = 0; a < 2; ++a) {
+            for (int b = 0; b < 2; ++b) {
+                const std::uint64_t sa = spec.stay[a][0], ta = spec.step[a][0];
+                const std::uint64_t sb = spec.stay[b][0], tb = spec.step[b][0];
+                spec.pair[0][2 * a + b] = sa & sb;
+                spec.pair[1][2 * a + b] = (ta & sb) | ((sa << 1) & tb);
+                spec.pair[2][2 * a + b] = (ta << 1) & tb;
+            }
+        }
+    }
     return spec;
 }
 

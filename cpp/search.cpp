@@ -1627,6 +1627,45 @@ inline void residual_sweeps(const LineSpec& spec, const std::int8_t* cells, std:
     static_assert(NW <= static_cast<int>(LineSpec::kTableWords), "the spec's tables cover the fast widths");
     const auto& stay = spec.stay;
     const auto& step = spec.step;
+    if (NW == 1) {
+        // One word: two cells per step through the pair table
+        // (LineSpec::pair), the odd cell alone. The cells swept are known
+        // (before the first unknown, after the last), so a pair's index is
+        // two bits. A cell cost ten instructions in the loop above; a pair
+        // costs sixteen.
+        const std::uint64_t* p0 = spec.pair[0];
+        const std::uint64_t* p1 = spec.pair[1];
+        const std::uint64_t* p2 = spec.pair[2];
+        std::uint64_t c = fwd_from == 0 ? 1 : fwd[0];
+        std::size_t i = fwd_from;
+        for (; i + 2 <= fu; i += 2) {
+            const unsigned ix = 2u * static_cast<unsigned>(cells[i * stride]) + static_cast<unsigned>(cells[(i + 1) * stride]);
+            c = (c & p0[ix]) | ((c << 1) & p1[ix]) | ((c << 2) & p2[ix]);
+        }
+        if (i < fu) {
+            const int v = cells[i * stride];
+            c = (c & stay[v][0]) | ((c << 1) & step[v][0]);
+        }
+        fwd[0] = c;
+        std::uint64_t b;
+        if (bwd_from == n) {
+            b = 1ULL << (spec.len_states - 1);
+            if (spec.len_states >= 2) b |= 1ULL << (spec.len_states - 2);
+        } else {
+            b = bwd[0];
+        }
+        std::size_t j = bwd_from;
+        for (; j >= lu + 2; j -= 2) {
+            const unsigned ix = 2u * static_cast<unsigned>(cells[(j - 2) * stride]) + static_cast<unsigned>(cells[(j - 1) * stride]);
+            b = (b & p0[ix]) | ((b & p1[ix]) >> 1) | ((b & p2[ix]) >> 2);
+        }
+        if (j > lu) {
+            const int v = cells[(j - 1) * stride];
+            b = (b & stay[v][0]) | ((b & step[v][0]) >> 1);
+        }
+        bwd[0] = b;
+        return;
+    }
     if (fwd_from == 0) {
         for (int w = 0; w < NW; ++w) fwd[w] = 0;
         fwd[0] = 1;
