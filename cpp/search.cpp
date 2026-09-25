@@ -600,12 +600,12 @@ public:
 
     // The complemented tag word a slot stores for (tag, hash h).
     static std::uint16_t full_tag(std::uint16_t tag, std::uint64_t h) {
-        return static_cast<std::uint16_t>(~(tag | ((h >> 58) << 10)));
+        return static_cast<std::uint16_t>(~(tag | (((h >> 26) & 63) << 10)));
     }
     // The same from the tag's complement: the tag is below 1024, so bits
     // 10-15 of ~tag are set and the or-and-complement is one xor.
     static std::uint16_t full_tag_n(std::uint16_t ntag, std::uint64_t h) {
-        return static_cast<std::uint16_t>(ntag ^ ((h >> 58) << 10));
+        return static_cast<std::uint16_t>(ntag ^ (((h >> 26) & 63) << 10));
     }
 
     // On a miss, remembers the empty slot it stopped at so the insert that
@@ -720,25 +720,16 @@ public:
     // With the tag's multiply already done (t = tag_mul(tag)).
     template <int KW = 0>
     std::uint64_t hash_tm(const std::uint64_t* key, std::uint64_t t) const {
-        namespace wy = ankerl::unordered_dense::detail::wyhash;
         const int kw = KW > 0 ? KW : kw_;
-        // One 64x64->128 multiply-fold covers the common <= 2-word key.
-        if (kw <= 2) {
-            const std::uint64_t k1 = (kw == 2) ? key[1] : 0;
-            return wy::mix(key[0] ^ t, k1 ^ 0xE7037ED1A0B428DBULL);
-        }
-        // Three and four words: fold the words with plain multiplies (each
-        // spreads its input upward) and mix once at the end, which folds the
-        // high half back down over every index and tag bit. One 128-bit
-        // multiply instead of four or five.
-        // One multiplier for every word: each extra 64-bit constant is a
-        // movabs the drain re-materialises per lookup under its register
-        // pressure.
-        std::uint64_t x = (key[0] ^ t) * 0xE7037ED1A0B428DBULL;
-        x = (x ^ key[1]) * 0xE7037ED1A0B428DBULL;
-        x = (x ^ key[2]) * 0xE7037ED1A0B428DBULL;
-        if (kw == 4) x = (x ^ key[3]) * 0xE7037ED1A0B428DBULL;
-        return wy::mix(x, 0xA0761D6478BD642FULL);
+        // CRC32C over the words, seeded by the tag word: one 3-cycle
+        // instruction per word on a dependent chain, no constants to hold.
+        // The 32-bit result indexes tables up to 2^26 slots with the tag's
+        // six hash bits (26-31) above the index.
+        std::uint64_t h = _mm_crc32_u64(t, key[0]);
+        if (kw >= 2) h = _mm_crc32_u64(h, key[1]);
+        if (kw >= 3) h = _mm_crc32_u64(h, key[2]);
+        if (kw >= 4) h = _mm_crc32_u64(h, key[3]);
+        return h;
     }
 
     template <int KW = 0>
