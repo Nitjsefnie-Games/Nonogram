@@ -845,6 +845,44 @@ constexpr std::uint64_t kUnknownBits = 0xAAAAAAAAAAAAAAAAULL;
 // 16-byte record cost the 3-word drain a shift per index.
 std::vector<std::uint64_t> g_row_tag;
 std::vector<std::uint64_t> g_col_tag;
+
+// The slots the two probes of (row, col) will open their propagations
+// with: the row's and the column's keys with that cell's digit set to
+// each value (the key words copied, one digit changed), hashed as the
+// drain will hash them and prefetched. Called one cell ahead of the
+// probing loop, so the lookup every probe starts with, which nothing
+// else can hash ahead, finds its slot in cache.
+template <int KW>
+inline void prefetch_probe_cell_t(const Picture& pic, int row, int col) {
+    std::uint64_t k[KW];
+    const std::uint64_t* rk = pic.row_keys.data() + static_cast<std::size_t>(row) * KW;
+    for (int w = 0; w < KW; ++w) k[w] = rk[w];
+    const std::uint64_t tr = g_row_tag[static_cast<std::size_t>(row)];
+    const int cw = KW == 1 ? 0 : col >> 5;
+    const std::uint64_t saved = k[cw];
+    k[cw] = saved ^ (std::uint64_t{2} << (2 * (col & 31)));  // UNKNOWN -> EMPTY
+    g_fast_cache.prefetch(g_fast_cache.hash_tm<KW>(k, tr));
+    k[cw] = saved ^ (std::uint64_t{3} << (2 * (col & 31)));  // UNKNOWN -> FULL
+    g_fast_cache.prefetch(g_fast_cache.hash_tm<KW>(k, tr));
+    const std::uint64_t* ck = pic.col_keys.data() + static_cast<std::size_t>(col) * KW;
+    for (int w = 0; w < KW; ++w) k[w] = ck[w];
+    const std::uint64_t tc = g_col_tag[static_cast<std::size_t>(col)];
+    const int rw = KW == 1 ? 0 : row >> 5;
+    const std::uint64_t savedc = k[rw];
+    k[rw] = savedc ^ (std::uint64_t{2} << (2 * (row & 31)));
+    g_fast_cache.prefetch(g_fast_cache.hash_tm<KW>(k, tc));
+    k[rw] = savedc ^ (std::uint64_t{3} << (2 * (row & 31)));
+    g_fast_cache.prefetch(g_fast_cache.hash_tm<KW>(k, tc));
+}
+inline void prefetch_probe_cell(const Picture& pic, int row, int col) {
+    switch (pic.key_words) {
+        case 1: prefetch_probe_cell_t<1>(pic, row, col); break;
+        case 2: prefetch_probe_cell_t<2>(pic, row, col); break;
+        case 3: prefetch_probe_cell_t<3>(pic, row, col); break;
+        case 4: prefetch_probe_cell_t<4>(pic, row, col); break;
+        default: break;
+    }
+}
 // Per line (rows, then columns at H + c), the line solver's sweep memo
 // (LineSweepMemo) and the arena its state arrays live in.
 std::vector<LineSweepMemo> g_line_memo;
@@ -3025,6 +3063,11 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 __builtin_prefetch(&g_memo[static_cast<std::size_t>(nx.first) * W + nx.second]);
             }
             if (pxs[row * W + col] != UNKNOWN) continue;  // settled by an earlier commit this pass
+            if (g_fast_mode && oi + 1 < order.size()) {
+                // The next cell's four opening lookups (see prefetch_probe_cell).
+                const auto& nx = unknown_coords[static_cast<std::size_t>(order[oi + 1])];
+                prefetch_probe_cell(pic, nx.first, nx.second);
+            }
 
             // Each value is skipped only when a bound proves it consistent
             // (bound set) AND below the best score. A skipped value is never
