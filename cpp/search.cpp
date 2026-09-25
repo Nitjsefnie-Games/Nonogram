@@ -1999,6 +1999,20 @@ inline bool solve_lines(const std::vector<const LineSpec*>& mapped,
             const int nx = qbuf[qh];
             next_h = g_fast_cache.hash_tm<KW>(keys + static_cast<std::size_t>(nx) * kw, tagrec[nx]);
             FastLineCache::prefetch<KW>(v, next_h);
+        } else if (FAST) {
+            // The last line of this direction: the other direction's first
+            // queued line is hashed on its current key and its slot
+            // prefetched under this line's lookup and write. This line's
+            // write may still change that key (then a wrong slot was
+            // fetched, at no cost to the result); the hash is recomputed
+            // when that drain starts either way.
+            const FifoQueue& oq = is_row ? pic.col_queue : pic.row_queue;
+            if (!oq.empty()) {
+                const int ox = oq.front();
+                const std::uint64_t* okeys = is_row ? pic.col_keys.data() : pic.row_keys.data();
+                const std::uint64_t* otag = (is_row ? g_col_tag : g_row_tag).data();
+                FastLineCache::prefetch<KW>(v, g_fast_cache.hash_tm<KW>(okeys + static_cast<std::size_t>(ox) * kw, otag[ox]));
+            }
         }
         BatchResult r = solve_one_batch<FAST, KW>(mapped, index, !is_row, pic, h, v, keys, tagrec);
         h = next_h;
