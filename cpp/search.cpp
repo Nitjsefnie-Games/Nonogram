@@ -1295,6 +1295,18 @@ inline StateTable::Key line_seed(std::uint64_t tag) {
 // the prefixes of the new sweeps whenever the cells they covered are
 // unchanged (checked on the packed key words). A revert shrinks them and
 // the sweeps restart from the ends.
+// Measured and not shipped (2026-09-25, 150k nodes): resuming a restart
+// from the line solver's own sweep memo where its key agrees on the
+// prefix or suffix removed 18% of the swept cells on hard/30532 but the
+// two checks per call cost the same (+0.04%; easy_medium/12130 +0.8%);
+// carrying this memo on the key undo trail so the sibling resumes from
+// the parent's state removed every restart (467k -> 92 full forward
+// sweeps on 30532, cells swept -21%; hard/3867 -72%) but the 112-byte
+// copy per entry cost what the restarts did (30532 +0.05%, 3867 -0.4%,
+// 12130 +2.0%), and keeping the memo in the trail entry itself (no copy,
+// the line's current memo an index) cost more still (30532 +0.8%): the
+// builder's frame and the resume's copies outweigh sweeps that average
+// two to fifteen cells per call.
 struct ResidualMemo {
     std::uint32_t fu = 0, lu = 0;  // prefix length; one past the last unknown
     std::uint64_t key[kMaxFastCells / 32] = {};
@@ -2107,6 +2119,15 @@ inline bool solve_lines(const std::vector<const LineSpec*>& mapped,
     // in memory, so anything read through a pointer or a global would be
     // reloaded after each of them (eight loads per lookup on the 3-word
     // drain). The queue never grows during its own drain.
+    // Hashing and prefetching two lines ahead instead of one (the hashes
+    // in a register pipeline, each line hashed once) was measured
+    // 2026-09-25: +0.5-0.9% instructions on every puzzle (the extra live
+    // value spills) and cycles within noise on the shielded core, at 150k
+    // and at 1.5M nodes of hard/3867 (medians -2.5% / +0.3%, best of
+    // rounds +0.4% / +4.7%); drains average 2.6 lines. The direction-
+    // switch prefetch below fetches a stale slot on 11% (3867) to 19%
+    // (30532) of switches, so re-prefetching on the final key is not
+    // worth a hash either.
     FastLineCache::View v = g_fast_cache.view();
     const int* qbuf = queue.data();
     std::size_t qh = queue.head();
@@ -2273,6 +2294,15 @@ std::uint64_t g_stat_probe_skips = 0;  // probes the bounds made unnecessary
 // every row and column index is below 32, so the word index and the
 // shift's mask fold away (easy_medium/12130: 27.9 million reverted cells,
 // 10.5% of the run in this loop).
+// The key xors as loads from g_cross_xor by the cell's value instead of
+// the shift were measured 2026-09-25: +0.35% on hard/3867 and hard/30532,
+// +0.9% on easy_large/7382 (a live table base and the value's lea cost
+// more than shlx). Restoring the keys from a snapshot of every line's
+// key taken at the node instead of toggling per cell is not worth
+// building: the copy scales with the line count (hard/3867: 159 lines
+// of three words, about 720 instructions per node for the copy in and
+// two restores, against 350 for its 27 reverted cells at 150k nodes),
+// and a node's revert shrinks deeper in the tree.
 template <int KW>
 inline void unset_cells_t(Picture& pic, const int* first, const int* last) {
     const std::size_t W = static_cast<std::size_t>(pic.width());
@@ -3111,6 +3141,12 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         // Built only for a large node: a small one (a region of a few
         // rows, or the SMALL_NOPROBE latch) walks fewer cells than the
         // masks cost (hard/3867: 3 rows and 10 cells per scan).
+        // Accumulating the levels on demand (the walk asks for best - uir)
+        // instead of the prefix over every level was measured 2026-09-25:
+        // hard/30532 +0.3% -- the walk reaches nearly every level, and
+        // the demand loop costs per row. Building a word's neighbour
+        // masks at the first cell that needs its score instead of per
+        // word walked: +0.2%, most words walked score a cell.
         static thread_local std::vector<std::uint64_t> cum;
         int max_uic = 0;
         if (n_unknown > 128) {

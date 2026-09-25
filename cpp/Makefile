@@ -36,6 +36,12 @@ stats: solver-stats
 solver-stats: $(SRCS) $(wildcard *.hpp) Makefile
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -DNONOGRAM_STATS $(SRCS) -o $@
 
+# Flag variants of the PGO build measured 2026-09-25 (81ed2f17e, instructions
+# on the four benchmark puzzles, then cycles on the shielded core):
+# -fno-unroll-loops +1.2-1.8%; -fno-tracer mixed within 0.5%; the inlining
+# budget raised to 200/1000 -0.1 to -0.3% instructions on all four but
+# cycles mixed (hard/3867 +3.2% median, hard/30532 -6.7%, 12130 +4.9%,
+# five rounds under load), and 300/1500 compiles to the same code.
 # Both stages link to the SAME output name: gcc derives the .gcda file names
 # from it (<output>-<source>.gcda), so an instrumented "solver-instrumented"
 # produced profiles the "solver" build never found -- and -Wmissing-profile
