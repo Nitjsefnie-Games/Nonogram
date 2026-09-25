@@ -894,8 +894,10 @@ std::vector<std::uint64_t> g_line_memo_arena;
 // of shifting, so its loop holds no shift count.
 std::vector<std::uint64_t> g_cross_xor;
 
+void init_digit_masks();  // the state-key builder's digit-mask table, below
 // Each line's tag (its spec id, columns flagged) and the tag's hash multiply.
 void set_line_tags(const std::vector<const LineSpec*>& mapped_rows, const std::vector<const LineSpec*>& mapped_cols) {
+    init_digit_masks();
     g_row_tag.resize(mapped_rows.size());
     for (std::size_t i = 0; i < mapped_rows.size(); ++i)
         g_row_tag[i] = FastLineCache::tag_mul(static_cast<std::uint16_t>(mapped_rows[i]->id * 2));
@@ -1564,7 +1566,29 @@ inline const std::int8_t* line_cells(int index, bool is_col, const Picture& pic,
 // words masked to [first unknown, last unknown]; the two sweeps run on
 // the cells, one word of DFA states when the clue fits (2 words on a
 // carry pair, more words in a loop).
-// Mask of the digits of cells < p (prefix) / >= p (suffix) in key word w.
+// Mask of the digits of cells >= p in key word w, for p in [0, kMaxFastCells]
+// (the digits of cells < p are its complement): a table, one row of
+// kMaxFastCells / 32 words per p, so that a mask is a load rather than the
+// two bounds tests and a shift per word that the builder ran for the memo's
+// prefix and suffix and for the middle's two ends (hard/30532: 43 million
+// instructions of the two-word middle mask alone, 1.4%; the branches on
+// fu and lu against each word's bounds went both ways).
+constexpr int kDigitWords = kMaxFastCells / 32;
+alignas(64) std::uint64_t g_digits_from[(kMaxFastCells + 1) * kDigitWords];
+void init_digit_masks() {
+    for (int p = 0; p <= kMaxFastCells; ++p) {
+        for (int w = 0; w < kDigitWords; ++w) {
+            const int lo = 32 * w;
+            std::uint64_t m;
+            if (p <= lo) m = ~0ULL;
+            else if (p >= lo + 32) m = 0;
+            else m = ~0ULL << (2 * (p - lo));
+            g_digits_from[static_cast<std::size_t>(p) * kDigitWords + w] = m;
+        }
+    }
+}
+inline const std::uint64_t* digits_from(std::size_t p) { return g_digits_from + p * kDigitWords; }
+// The same by arithmetic, for lines beyond the table (the runtime word count).
 inline std::uint64_t prefix_digits(int w, std::size_t p) {
     const std::size_t lo = 32 * static_cast<std::size_t>(w);
     if (p <= lo) return 0;
@@ -1665,12 +1689,22 @@ StateTable::Key residual_key_t(StateTable::Key seed, const LineSpec& spec, const
     if (memo.valid) {
         if (memo.fu <= fu) {
             std::uint64_t diff = 0;
-            for (int w = 0; w < kw; ++w) diff |= (words[w] ^ memo.key[w]) & prefix_digits(w, memo.fu);
+            if (KW > 0) {
+                const std::uint64_t* from = digits_from(memo.fu);
+                for (int w = 0; w < kw; ++w) diff |= (words[w] ^ memo.key[w]) & ~from[w];
+            } else {
+                for (int w = 0; w < kw; ++w) diff |= (words[w] ^ memo.key[w]) & prefix_digits(w, memo.fu);
+            }
             if (diff == 0) fwd_from = memo.fu;
         }
         if (memo.lu >= lu1) {
             std::uint64_t diff = 0;
-            for (int w = 0; w < kw; ++w) diff |= (words[w] ^ memo.key[w]) & suffix_digits(w, memo.lu);
+            if (KW > 0) {
+                const std::uint64_t* from = digits_from(memo.lu);
+                for (int w = 0; w < kw; ++w) diff |= (words[w] ^ memo.key[w]) & from[w];
+            } else {
+                for (int w = 0; w < kw; ++w) diff |= (words[w] ^ memo.key[w]) & suffix_digits(w, memo.lu);
+            }
             if (diff == 0) bwd_from = memo.lu;
         }
     }
@@ -1697,6 +1731,15 @@ StateTable::Key residual_key_t(StateTable::Key seed, const LineSpec& spec, const
         const std::uint64_t v = words[0] & mask;
         ha = wy::mix(ha ^ v, 0xE7037ED1A0B428DBULL);
         hb = wy::mix(hb ^ v, 0x8EBC6AF09C88C6E3ULL);
+    } else if (KW > 0) {
+        // The digits from fu on, less those from lu + 1 on: two table rows.
+        const std::uint64_t* from = digits_from(fu);
+        const std::uint64_t* to = digits_from(lu1);
+        for (int w = 0; w < kw; ++w) {
+            const std::uint64_t v = words[w] & from[w] & ~to[w];
+            ha = wy::mix(ha ^ v, 0xE7037ED1A0B428DBULL);
+            hb = wy::mix(hb ^ v, 0x8EBC6AF09C88C6E3ULL);
+        }
     } else
     for (int w = 0; w < kw; ++w) {
         const std::size_t lo = 32 * static_cast<std::size_t>(w), hi = lo + 31;
