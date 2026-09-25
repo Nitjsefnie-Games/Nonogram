@@ -2806,6 +2806,31 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                         }
                     }
                 }
+            } else if (kw == 2) {
+                // Two key words per row (33 to 64 columns): both mask words
+                // in registers, the join test two ands and an or. The
+                // runtime-count loops below cost hard/30532 (50 x 50) about
+                // 50 instructions per row visited, 8% of its instructions.
+                std::uint64_t cm0 = rk[r0 * 2] & kUnknownBits;
+                std::uint64_t cm1 = rk[r0 * 2 + 1] & kUnknownBits;
+                while (grew) {
+                    grew = false;
+                    for (int wd = wd0; wd < row_words; ++wd) {
+                        std::uint64_t m = left[wd];
+                        while (m != 0) {
+                            const int r = 64 * wd + __builtin_ctzll(m);
+                            m &= m - 1;
+                            const std::uint64_t k0 = rk[r * 2];
+                            const std::uint64_t k1 = rk[r * 2 + 1];
+                            if (((k0 & cm0) | (k1 & cm1)) == 0) continue;
+                            cm0 |= k0 & kUnknownBits;
+                            cm1 |= k1 & kUnknownBits;
+                            left[wd] &= ~(1ULL << (r & 63));
+                            comp[wd] |= 1ULL << (r & 63);
+                            grew = true;
+                        }
+                    }
+                }
             } else {
             for (int w = 0; w < kw; ++w) cm[w] = rk[r0 * kw + w] & kUnknownBits;
             while (grew) {
