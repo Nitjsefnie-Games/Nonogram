@@ -2668,10 +2668,28 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
     // value is then flagged again since it may predate them.
     const std::size_t key_mark = state.key_undo.size();
     const bool keys_clean = cache_this_node;
+    const StateTable::Key gk_at_mark = state.grid_key;
     auto restore_keys = [&]() {
         StateTable::Key* rh = state.row_hash.data();
         StateTable::Key* ch = state.col_hash.data();
         StateTable::Key& gk = state.grid_key;
+        if (keys_clean) {
+            // Every restored line returns to its value at the mark, so the
+            // grid key does too: copied back rather than re-derived per
+            // entry (hard/30532: the entry loop was 3% of its cycles).
+            std::vector<SolveState::KeyUndo>& undo = state.key_undo;
+            for (std::size_t i = undo.size(); i > key_mark; --i) {
+                const SolveState::KeyUndo& u = undo[i - 1];
+                if (u.line < H) rh[u.line] = u.old; else ch[u.line - H] = u.old;
+            }
+            undo.resize(key_mark);
+            gk = gk_at_mark;
+            for (int r : trail.dirty_rows) trail.row_hash_dirty[static_cast<std::size_t>(r)] = 0;
+            trail.dirty_rows.clear();
+            for (int c : trail.dirty_cols) trail.col_hash_dirty[static_cast<std::size_t>(c)] = 0;
+            trail.dirty_cols.clear();
+            return;
+        }
         while (state.key_undo.size() > key_mark) {
             const SolveState::KeyUndo u = state.key_undo.back();
             state.key_undo.pop_back();
@@ -2679,7 +2697,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 const int r = u.line;
                 gk.a ^= rh[r].a ^ u.old.a; gk.b += u.old.b - rh[r].b;
                 rh[r] = u.old;
-                if (!keys_clean && !trail.row_hash_dirty[static_cast<std::size_t>(r)]) {
+                if (!trail.row_hash_dirty[static_cast<std::size_t>(r)]) {
                     trail.row_hash_dirty[static_cast<std::size_t>(r)] = 1;
                     trail.dirty_rows.push_back(r);
                 }
@@ -2687,17 +2705,11 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 const int c = u.line - H;
                 gk.a ^= ch[c].a ^ u.old.a; gk.b += u.old.b - ch[c].b;
                 ch[c] = u.old;
-                if (!keys_clean && !trail.col_hash_dirty[static_cast<std::size_t>(c)]) {
+                if (!trail.col_hash_dirty[static_cast<std::size_t>(c)]) {
                     trail.col_hash_dirty[static_cast<std::size_t>(c)] = 1;
                     trail.dirty_cols.push_back(c);
                 }
             }
-        }
-        if (keys_clean) {
-            for (int r : trail.dirty_rows) trail.row_hash_dirty[static_cast<std::size_t>(r)] = 0;
-            trail.dirty_rows.clear();
-            for (int c : trail.dirty_cols) trail.col_hash_dirty[static_cast<std::size_t>(c)] = 0;
-            trail.dirty_cols.clear();
         }
     };
 
