@@ -1341,6 +1341,16 @@ struct SolveState {
     std::vector<StateTable::Key> row_seed, col_seed;  // line_seed per row / column
     std::vector<ResidualMemo> row_memo, col_memo;     // residual_key's resume state per line
     StateTable::Key grid_key{0, 0};
+    // Undo trail of the per-line contributions: a node that brings a
+    // dirty line up to date records the value it replaced, and a parent
+    // restores everything its child's subtree recorded once the child's
+    // cells are reverted -- the lines are then back at the parent's content
+    // and their contributions at the parent's values, so they are not
+    // dirty and the sibling branch recomputes only what it changes itself.
+    // Before this the sibling recomputed every line the whole subtree had
+    // touched, because the revert flags each unsettled cell's lines.
+    struct KeyUndo { int line; StateTable::Key old; };  // line: row r, or H + c
+    std::vector<KeyUndo> key_undo;
     std::uint64_t state_lookups = 0, state_hits = 0, state_evictions = 0;
     // Adaptive gate by node size (bucket = log2 of the unknown cells):
     // hits come almost only from small nodes, and which sizes pay differs
@@ -2551,6 +2561,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         StateTable::Key& gk = state.grid_key;
         for (int r : trail.dirty_rows) {
             gk.a ^= rh[r].a; gk.b -= rh[r].b;
+            state.key_undo.push_back(SolveState::KeyUndo{r, rh[r]});
             rh[r] = uir[r] > 0 ? residual_key(state.row_seed[static_cast<std::size_t>(r)], *mapped_rows[static_cast<std::size_t>(r)],
                                               px + static_cast<std::size_t>(r) * W, 1, static_cast<std::size_t>(W),
                                               rk + static_cast<std::size_t>(r) * kw, kw, state.row_memo[static_cast<std::size_t>(r)])
@@ -2561,6 +2572,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         trail.dirty_rows.clear();
         for (int c : trail.dirty_cols) {
             gk.a ^= ch[c].a; gk.b -= ch[c].b;
+            state.key_undo.push_back(SolveState::KeyUndo{H + c, ch[c]});
             if (uic[c] > 0) {
                 // The column read in place (stride W), not gathered.
                 ch[c] = residual_key(state.col_seed[static_cast<std::size_t>(c)], *mapped_cols[static_cast<std::size_t>(c)],
@@ -2606,6 +2618,45 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         // table's cache misses overlap with that scan.
         state.state_cache.prefetch(state_key);
     }
+    // What a child's subtree records above this mark is undone after the
+    // child's cells are reverted (see SolveState::key_undo). With the node's
+    // lines all up to date here, the revert leaves nothing dirty; a node
+    // gated off the cache leaves its dirty lines dirty, and a restored
+    // value is then flagged again since it may predate them.
+    const std::size_t key_mark = state.key_undo.size();
+    const bool keys_clean = cache_this_node;
+    auto restore_keys = [&]() {
+        StateTable::Key* rh = state.row_hash.data();
+        StateTable::Key* ch = state.col_hash.data();
+        StateTable::Key& gk = state.grid_key;
+        while (state.key_undo.size() > key_mark) {
+            const SolveState::KeyUndo u = state.key_undo.back();
+            state.key_undo.pop_back();
+            if (u.line < H) {
+                const int r = u.line;
+                gk.a ^= rh[r].a ^ u.old.a; gk.b += u.old.b - rh[r].b;
+                rh[r] = u.old;
+                if (!keys_clean && !trail.row_hash_dirty[static_cast<std::size_t>(r)]) {
+                    trail.row_hash_dirty[static_cast<std::size_t>(r)] = 1;
+                    trail.dirty_rows.push_back(r);
+                }
+            } else {
+                const int c = u.line - H;
+                gk.a ^= ch[c].a ^ u.old.a; gk.b += u.old.b - ch[c].b;
+                ch[c] = u.old;
+                if (!keys_clean && !trail.col_hash_dirty[static_cast<std::size_t>(c)]) {
+                    trail.col_hash_dirty[static_cast<std::size_t>(c)] = 1;
+                    trail.dirty_cols.push_back(c);
+                }
+            }
+        }
+        if (keys_clean) {
+            for (int r : trail.dirty_rows) trail.row_hash_dirty[static_cast<std::size_t>(r)] = 0;
+            trail.dirty_rows.clear();
+            for (int c : trail.dirty_cols) trail.col_hash_dirty[static_cast<std::size_t>(c)] = 0;
+            trail.dirty_cols.clear();
+        }
+    };
 
     if (state.count_mode) {
         // Split the region's unknown cells into independent regions: rows
@@ -2788,6 +2839,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 state.path_pop();
                 total *= state.result;
                 revert_branch(pic, trail, mark, saved_unknown_count);
+                restore_keys();
                 if (total == 0) break;
             }
             state.region_row = saved_region;
@@ -3179,6 +3231,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         // caches by the subtree; start fetching them under the last revert.
         if (branch == 1 && cache_this_node) state.state_cache.prefetch(state_key);
         revert_branch(pic, trail, mark, saved_unknown_count);
+        restore_keys();
     }
     state.result = subtree_total;
     g_counted_so_far -= subtree_total;  // the parent adds it back as one finished child
@@ -3389,6 +3442,7 @@ void solve(const std::vector<std::vector<int>>& rows,
         for (int r = 0; r < H; ++r) state.row_seed[static_cast<std::size_t>(r)] = line_seed(static_cast<std::uint64_t>(r) | (1ULL << 40));
         for (int c = 0; c < W; ++c) state.col_seed[static_cast<std::size_t>(c)] = line_seed(static_cast<std::uint64_t>(c) | (1ULL << 41));
         state.grid_key = StateTable::Key{0, 0};
+        state.key_undo.clear();
         state.sc_yield = g_state_cache_yield;
         // Every line starts flagged, so the first node computes them all.
         trail.track_hash = true;
