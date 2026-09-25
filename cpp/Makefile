@@ -45,14 +45,19 @@ pgo: pgo-clean
 	@echo "=== PGO Stage 1: build instrumented binary ==="
 	mkdir -p $(PGO_DIR)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -fprofile-generate=$(PGO_DIR) $(SRCS) -o solver
-	@echo "=== PGO Stage 2: train on representative puzzles ==="
-	./solver ../nonograms/easy_medium/108 --max 200000 > /dev/null
-	./solver ../nonograms/easy_medium/108 > /dev/null
-	MAX_NODES=300000 ./solver ../nonograms/partially_solved/3867 > /dev/null
-	./solver ../nonograms/partially_solved/pikachu --anytime --max 30000 > /dev/null
-	./solver ../nonograms/easy_large/4 > /dev/null
-	./solver ../nonograms/easy_medium/63 > /dev/null
-	./solver ../nonograms/trivial/1 > /dev/null
+	@echo "=== PGO Stage 2: train on the puzzles that carry the corpus wall ==="
+	# hard/3867 and hard/30532 are 80% of the corpus's summed solve time,
+	# easy_large/7382 and easy_medium/12130 the largest of the rest; the
+	# node caps keep the training under 15 s. The state cache's yield gate
+	# is held inert so the training tree, and with it the profile, is the
+	# same on every build.
+	STATE_CACHE_YIELD=0 MAX_NODES=150000 ./solver ../nonograms/hard/3867 > /dev/null
+	STATE_CACHE_YIELD=0 MAX_NODES=300000 ./solver ../nonograms/hard/30532 > /dev/null
+	STATE_CACHE_YIELD=0 ./solver ../nonograms/easy_large/7382 > /dev/null
+	STATE_CACHE_YIELD=0 ./solver ../nonograms/easy_medium/12130 > /dev/null
+	STATE_CACHE_YIELD=0 ./solver ../nonograms/easy_large/4 > /dev/null
+	STATE_CACHE_YIELD=0 ./solver ../nonograms/easy_medium/63 > /dev/null
+	STATE_CACHE_YIELD=0 ./solver ../nonograms/trivial/1 > /dev/null
 	@echo "=== PGO Stage 3: build optimized binary ==="
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -fprofile-use=$(PGO_DIR) -Werror=missing-profile $(SRCS) -o solver
 

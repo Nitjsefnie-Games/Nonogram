@@ -94,7 +94,8 @@ the C++ solver should come with these numbers, measured this way:
 ```
 cd cpp
 bench/shield.sh                      # reserve one core (undo: bench/unshield.sh)
-make                                 # the binary that ships: plain -O3 (see below on PGO)
+make                                 # development build: plain -O3, what a change is counted on
+make pgo                             # the binary that ships (see below on PGO)
 python3 bench/harness.py gate        # solution count + strategy vs golden
 python3 bench/harness.py gate-anytime   # same puzzles with --anytime (count only)
 python3 bench/harness.py bench 3     # default-mode timing suite, best of 3
@@ -102,12 +103,23 @@ bench/run.sh ./solver ../nonograms/partially_solved/pikachu --anytime --max 3000
 ```
 
 The last line is the headline anytime benchmark (time to 300k solutions
-on a puzzle that never finishes). `make pgo` still builds a
-profile-guided binary, but since count mode became the default it
-measures slower than the plain build on that mode (medium/7382 15.1 s
-against 10.3 s, easy_medium/12130 2.8 against 1.9, 10810 explores 2.6x
-less in 60 s; 2026-09-18), whichever training set was tried, so the
-plain build ships; re-measure before shipping PGO again. `./solver <puzzle> --balance 6` switches
+on a puzzle that never finishes). `make pgo` builds the profile-guided
+binary that ships: it trains on the puzzles that carry the corpus wall
+(hard/3867 and hard/30532 at node caps, easy_large/7382,
+easy_medium/12130, three small ones), with the state cache's yield gate
+inert so the profile is the same on every build. Measured against the
+plain build of the same source (b64f6aebe, interleaved rounds on the
+shielded core, cycles medians of 3): hard/30532 at 150k nodes -13%,
+easy_large/7382 -4.6%, easy_medium/12130 -2%, hard/3867 at 150k and
+1.5M nodes within noise (-0.5%), the anytime benchmark unchanged
+(5.18 s both); instructions -5.1% / -8.9% / -6.6% / -2.8% on 3867 /
+30532 / 7382 / 12130. An earlier training set (2026-09-18: easy_medium/108
+and a --max run of it, pikachu --anytime, partially_solved/3867) measured
+slower than the plain build on count mode, whichever variant was tried;
+what changed is the training set and the code since. Count a change on
+the plain build (instructions repeat to 7 digits there, and PGO's
+inlining decisions move with the profile); ship and rebench the PGO one,
+re-checking `bench/harness.py gate` on it. `./solver <puzzle> --balance 6` switches
 the branch score to `6*min - max` of the two probe fills, which shrinks
 exhaustive trees on hard unique puzzles several-fold (11-Dom 217k -> 28k
 nodes) but changes where a `--max N` run on a many-solution puzzle stops;
