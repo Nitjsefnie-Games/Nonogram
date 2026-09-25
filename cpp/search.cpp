@@ -2623,6 +2623,14 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         // of the branch node on easy_small/4774. The component's root is its
         // lowest row, and components are found in ascending order of that
         // row, which is the order the old row scan first met each root.
+        // Growing a component by alternating steps over rows and columns
+        // instead (the reached rows' unknown columns from the row keys, the
+        // new columns' unknown rows from the column keys, compressed to row
+        // bits), so that each key is read once, was measured 2026-09-25:
+        // the sweeps here average about two passes, and reading every
+        // column key costs what the second pass did -- hard/30532 -4.0%
+        // instructions, hard/3867 +1.0%, easy_medium/12130 +2.2% (it loses
+        // the one-word path below), easy_large/7382 -0.1%.
         const std::uint64_t* zero_rows = trail.row_bucket.data();  // bucket 0: rows without unknowns
         const int row_words = trail.row_words;
         std::uint64_t rows_left[kMaxFastCells / 64 + 1];  // H <= kMaxFastCells in fast mode; wider grids fall back below
