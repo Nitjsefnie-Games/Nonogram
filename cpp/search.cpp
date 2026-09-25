@@ -709,7 +709,7 @@ public:
     // hash-ahead loads it instead of loading the tag, materialising the
     // constant and multiplying, under its register pressure.
     // The low 16 bits are the tag's complement (see g_row_tag), the upper
-    // 48 the multiply's; the hash mixes the whole word.
+    // 48 the multiply's; the crc32 chain seeds from the low 32.
     static std::uint64_t tag_mul(std::uint16_t tag) {
         return ((static_cast<std::uint64_t>(tag) * 0x9E3779B97F4A7C15ULL) & ~0xFFFFULL) | static_cast<std::uint16_t>(~tag);
     }
@@ -2825,6 +2825,31 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                             if (((k0 & cm0) | (k1 & cm1)) == 0) continue;
                             cm0 |= k0 & kUnknownBits;
                             cm1 |= k1 & kUnknownBits;
+                            left[wd] &= ~(1ULL << (r & 63));
+                            comp[wd] |= 1ULL << (r & 63);
+                            grew = true;
+                        }
+                    }
+                }
+            } else if (kw == 3) {
+                // Three words (65 to 96 columns), likewise.
+                std::uint64_t cm0 = rk[r0 * 3] & kUnknownBits;
+                std::uint64_t cm1 = rk[r0 * 3 + 1] & kUnknownBits;
+                std::uint64_t cm2 = rk[r0 * 3 + 2] & kUnknownBits;
+                while (grew) {
+                    grew = false;
+                    for (int wd = wd0; wd < row_words; ++wd) {
+                        std::uint64_t m = left[wd];
+                        while (m != 0) {
+                            const int r = 64 * wd + __builtin_ctzll(m);
+                            m &= m - 1;
+                            const std::uint64_t k0 = rk[r * 3];
+                            const std::uint64_t k1 = rk[r * 3 + 1];
+                            const std::uint64_t k2 = rk[r * 3 + 2];
+                            if (((k0 & cm0) | (k1 & cm1) | (k2 & cm2)) == 0) continue;
+                            cm0 |= k0 & kUnknownBits;
+                            cm1 |= k1 & kUnknownBits;
+                            cm2 |= k2 & kUnknownBits;
                             left[wd] &= ~(1ULL << (r & 63));
                             comp[wd] |= 1ULL << (r & 63);
                             grew = true;
