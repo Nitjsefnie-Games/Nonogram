@@ -479,22 +479,51 @@ def rebench_folder(root, excludes, solver_cmd=None, repeat=1):
             files.append(os.path.join(dirpath, fname))
     # Shortest previous solve first, so results land in ascending order and
     # a run cut short has done the cheap ones; files without a header last.
-    files.sort(key=lambda p: (previous_solve_time(p) is None, previous_solve_time(p) or 0.0, p))
+    before = {p: previous_solve_time(p) for p in files}
+    files.sort(key=lambda p: (before[p] is None, before[p] or 0.0, p))
 
     rebenched = moved = 0
+    paired = []  # (path, previous time, new time) for files that had a header
     for path in files:
         ok, new_path, elapsed = rebench_file(path, solver_cmd=solver_cmd, repeat=repeat)
         if not ok:
             continue
         rebenched += 1
+        old = before[path]
+        was = f"{old:.4f}s -> " if old is not None else ""
         if new_path != path:
             moved += 1
-            print(f"  {path}  ->  {new_path}  ({elapsed:.4f}s)")
+            print(f"  {path}  ->  {new_path}  ({was}{elapsed:.4f}s)")
         else:
-            print(f"  {path}  ({elapsed:.4f}s)")
+            print(f"  {path}  ({was}{elapsed:.4f}s)")
+        if old is not None:
+            paired.append((path, old, elapsed))
 
     print("-" * 60)
     print(f"Rebenched {rebenched} puzzles, moved {moved} between buckets.")
+    report_speed_change(paired)
+
+
+def report_speed_change(paired, movers=12):
+    """The rebench's speed change against the headers it replaced: the sum
+    of the previous and the new solve times over the files that had one,
+    and the largest gains and losses, for the rebench commit's message."""
+    if not paired:
+        print("No previous solve times to compare against.")
+        return
+    old_sum = sum(old for _, old, _ in paired)
+    new_sum = sum(new for _, _, new in paired)
+    change = f" ({(new_sum / old_sum - 1) * 100:+.1f}%)" if old_sum else ""
+    print(f"{len(paired)} re-headed files with a previous time: {old_sum:.1f} -> {new_sum:.1f} s{change}")
+    by_gain = sorted(paired, key=lambda t: t[1] - t[2], reverse=True)
+    print("largest gains:")
+    for path, old, new in by_gain[:movers]:
+        if new < old:
+            print(f"  {path}: {old:.4g} -> {new:.4g} s")
+    print("largest losses:")
+    for path, old, new in by_gain[-movers:][::-1]:
+        if new > old:
+            print(f"  {path}: {old:.4g} -> {new:.4g} s")
 
 
 def main():
