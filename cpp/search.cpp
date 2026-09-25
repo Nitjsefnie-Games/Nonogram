@@ -1717,10 +1717,16 @@ StateTable::Key residual_key_t(StateTable::Key seed, const LineSpec& spec, const
     memo.lu = static_cast<std::uint32_t>(lu1);
     for (int w = 0; w < kw; ++w) memo.key[w] = words[w];
     memo.valid = true;
+    // Two words per multiply, as wyhash folds its input: one operand is
+    // the chain xor the first word, the other the constant xor the
+    // second (a forward set with its backward set, two key words). Half
+    // the multiplies of one word per mix with the constant alone
+    // (hard/30532: the chain was 53 instructions of the builder's 363
+    // per call).
     std::uint64_t ha = seed.a ^ (fu | (lu << 8)), hb = seed.b + (fu | (lu << 8));
     for (int w = 0; w < nw; ++w) {
-        ha = wy::mix(ha ^ fwd[w], 0xE7037ED1A0B428DBULL); hb = wy::mix(hb ^ fwd[w], 0x8EBC6AF09C88C6E3ULL);
-        ha = wy::mix(ha ^ bwd[w], 0xE7037ED1A0B428DBULL); hb = wy::mix(hb ^ bwd[w], 0x8EBC6AF09C88C6E3ULL);
+        ha = wy::mix(ha ^ fwd[w], 0xE7037ED1A0B428DBULL ^ bwd[w]);
+        hb = wy::mix(hb ^ fwd[w], 0x8EBC6AF09C88C6E3ULL ^ bwd[w]);
     }
     // The cells from fu to lu: the key words with the digits outside zeroed.
     if (KW == 1) {
@@ -1735,10 +1741,11 @@ StateTable::Key residual_key_t(StateTable::Key seed, const LineSpec& spec, const
         // The digits from fu on, less those from lu + 1 on: two table rows.
         const std::uint64_t* from = digits_from(fu);
         const std::uint64_t* to = digits_from(lu1);
-        for (int w = 0; w < kw; ++w) {
-            const std::uint64_t v = words[w] & from[w] & ~to[w];
-            ha = wy::mix(ha ^ v, 0xE7037ED1A0B428DBULL);
-            hb = wy::mix(hb ^ v, 0x8EBC6AF09C88C6E3ULL);
+        for (int w = 0; w < kw; w += 2) {
+            const std::uint64_t v0 = words[w] & from[w] & ~to[w];
+            const std::uint64_t v1 = w + 1 < kw ? words[w + 1] & from[w + 1] & ~to[w + 1] : 0;
+            ha = wy::mix(ha ^ v0, 0xE7037ED1A0B428DBULL ^ v1);
+            hb = wy::mix(hb ^ v0, 0x8EBC6AF09C88C6E3ULL ^ v1);
         }
     } else
     for (int w = 0; w < kw; ++w) {
