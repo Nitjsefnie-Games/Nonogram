@@ -2963,6 +2963,27 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         int min_uic = 1;
         while (trail.col_hist[static_cast<std::size_t>(min_uic)] == 0) ++min_uic;
         const int words = trail.row_words;
+        // The columns by unknown count as digit masks in the row keys'
+        // layout: cum[t] marks the columns with 1..t unknowns. A row with
+        // k unknowns can only better or tie the best key in a column with
+        // at most best - k unknowns, so its cells are masked to those
+        // before they are walked: hard/30532's nodes walked 134 cells and
+        // rejected most on the line constraint alone.
+        // Built only for a large node: a small one (a region of a few
+        // rows, or the SMALL_NOPROBE latch) walks fewer cells than the
+        // masks cost (hard/3867: 3 rows and 10 cells per scan).
+        static thread_local std::vector<std::uint64_t> cum;
+        int max_uic = 0;
+        if (n_unknown > 128) {
+            for (int c = 0; c < W; ++c) if (uic[c] > max_uic) max_uic = uic[c];
+            cum.assign(static_cast<std::size_t>(max_uic + 1) * kw, 0);
+            for (int c = 0; c < W; ++c) {
+                const int u = uic[c];
+                if (u > 0) cum[static_cast<std::size_t>(u) * kw + (c >> 5)] |= 1ULL << (2 * (c & 31) + 1);
+            }
+            for (int t = 2; t <= max_uic; ++t)
+                for (int w = 0; w < kw; ++w) cum[static_cast<std::size_t>(t) * kw + w] |= cum[static_cast<std::size_t>(t - 1) * kw + w];
+        }
         for (int k = 1; k <= W; ++k) {
             if (have && k + min_uic > best_key.first) break;
             const std::uint64_t* bucket = trail.row_bucket.data() + static_cast<std::size_t>(k) * words;
@@ -2973,8 +2994,16 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                     rows &= rows - 1;
                     if (region && !region[r]) continue;
                     const int uir_r = uir[r];
+                    const std::uint64_t* cmask = nullptr;
+                    if (have && max_uic > 0) {
+                        int t = best_key.first - uir_r;
+                        if (t < 1) continue;  // no column can tie the best from this row
+                        if (t > max_uic) t = max_uic;
+                        cmask = cum.data() + static_cast<std::size_t>(t) * kw;
+                    }
                     for (int w = 0; w < kw; ++w) {
                         std::uint64_t m = rk[r * kw + w] & kUnknownBits;
+                        if (cmask) m &= cmask[w];
                         if (m == 0) continue;
                         const NeighborMasks nm = neighbor_masks(r, w);
                         while (m != 0) {
