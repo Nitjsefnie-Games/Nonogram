@@ -1066,8 +1066,14 @@ struct Trail {
         --col_hist[oc];
         ++col_hist[oc - 1];
     }
+    // No hash flag on unsettle: a revert is always followed by the key
+    // restore, which either clears every flag (a node whose keys were up
+    // to date: every line is back at the value it has) or flags exactly
+    // the lines whose hash it restores, and a line settled under a gated
+    // node keeps the flag its settle set. The flags a revert set were
+    // only ever cleared again (hard/3867 at 1.5M nodes: 70 million
+    // instructions setting them, 89 million clearing them).
     void unsettle(int r, int c) {
-        if (track_hash) mark_hash_dirty(r, c);
         const int old = row_unknown[r]++;
         std::uint64_t* b = row_bucket.data() + static_cast<std::size_t>(r >> 6);
         const std::uint64_t bit = 1ULL << (r & 63);
