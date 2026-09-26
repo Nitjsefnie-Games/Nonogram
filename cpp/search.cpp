@@ -418,8 +418,11 @@ std::uint64_t g_stat_probe_pairs = 0, g_stat_probe_hits = 0;  // probe pairs, an
 // the short, cache-hot ones, and the memo line and stamp loads plus a
 // 32-byte store per probe cost more cycles than those saved: quiet core,
 // medians of 7, 3867 +0.3%, 7382 +3.6%, 12130 +3.0%. Storing memos only
-// for probes of <= 12 cells is no better. Not shipped: PROBE_MEMO=1 in
-// the stats build.
+// for probes of <= 12 cells is no better. Deeper in the tree it does
+// not even save instructions: compiled into a release build (2026-09-26)
+// it was -3.3% at 150k nodes of hard/3867 and +1.7% at 1.5M, where the
+// probes are short and the stamps and memo stores outweigh the answers.
+// Not shipped: PROBE_MEMO=1 in the stats build.
 // A cell's two memos are one 64-byte line: 32-byte entries, three words of
 // lines (H + W <= 192), a 32-bit generation. The generation wraps after
 // 4 billion committed changes; then every memo is dropped and the stamps
