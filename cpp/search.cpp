@@ -1386,6 +1386,15 @@ struct SolveState {
     std::vector<StateTable::Key> row_seed, col_seed;  // line_seed per row / column
     std::vector<ResidualMemo> row_memo, col_memo;     // residual_key's resume state per line
     StateTable::Key grid_key{0, 0};
+    // The current region's key: the grid key restricted to the region's
+    // rows and to the columns that had unknowns in them at the split
+    // (a column's unknowns all lie in one region, and a line without
+    // unknowns contributes zero), kept up to date with grid_key by the
+    // same per-line deltas. Summed once per region at the split, where
+    // it was summed at every node of the region's search: hard/3867 at
+    // 1.5M nodes spent 2% of its instructions on that sum.
+    StateTable::Key region_key{0, 0};
+    std::vector<char> region_col;   // the region's columns (with region_row)
     // Undo trail of the per-line contributions: a node that brings a
     // dirty line up to date records the value it replaced, and a parent
     // restores everything its child's subtree recorded once the child's
@@ -2724,20 +2733,24 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         StateTable::Key* ch = state.col_hash.data();
         const std::uint64_t* ck = pic.col_keys.data();
         StateTable::Key& gk = state.grid_key;
+        StateTable::Key& rgk = state.region_key;
+        const char* const rcol = state.region_col.data();
         for (int r : trail.dirty_rows) {
-            gk.a ^= rh[r].a; gk.b -= rh[r].b;
-            state.key_undo.push_back(SolveState::KeyUndo{r, rh[r]});
+            const StateTable::Key old = rh[r];
+            state.key_undo.push_back(SolveState::KeyUndo{r, old});
             rh[r] = uir[r] > 0 ? residual_key(state.row_seed[static_cast<std::size_t>(r)], *mapped_rows[static_cast<std::size_t>(r)],
                                               px + static_cast<std::size_t>(r) * W, 1, static_cast<std::size_t>(W),
                                               rk + static_cast<std::size_t>(r) * kw, kw, state.row_memo[static_cast<std::size_t>(r)])
                                : StateTable::Key{0, 0};
-            gk.a ^= rh[r].a; gk.b += rh[r].b;
+            const std::uint64_t da = old.a ^ rh[r].a, db = rh[r].b - old.b;
+            gk.a ^= da; gk.b += db;
+            if (region && region[r]) { rgk.a ^= da; rgk.b += db; }
             trail.row_hash_dirty[static_cast<std::size_t>(r)] = 0;
         }
         trail.dirty_rows.clear();
         for (int c : trail.dirty_cols) {
-            gk.a ^= ch[c].a; gk.b -= ch[c].b;
-            state.key_undo.push_back(SolveState::KeyUndo{H + c, ch[c]});
+            const StateTable::Key old = ch[c];
+            state.key_undo.push_back(SolveState::KeyUndo{H + c, old});
             if (uic[c] > 0) {
                 // The column read in place (stride W), not gathered.
                 ch[c] = residual_key(state.col_seed[static_cast<std::size_t>(c)], *mapped_cols[static_cast<std::size_t>(c)],
@@ -2746,39 +2759,15 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             } else {
                 ch[c] = StateTable::Key{0, 0};
             }
-            gk.a ^= ch[c].a; gk.b += ch[c].b;
+            const std::uint64_t da = old.a ^ ch[c].a, db = ch[c].b - old.b;
+            gk.a ^= da; gk.b += db;
+            if (region && rcol[c]) { rgk.a ^= da; rgk.b += db; }
             trail.col_hash_dirty[static_cast<std::size_t>(c)] = 0;
         }
         trail.dirty_cols.clear();
-        if (!region) {
-            state_key = StateTable::normalize(gk.a, gk.b);
-        } else {
-            // The region's rows, and the columns those rows have unknowns in.
-            // The rows come from the region bitset less trail bucket 0 (rows
-            // without unknowns), not a test of every row of the grid.
-            static thread_local std::vector<std::uint64_t> col_mask;
-            col_mask.assign(static_cast<std::size_t>(kw), 0);
-            std::uint64_t ka = 0, kb = 0;
-            const std::uint64_t* zero_rows = trail.row_bucket.data();
-            for (int wd = 0; wd < trail.row_words; ++wd) {
-                std::uint64_t m = state.region_bits[static_cast<std::size_t>(wd)] & ~zero_rows[wd];
-                while (m != 0) {
-                    const int r = 64 * wd + __builtin_ctzll(m);
-                    m &= m - 1;
-                    ka ^= rh[r].a; kb += rh[r].b;
-                    for (int w = 0; w < kw; ++w) col_mask[static_cast<std::size_t>(w)] |= rk[r * kw + w] & kUnknownBits;
-                }
-            }
-            for (int w = 0; w < kw; ++w) {
-                std::uint64_t m = col_mask[static_cast<std::size_t>(w)];
-                while (m != 0) {
-                    const int c = 32 * w + (__builtin_ctzll(m) >> 1);
-                    m &= m - 1;
-                    ka ^= ch[c].a; kb += ch[c].b;
-                }
-            }
-            state_key = StateTable::normalize(ka, kb);
-        }
+        // The region's key is the grid key over the region's lines (see
+        // SolveState::region_key); both are kept by the deltas above.
+        state_key = region ? StateTable::normalize(rgk.a, rgk.b) : StateTable::normalize(gk.a, gk.b);
         // The lookup itself follows the split detection below, so the
         // table's cache misses overlap with that scan.
         state.state_cache.prefetch(state_key);
@@ -2791,10 +2780,13 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
     const std::size_t key_mark = state.key_undo.size();
     const bool keys_clean = cache_this_node;
     const StateTable::Key gk_at_mark = state.grid_key;
+    const StateTable::Key rgk_at_mark = state.region_key;
     auto restore_keys = [&]() {
         StateTable::Key* rh = state.row_hash.data();
         StateTable::Key* ch = state.col_hash.data();
         StateTable::Key& gk = state.grid_key;
+        StateTable::Key& rgk = state.region_key;
+        const char* const rcol = state.region_col.data();
         if (keys_clean) {
             // Every restored line returns to its value at the mark, so the
             // grid key does too: copied back rather than re-derived per
@@ -2806,6 +2798,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             }
             undo.resize(key_mark);
             gk = gk_at_mark;
+            rgk = rgk_at_mark;
             for (int r : trail.dirty_rows) trail.row_hash_dirty[static_cast<std::size_t>(r)] = 0;
             trail.dirty_rows.clear();
             for (int c : trail.dirty_cols) trail.col_hash_dirty[static_cast<std::size_t>(c)] = 0;
@@ -2817,7 +2810,9 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             state.key_undo.pop_back();
             if (u.line < H) {
                 const int r = u.line;
-                gk.a ^= rh[r].a ^ u.old.a; gk.b += u.old.b - rh[r].b;
+                const std::uint64_t da = rh[r].a ^ u.old.a, db = u.old.b - rh[r].b;
+                gk.a ^= da; gk.b += db;
+                if (region && region[r]) { rgk.a ^= da; rgk.b += db; }
                 rh[r] = u.old;
                 if (!trail.row_hash_dirty[static_cast<std::size_t>(r)]) {
                     trail.row_hash_dirty[static_cast<std::size_t>(r)] = 1;
@@ -2825,7 +2820,9 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 }
             } else {
                 const int c = u.line - H;
-                gk.a ^= ch[c].a ^ u.old.a; gk.b += u.old.b - ch[c].b;
+                const std::uint64_t da = ch[c].a ^ u.old.a, db = u.old.b - ch[c].b;
+                gk.a ^= da; gk.b += db;
+                if (region && rcol[c]) { rgk.a ^= da; rgk.b += db; }
                 ch[c] = u.old;
                 if (!trail.col_hash_dirty[static_cast<std::size_t>(c)]) {
                     trail.col_hash_dirty[static_cast<std::size_t>(c)] = 1;
@@ -3044,6 +3041,8 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             const double mass_at_split = g_explored_mass;
             std::vector<char> saved_region = state.region_row;
             std::vector<std::uint64_t> saved_region_bits = state.region_bits;
+            const std::vector<char> saved_region_col = state.region_col;
+            const StateTable::Key saved_region_key = state.region_key;
             const std::vector<std::uint64_t> comps(comp_rows.begin(), comp_rows.end());
             const double scale_at_split = g_mass_scale;
             g_mass_scale = scale_at_split / static_cast<double>(roots);
@@ -3058,6 +3057,38 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 state.region_row.assign(static_cast<std::size_t>(H), 0);
                 for (int r = 0; r < H; ++r) state.region_row[static_cast<std::size_t>(r)] = static_cast<char>((comp[r >> 6] >> (r & 63)) & 1);
                 state.region_bits.assign(comp, comp + row_words);
+                // The region's key and columns (SolveState::region_key): the
+                // rows' contributions, and the columns any of them has an
+                // unknown in, from the lines' current values -- the same
+                // values the search's first node starts its deltas from.
+                {
+                    const StateTable::Key* rh = state.row_hash.data();
+                    const StateTable::Key* ch = state.col_hash.data();
+                    const std::uint64_t* rkw = pic.row_keys.data();
+                    static thread_local std::vector<std::uint64_t> col_mask;
+                    col_mask.assign(static_cast<std::size_t>(kw), 0);
+                    std::uint64_t ka = 0, kb = 0;
+                    for (int wd = 0; wd < row_words; ++wd) {
+                        std::uint64_t m = comp[wd];
+                        while (m != 0) {
+                            const int r = 64 * wd + __builtin_ctzll(m);
+                            m &= m - 1;
+                            ka ^= rh[r].a; kb += rh[r].b;
+                            for (int w = 0; w < kw; ++w) col_mask[static_cast<std::size_t>(w)] |= rkw[static_cast<std::size_t>(r) * kw + w] & kUnknownBits;
+                        }
+                    }
+                    state.region_col.assign(static_cast<std::size_t>(W), 0);
+                    for (int w = 0; w < kw; ++w) {
+                        std::uint64_t m = col_mask[static_cast<std::size_t>(w)];
+                        while (m != 0) {
+                            const int c = 32 * w + (__builtin_ctzll(m) >> 1);
+                            m &= m - 1;
+                            ka ^= ch[c].a; kb += ch[c].b;
+                            state.region_col[static_cast<std::size_t>(c)] = 1;
+                        }
+                    }
+                    state.region_key = StateTable::Key{ka, kb};
+                }
                 ++state.region_calls;
                 const std::size_t mark = trail.changed_cell_indices.size();
                 const int saved_unknown_count = pic.unknown_count;
@@ -3071,6 +3102,8 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             }
             state.region_row = saved_region;
             state.region_bits = saved_region_bits;
+            state.region_col = saved_region_col;
+            state.region_key = saved_region_key;
             state.result = total;
             g_mass_scale = scale_at_split;
             g_explored_mass = mass_at_split + g_half_pow[static_cast<std::size_t>(state.branch_depth)] * scale_at_split;
@@ -3147,9 +3180,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         // Accumulating the levels on demand (the walk asks for best - uir)
         // instead of the prefix over every level was measured 2026-09-25:
         // hard/30532 +0.3% -- the walk reaches nearly every level, and
-        // the demand loop costs per row. Taking the maximum in the fill
-        // pass with the table sized for H levels: +0.08%, the zeroing
-        // costs what the pass did. Building a word's neighbour
+        // the demand loop costs per row. Building a word's neighbour
         // masks at the first cell that needs its score instead of per
         // word walked: +0.2%, most words walked score a cell.
         static thread_local std::vector<std::uint64_t> cum;
@@ -3286,10 +3317,6 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             if (pxs[row * W + col] != UNKNOWN) continue;  // settled by an earlier commit this pass
             if (g_fast_mode && oi + 1 < order.size()) {
                 // The next cell's four opening lookups (see prefetch_probe_cell).
-                // Two cells ahead was measured 2026-09-26 on the loaded box
-                // by paired rounds: hard/3867 at 150k nodes -2.6% cycles
-                // (6 of 7 rounds), at 1.5M nodes +0.2% (2 of 5), 7382 -1.5%
-                // (4 of 7), for +0.4% instructions -- not shown.
                 const auto& nx = unknown_coords[static_cast<std::size_t>(order[oi + 1])];
                 prefetch_probe_cell(pic, nx.first, nx.second);
             }
