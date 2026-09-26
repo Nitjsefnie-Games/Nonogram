@@ -390,13 +390,17 @@ constexpr std::size_t g_probe_window = 100;
 constexpr double g_probe_thresh = 0.01;
 #endif
 // STATE_CACHE_YIELD=<x> overrides the state cache's per-bucket gate
-// threshold (cycles saved per lookup below which a node-size bucket stops
-// using the cache; 0 never gates). Read in every build, not only the stats
-// one: the gate decides on measured cycles, so a release binary's tree,
-// and with it an instruction count, moves with anything that moves the
-// cycles (on easy_medium/12130 by 1.2% with the stack's placement alone),
-// and the override is what makes a count reproducible.
-const double g_state_cache_yield = std::getenv("STATE_CACHE_YIELD") ? std::atof(std::getenv("STATE_CACHE_YIELD")) : 0.5;
+// threshold (branch nodes saved per lookup below which a node-size bucket
+// stops using the cache; 0 never gates). Read in every build, not only the
+// stats one. The gate decided on measured cycles until 2026-09-26, so a
+// release binary's tree, and with it an instruction count, moved with
+// anything that moved the cycles (on easy_medium/12130 by 1.2% with the
+// stack's placement alone), and the override was what made a count
+// reproducible; the node measure is deterministic, and `nodes.py` still
+// sets 0. The default of one node saved per ten lookups is the old
+// break-even (half a lookup's cycles per lookup) at the cost of a small
+// branch node against a lookup.
+const double g_state_cache_yield = std::getenv("STATE_CACHE_YIELD") ? std::atof(std::getenv("STATE_CACHE_YIELD")) : 0.1;
 std::uint64_t g_stat_probe_pairs = 0, g_stat_probe_hits = 0;  // probe pairs, and those with a contradiction
 
 // Probe memo. A probe (cell, value) at one node solved a set of lines --
@@ -1419,18 +1423,18 @@ struct SolveState {
     // hits come almost only from small nodes, and which sizes pay differs
     // by puzzle (10810: the 16-63-cell buckets took 2.2M lookups for 363
     // hits while the 4-15-cell ones hit 30%; on 3867 every bucket up to 31
-    // cells pays). Every kScWindow lookups in a bucket, the cycles its hits
-    // saved (the entries' work bytes) are compared with the cycles the
-    // lookups cost; below sc_yield times that the bucket stops looking up
-    // and storing for kScResample nodes, then samples again.
-    // STATE_CACHE_YIELD overrides the factor (default 1: break-even).
+    // cells pays). Every kScWindow lookups in a bucket, the branch nodes
+    // its hits saved (the entries' work bytes) are compared with the
+    // lookups made; below sc_yield nodes per lookup the bucket stops
+    // looking up and storing for kScResample nodes, then samples again.
+    // STATE_CACHE_YIELD overrides the threshold (g_state_cache_yield).
     static constexpr int kScBuckets = 24;
     static constexpr std::uint32_t kScWindow = 16384;
     static constexpr std::uint32_t kScResample = 16 * kScWindow;
     std::uint32_t sc_lookups[kScBuckets] = {}, sc_skipped[kScBuckets] = {};
-    std::uint64_t sc_saved[kScBuckets] = {}, sc_lookup_cycles[kScBuckets] = {};
+    std::uint64_t sc_saved[kScBuckets] = {};
     bool sc_off[kScBuckets] = {};
-    double sc_yield = 1.0;
+    double sc_yield = 0.1;
     bool skip_probing = false;
     // Dead-work watchdog for the latched (no-probing) mode. The yield window
     // shuts probing off when few probes find contradictions, but that is
@@ -2727,10 +2731,15 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             state.sc_skipped[nb] = 0;
         }
     }
-    // Work is measured in cycles (rdtsc): the entry's work byte holds what
-    // its subtree cost, which is what a hit saves, in the same currency as
-    // the lookup's own cost. Both cost ~25 cycles to read.
-    const std::uint64_t tsc_at_entry = cache_this_node ? __rdtsc() : 0;
+    // Work is measured in branch nodes: the entry's work byte holds what
+    // its subtree cost, which is what a hit saves. It was measured in
+    // cycles (rdtsc at entry, after the lookup and at the insert), which
+    // cost 28 cycles a read on this machine and do not overlap, 0.8% of
+    // hard/3867 at 1.5M nodes; and the trees of the puzzles whose table
+    // evicts (least work first) were not reproducible between two runs of
+    // one binary. Node counts make the eviction order, and so the tree,
+    // the same on every run.
+    const std::uint64_t nodes_at_entry = state.branch_nodes;
     if (cache_this_node) {
         // The key combines one 128-bit hash per line with unknowns (XOR in
         // one word, sum in the other, so the order of lines does not
@@ -3019,7 +3028,6 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             int hit_work = 0;
             if (g_debug_stats) ++g_stat_sc_lookups[nb];
             const u128* hit = state.state_cache.find(state_key, &hit_work);
-            state.sc_lookup_cycles[nb] += __rdtsc() - tsc_at_entry;
             if (hit) {
                 ++state.state_hits;
                 const std::uint64_t saved = StateTable::decode_work(hit_work);
@@ -3027,13 +3035,12 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 if (g_debug_stats) { ++g_stat_sc_hits[nb]; g_stat_sc_saved[nb] += saved; }
             }
             if (++state.sc_lookups[nb] == SolveState::kScWindow) {
-                if (static_cast<double>(state.sc_saved[nb]) < state.sc_yield * static_cast<double>(state.sc_lookup_cycles[nb])) {
+                if (static_cast<double>(state.sc_saved[nb]) < state.sc_yield * static_cast<double>(SolveState::kScWindow)) {
                     state.sc_off[nb] = true;
                     if (g_debug_stats) ++g_stat_sc_gated[nb];
                 }
                 state.sc_lookups[nb] = 0;
                 state.sc_saved[nb] = 0;
-                state.sc_lookup_cycles[nb] = 0;
             }
             if (hit && !g_state_cache_probe_only) {
                 state.result = *hit;
@@ -3115,7 +3122,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             g_mass_scale = scale_at_split;
             g_explored_mass = mass_at_split + g_half_pow[static_cast<std::size_t>(state.branch_depth)] * scale_at_split;
             if (cache_this_node) {
-                if (state.state_cache.insert(state_key, total, __rdtsc() - tsc_at_entry)) ++state.state_evictions;
+                if (state.state_cache.insert(state_key, total, state.branch_nodes - nodes_at_entry)) ++state.state_evictions;
             }
             return true;
         }
@@ -3557,7 +3564,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
     state.result = subtree_total;
     g_counted_so_far -= subtree_total;  // the parent adds it back as one finished child
     if (cache_this_node) {
-        if (state.state_cache.insert(state_key, subtree_total, __rdtsc() - tsc_at_entry)) ++state.state_evictions;
+        if (state.state_cache.insert(state_key, subtree_total, state.branch_nodes - nodes_at_entry)) ++state.state_evictions;
     }
 
     if (latched_here) {
@@ -3807,11 +3814,11 @@ void solve(const std::vector<std::vector<int>>& rows,
         std::fprintf(stderr, "cache-stats: state lookups=%llu hits=%llu evictions=%llu entries=%zu of %zu slots\n",
                      static_cast<unsigned long long>(state.state_lookups), static_cast<unsigned long long>(state.state_hits),
                      static_cast<unsigned long long>(state.state_evictions), state.state_cache.size(), state.state_cache.slots());
-        std::fprintf(stderr, "cache-stats: state cache by unknown cells (2^k..): lookups/hits/Mcycles-saved/times-gated");
+        std::fprintf(stderr, "cache-stats: state cache by unknown cells (2^k..): lookups/hits/nodes-saved/times-gated");
         for (int k = 0; k < 24; ++k) {
             if (g_stat_sc_lookups[k] == 0) continue;
             std::fprintf(stderr, " %d:%llu/%llu/%llu/%llu", k, static_cast<unsigned long long>(g_stat_sc_lookups[k]),
-                         static_cast<unsigned long long>(g_stat_sc_hits[k]), static_cast<unsigned long long>(g_stat_sc_saved[k] >> 20),
+                         static_cast<unsigned long long>(g_stat_sc_hits[k]), static_cast<unsigned long long>(g_stat_sc_saved[k]),
                          static_cast<unsigned long long>(g_stat_sc_gated[k]));
         }
         std::fprintf(stderr, "\n");
