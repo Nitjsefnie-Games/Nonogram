@@ -2705,7 +2705,9 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
     bool cache_this_node = use_state_cache;  // cleared when the node's size bucket is gated off
     SmallTimer small_timer(n_unknown);
     int nb = 0;  // node-size bucket: log2 of the unknown cells
-    while ((n_unknown >> (nb + 1)) != 0 && nb < SolveState::kScBuckets - 1) ++nb;
+    // The node-size bucket is log2 of the unknown cells (it was a shift
+    // loop: hard/3867 at 1.5M nodes, 34 million instructions).
+    nb = std::min(63 - __builtin_clzll(static_cast<std::uint64_t>(n_unknown)), SolveState::kScBuckets - 1);
     if (use_state_cache && state.sc_off[nb]) {
         // Gated off: no key, no lookup, no store (the trail's dirty lists
         // keep accumulating and are applied at the next node that needs
@@ -2870,15 +2872,11 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             std::uint64_t valid = (H - lo >= 64) ? ~0ULL : ((1ULL << (H - lo)) - 1);
             left[wd] = valid & ~zero_rows[wd];
         }
+        // A region search keeps its own rows: the region bitset, a word
+        // at a time (it was a membership test per row with unknowns,
+        // hard/3867 at 1.5M nodes: 180 million instructions, 0.9%).
         if (region) {
-            for (int wd = 0; wd < row_words; ++wd) {
-                std::uint64_t m = left[wd];
-                while (m != 0) {
-                    const int r = 64 * wd + __builtin_ctzll(m);
-                    m &= m - 1;
-                    if (!region[r]) left[wd] &= ~(1ULL << (r & 63));
-                }
-            }
+            for (int wd = 0; wd < row_words; ++wd) left[wd] &= state.region_bits[static_cast<std::size_t>(wd)];
         }
         // Component i's rows as a bitset at comp_rows[i * row_words ..]; a
         // per-row root array needed an H-wide fill at every node.
@@ -3257,8 +3255,15 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         unknown_coords.clear();
         enc.clear();
         int max_enc = 0;
-        for (int r = 0; r < H; ++r) {
-            if (region && !region[r]) continue;
+        // The rows in ascending order from the region's bitset (a search
+        // without regions: every row), less the rows without unknowns.
+        const std::uint64_t* enum_zero = trail.row_bucket.data();
+        for (int wd = 0; wd < trail.row_words; ++wd) {
+            std::uint64_t rows = (region ? state.region_bits[static_cast<std::size_t>(wd)] : ~0ULL) & ~enum_zero[wd];
+            if (64 * wd + 64 > H) rows &= (1ULL << (H - 64 * wd)) - 1;
+            while (rows != 0) {
+            const int r = 64 * wd + __builtin_ctzll(rows);
+            rows &= rows - 1;
             for (int w = 0; w < kw; ++w) {
                 std::uint64_t m = rk[r * kw + w] & kUnknownBits;
                 if (m == 0) continue;
@@ -3273,6 +3278,7 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                     enc.push_back(e);
                     if (e > max_enc) max_enc = e;
                 }
+            }
             }
         }
 
