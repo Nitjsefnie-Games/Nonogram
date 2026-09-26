@@ -1221,8 +1221,12 @@ public:
         return nullptr;
     }
     void prefetch(Key k) const {
+        // Both lines a window's occupied prefix usually spans (two slots
+        // per line; the prefix averages 1.6 entries at half load).
         __builtin_prefetch(&slots_[bucket(k.a)]);
+        __builtin_prefetch(&slots_[bucket(k.a) + 2]);
         __builtin_prefetch(&slots_[bucket(k.b)]);
+        __builtin_prefetch(&slots_[bucket(k.b) + 2]);
     }
     // Windows are aligned, non-overlapping buckets of kWindow slots, so the
     // occupied-prefix property holds for each.
