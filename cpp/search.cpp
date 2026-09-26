@@ -672,7 +672,18 @@ public:
     unsigned char* insert(const std::uint64_t* key, std::uint16_t tag, const LineSolveResult& res) {
         unsigned char* s;
         std::uint16_t ftag;
-        if ((count_ + 1) * 3 > nslots_) {  // load factor <= 1/3
+        // Load factor 1/8: a collision's extra probe step is the next slot,
+        // a line no prefetch fetched, so mostly a memory access. At 1/3
+        // hard/3867 at 1.5M nodes took 0.21 extra steps per lookup, at 1/8
+        // 0.07, and its cycles fell 8% (1/6: -5%, 1/4: -2%, paired rounds
+        // on the shielded core; hard/30532 within noise). The budget's
+        // capacity falls with it: with the budget cut to 128 MB so that
+        // the clears fall inside those 1.5M nodes, 1/8 had 23% more misses
+        // and was still -4.5% (1/6 -5.8%); growing at 1/8 but filling to
+        // 1/3 at the budget, to keep the capacity, measured -2% there.
+        // Prefetching the next slot with the line's own instead, at 1/3,
+        // was -3% for +1% instructions.
+        if ((count_ + 1) * 8 > nslots_) {  // load factor <= 1/8
             if (nslots_ >= max_slots_) {
                 clear_slots();  // OOM-safe generational eviction (cold path)
             } else {
