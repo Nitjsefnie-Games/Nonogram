@@ -805,6 +805,13 @@ private:
         count_ = 0;
     }
 
+    // Everything goes. Keeping half of the entries through a clear (by a
+    // hash bit alternating with the clear, copied out and re-placed into
+    // the zeroed table) was measured 2026-09-26 with the budget cut to
+    // 128 MB so that hard/3867 clears inside its first 1.5M nodes: 8%
+    // fewer misses, but +4.4% cycles (slower in 7 of 7 paired rounds) and
+    // +0.8% instructions; the copy and the re-placing cost more than the
+    // misses they save.
     void clear_slots() {
         std::memset(buf_.p, 0, buf_.bytes);
         count_ = 0;
