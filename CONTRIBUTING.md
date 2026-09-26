@@ -119,7 +119,12 @@ slower than the plain build on count mode, whichever variant was tried;
 what changed is the training set and the code since. Count a change on
 the plain build (instructions repeat to 7 digits there, and PGO's
 inlining decisions move with the profile); ship and rebench the PGO one,
-re-checking `bench/harness.py gate` on it. `./solver <puzzle> --balance 6` switches
+re-checking `bench/harness.py gate` on it. A change to per-node work is
+also counted at `MAX_NODES=1500000` on hard/3867: the first 150k nodes
+are the top of the tree, large propagations and hardly any region
+searches, while the deep tree is mostly small region-search nodes, and a
+per-node cost weighs two to three times more there (the region key kept
+incrementally: -1.2% at 150k nodes, -2.7% at 1.5M). `./solver <puzzle> --balance 6` switches
 the branch score to `6*min - max` of the two probe fills, which shrinks
 exhaustive trees on hard unique puzzles several-fold (11-Dom 217k -> 28k
 nodes) but changes where a `--max N` run on a many-solution puzzle stops;
