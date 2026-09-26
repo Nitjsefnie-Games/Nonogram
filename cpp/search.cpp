@@ -755,7 +755,13 @@ public:
         // Two words at a time in a vector register: a 16-byte load, an
         // xor and a zero test where the scalar loop had two loads, two
         // xors and an or (the 3-word compare was 6.8 instructions per
-        // lookup on hard/3867).
+        // lookup on hard/3867). Three words as one 32-byte compare (a
+        // vptest with a mask operand, or a lane compare and its sign
+        // mask) was measured 2026-09-26: 3 instructions per lookup
+        // instead of 7, but a 256-bit value in the drain makes the
+        // compiler realign the drain's frame to 32 bytes and add a
+        // vzeroupper at every call and return -- -0.15% and +0.5%
+        // instructions on hard/3867 for the two forms.
         if (KW == 2 || KW == 3 || KW == 4) {
             __m128i d = _mm_xor_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(s)),
                                       _mm_loadu_si128(reinterpret_cast<const __m128i*>(key)));
@@ -1156,6 +1162,13 @@ private:
 // lookup probes a window of kWindow slots; an insert into a full window
 // evicts the entry with the least work, since an entry's value is the
 // search it saves. The budget is STATE_CACHE_MB (default 512).
+// A filter of one bit per key in front of the table (one to eight bits
+// per slot, rebuilt as evictions accumulate), so that a miss skips the
+// window scan, was measured 2026-09-26: 61% of hard/3867's lookups at
+// 1.5M nodes miss, but the filter's word is prefetched with the windows
+// and arrives with them, and no array of 512 KB to 4 MB stays in a
+// nearer cache beside the line cache's traffic -- 3867 +2% to +3%
+// cycles at every size, hard/30532 -1.5%.
 class StateTable {
 public:
     struct Key { std::uint64_t a, b; };
@@ -2004,7 +2017,13 @@ inline void write_intersection_impl(Iter first, Iter last, Pos pos_of, Val val_o
     // it into the drain was measured: the drain's own live values spill
     // around it and the call's cost comes back as spills, +0.6% on
     // easy_medium/12130 for the 1-word drain, +1.5% on hard/3867 for the
-    // 3-word one.)
+    // 3-word one.) A straight-line two-cell path (18% of the calls on
+    // hard/3867 at 1.5M nodes, 17% on easy_large/7382, 13% on 12130) was
+    // measured 2026-09-26: written here it made the wrapper save six
+    // registers before the count test, +0.4% on 3867 and +2.1% on 12130;
+    // as its own function it saved 2.7 instructions per call, -0.06% on
+    // 3867 and +0.25% on 12130 -- the loop's setup is what two cells
+    // need as well.
     const std::size_t kw = KW > 0 ? static_cast<std::size_t>(KW) : static_cast<std::size_t>(pic.key_words);
     const std::size_t li = static_cast<std::size_t>(line_index);
     const std::size_t W = static_cast<std::size_t>(pic.width());
@@ -2800,7 +2819,11 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         // SolveState::region_key); both are kept by the deltas above.
         state_key = region ? StateTable::normalize(rgk.a, rgk.b) : StateTable::normalize(gk.a, gk.b);
         // The lookup itself follows the split detection below, so the
-        // table's cache misses overlap with that scan.
+        // table's cache misses overlap with that scan. The lookup first,
+        // so that a hit skips the scan, was measured 2026-09-26: 39% of
+        // the lookups hit on hard/3867 at 1.5M nodes, instructions -1.1%
+        // there and -3.3% on hard/30532, but cycles +1.4% and +1.2% by
+        // paired rounds; the scan is what hides the table's latency.
         state.state_cache.prefetch(state_key);
     }
     // What a child's subtree records above this mark is undone after the
@@ -3230,6 +3253,9 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
                 while (rows != 0) {
                     const int r = 64 * wd + __builtin_ctzll(rows);
                     rows &= rows - 1;
+                    // Per row, not the bucket word masked by the region
+                    // bitset: the mask ran for every empty bucket word
+                    // too, +0.2% on hard/3867 at 1.5M nodes (2026-09-26).
                     if (region && !region[r]) continue;
                     const int uir_r = uir[r];
                     const std::uint64_t* cmask = nullptr;
