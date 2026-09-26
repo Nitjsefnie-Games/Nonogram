@@ -3147,7 +3147,9 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
         // Accumulating the levels on demand (the walk asks for best - uir)
         // instead of the prefix over every level was measured 2026-09-25:
         // hard/30532 +0.3% -- the walk reaches nearly every level, and
-        // the demand loop costs per row. Building a word's neighbour
+        // the demand loop costs per row. Taking the maximum in the fill
+        // pass with the table sized for H levels: +0.08%, the zeroing
+        // costs what the pass did. Building a word's neighbour
         // masks at the first cell that needs its score instead of per
         // word walked: +0.2%, most words walked score a cell.
         static thread_local std::vector<std::uint64_t> cum;
@@ -3284,6 +3286,10 @@ bool solve_backtrack(const std::vector<const LineSpec*>& mapped_rows,
             if (pxs[row * W + col] != UNKNOWN) continue;  // settled by an earlier commit this pass
             if (g_fast_mode && oi + 1 < order.size()) {
                 // The next cell's four opening lookups (see prefetch_probe_cell).
+                // Two cells ahead was measured 2026-09-26 on the loaded box
+                // by paired rounds: hard/3867 at 150k nodes -2.6% cycles
+                // (6 of 7 rounds), at 1.5M nodes +0.2% (2 of 5), 7382 -1.5%
+                // (4 of 7), for +0.4% instructions -- not shown.
                 const auto& nx = unknown_coords[static_cast<std::size_t>(order[oi + 1])];
                 prefetch_probe_cell(pic, nx.first, nx.second);
             }
